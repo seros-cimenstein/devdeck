@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Keep in sync with the web UI palette (page #0d1117, compose bar #161b22). -->
+    <color name="bg">#0d1117</color>
+    <color name="bar">#161b22</color>
+    <color name="accent">#58a6ff</color>
+
+    <style name="Theme.DevDeck" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:colorBackground">@color/bg</item>
+        <item name="android:colorPrimary">@color/bg</item>
+        <item name="android:colorPrimaryDark">@color/bg</item>
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:statusBarColor">@color/bg</item>
+        <item name="android:navigationBarColor">@color/bar</item>
+    </style>
+
+    <style name="Theme.DevDeck.Share" parent="@android:style/Theme.Material.Dialog.NoActionBar">
+        <item name="android:colorAccent">@color/accent</item>
+    </style>
+</resources>
