@@ -43,6 +43,7 @@ import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -159,6 +160,10 @@ public class LinkService extends Service {
     private volatile long haveRev;
     private volatile String lastSessions;
 
+    // UI's latest `voice` message per target while on: re-sent after every reconnect.
+    private final Map<String, String> voices = new LinkedHashMap<>();  // guarded by itself
+    private Speaker speaker;
+
     // Read thread only: previous pane states for notification transitions.
     private final Map<String, String> lastStates = new HashMap<>();
     private final Map<String, String> lastAskIds = new HashMap<>();
@@ -253,6 +258,7 @@ public class LinkService extends Service {
         notes.createNotificationChannel(new NotificationChannel(CH_DONE, "Agent finished",
                 NotificationManager.IMPORTANCE_DEFAULT));
         queueFile = new File(getFilesDir(), "queue.json");
+        speaker = new Speaker(this, this::toUi);
         loadQueue();
         state = paired(this) ? ST_OFFLINE : ST_UNPAIRED;
         startForeground(NOTE_ID, buildNote());
@@ -338,6 +344,7 @@ public class LinkService extends Service {
         linkThread.interrupt();
         uploadThread.interrupt();
         writeThread.quit();
+        speaker.shutdown();
         for (PowerManager.WakeLock w : new PowerManager.WakeLock[]{uploadWake, linkWake, alarmWake, rxWake}) {
             if (w.isHeld()) w.release();
         }
@@ -386,7 +393,8 @@ public class LinkService extends Service {
 
     /**
      * Live message from the UI (any thread). Returns false if offline. `watch` is remembered
-     * for the next hello and for notification suppression.
+     * for the next hello and for notification suppression; `voice` (while on) is re-sent after
+     * every reconnect, also when it was sent offline.
      */
     boolean sendLive(String json) {
         JSONObject m;
@@ -396,7 +404,15 @@ public class LinkService extends Service {
             Log.w(TAG, "bad UI message " + json);
             return false;
         }
-        if ("watch".equals(m.optString("t"))) {
+        String t = m.optString("t");
+        if ("voice".equals(t)) {
+            String target = m.optString("target");
+            synchronized (voices) {
+                if (m.optBoolean("on")) voices.put(target, json.indexOf('\n') >= 0 ? m.toString() : json);
+                else voices.remove(target);
+            }
+        }
+        if ("watch".equals(t)) {
             String target = m.optString("target", null);
             String view = m.optString("view", null);
             SharedPreferences.Editor ed = prefs.edit();
@@ -439,6 +455,34 @@ public class LinkService extends Service {
         String s = lastSessions;
         if (s != null) out.add(s);
         return out;
+    }
+
+    /** Any thread: stop the native TTS player and drop what is queued or streaming. */
+    void stopSpeaking() {
+        speaker.stop();
+    }
+
+    /**
+     * Main thread. The UI page that switched voice mode on is gone: the server stops speaking
+     * to this client (it would play with no UI around) and nothing is re-sent on reconnect.
+     */
+    void resetVoice() {
+        List<String> targets;
+        synchronized (voices) {
+            targets = new ArrayList<>(voices.keySet());
+            voices.clear();
+        }
+        Conn c = conn;
+        if (c != null) {
+            for (String target : targets) {
+                try {
+                    writeObj(c, new JSONObject().put("t", "voice").put("target", target).put("on", false));
+                } catch (JSONException e) {
+                    throw new IllegalStateException(e);
+                }
+            }
+        }
+        speaker.stop();
     }
 
     boolean wakelock() {
@@ -672,6 +716,9 @@ public class LinkService extends Service {
                     conn = c;
                     for (JSONObject it : queue) if (!"upload".equals(it.optString("t"))) writeObj(c, it);
                 }
+                synchronized (voices) {
+                    for (String v : voices.values()) writeLine(c, v);
+                }
                 setState(ST_ONLINE, c.host);
                 if (visible) startPings(c);
                 else ping(c);
@@ -825,6 +872,12 @@ public class LinkService extends Service {
                     rtt = SystemClock.elapsedRealtime() - Peek.num(line, "ts", SystemClock.elapsedRealtime());
                     if (!visible && alarmWake.isHeld()) alarmWake.release();
                     fireLink();
+                    break;
+                case "audio":
+                    speaker.offer(line);
+                    break;
+                case "voice_error":
+                    speaker.voiceError(line);
                     break;
                 default:
                     break;

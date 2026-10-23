@@ -29,13 +29,17 @@ export class AskSheet implements Layer {
   readonly dismissed = new Set<string>();
   /** Called when the sheet opens or closes. */
   onChange?: () => void;
+  /** Mic tapped in the sheet's voice strip (voice mode only). */
+  onVoiceMic?: () => void;
+  private readonly voiceEl: HTMLElement;
 
   constructor() {
     this.scrim = h("div.scrim.sheet-scrim.ask-scrim", { onclick: () => this.close() });
     this.body = h("div.sheet-body");
     this.statusEl = h("div.ask-status", { hidden: true });
+    this.voiceEl = h("div.ask-voice", { hidden: true });
     this.submitBtn = h("button.btn.primary.wide", { text: "Submit", onclick: () => this.submit() }) as HTMLButtonElement;
-    this.foot = h("div.sheet-foot", null, this.statusEl, this.submitBtn);
+    this.foot = h("div.sheet-foot", null, this.voiceEl, this.statusEl, this.submitBtn);
     this.sheet = h(
       "div.sheet.ask-sheet",
       { role: "dialog", "aria-modal": "true" },
@@ -100,6 +104,46 @@ export class AskSheet implements Layer {
       this.submitBtn.textContent = "Retry";
     }
     return true;
+  }
+
+  /** The ask shown (open or not) for voice answering. */
+  get current(): { target: string; ask: Ask } | null {
+    return this.ask ? { target: this.target, ask: this.ask } : null;
+  }
+
+  get answering(): boolean {
+    return !!this.pendingId;
+  }
+
+  /** Voice strip in the sheet foot: what voice mode is doing for this ask; null hides it. */
+  setVoice(v: { phase: string; title: string; text?: string } | null) {
+    const el = this.voiceEl;
+    el.hidden = !v;
+    if (!v) return;
+    el.className = `ask-voice v-${v.phase}`;
+    el.textContent = "";
+    el.append(
+      h("button.av-mic", { "aria-label": "Answer by voice", html: icon("mic"), onclick: () => this.onVoiceMic?.() }),
+      h("div.av-main", null, h("div.av-title", { text: v.title }), v.text ? h("div.av-text", { text: v.text }) : null),
+    );
+  }
+
+  /** Applies a spoken answer to question `qi` and shows it as if tapped. */
+  applyVoice(qi: number, selected: string[], custom?: string) {
+    const st = this.qs[qi];
+    if (!st || this.pendingId) return;
+    st.selected = new Set(selected);
+    st.other = !!custom;
+    st.custom = custom ?? "";
+    this.render();
+    this.body.querySelectorAll("section.q")[qi]?.scrollIntoView({ block: "nearest" });
+  }
+
+  /** Sends the answers set so far (voice confirmation done); false when incomplete. */
+  submitVoice(): boolean {
+    if (this.pendingId || this.submitBtn.disabled) return false;
+    this.submit();
+    return !!this.pendingId;
   }
 
   private render() {
@@ -200,6 +244,11 @@ export class AskSheet implements Layer {
     });
     opts.append(otherRow, otherInput);
     box.append(opts);
+    // Re-renders (voice answers) keep what is already chosen.
+    inputs.forEach((inp, oi) => (inp.checked = st.selected.has(q.options[oi].label)));
+    otherRadio.checked = st.other;
+    otherInput.value = st.custom;
+    if (st.selected.size || st.other) sync();
 
     const noteIn = h("textarea.note-in", { rows: 1, placeholder: "Note for the agent (optional)" }) as HTMLTextAreaElement;
     noteIn.hidden = true;

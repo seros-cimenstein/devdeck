@@ -30,11 +30,13 @@ export function onOutboxChange(fn: () => void) {
   listeners.add(fn);
 }
 
-export function sendText(target: string, text: string, enter: boolean) {
+/** Queues a text send; returns the outbox id its ack will carry. */
+export function sendText(target: string, text: string, enter: boolean): string {
   const id = uuid();
   const real = enqueue({ t: "send", id, target, text, enter });
   items.set(real, { id: real, target, text, enter, ts: Date.now() });
   changed();
+  return real;
 }
 
 export function retrySend(id: string) {

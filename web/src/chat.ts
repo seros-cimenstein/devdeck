@@ -6,6 +6,7 @@ import { dismissSend, onOutboxChange, outboxFor, retrySend } from "./outbox";
 import { hooks, state } from "./state";
 import type { AssistantEntry, Entry, FullMsg, ToolCall, TranscriptMsg } from "./types";
 import { debounce, h, icon, reducedMotion } from "./util";
+import { onSayChange, sayStatus, toggleEntry } from "./voice";
 
 const MAX_DOM = 220; // rendered entries kept while following the bottom
 const TRIM_TO = 160;
@@ -68,6 +69,7 @@ export class ChatView {
     ro.observe(this.outbox);
     ro.observe(this.working);
     onOutboxChange(() => this.renderOutbox());
+    onSayChange(() => this.updateSay());
   }
 
   // ---------------------------------------------------------------- target / data
@@ -444,6 +446,7 @@ export class ChatView {
       const md = h("div.md", { html: renderMarkdown(this.full.get(e.id) ?? e.text) });
       n.append(md);
       if (e.textTruncated && !this.full.has(e.id)) n.append(this.fullBtn(e.id, "Show full message"));
+      n.append(h("div.ent-acts", null, this.sayBtn(e.id)));
     }
     if (e.tools?.length) {
       const tl = h("div.tools");
@@ -508,6 +511,30 @@ export class ChatView {
       }
     });
     return box;
+  }
+
+  /** Play/stop for one reply; the state follows voice.ts (also while voice mode reads the reply). */
+  private sayBtn(entryId: string): HTMLElement {
+    const b = h("button.say-btn", { "data-say": entryId, onclick: () => toggleEntry(this.target, entryId) });
+    this.setSay(b, sayStatus(entryId));
+    return b;
+  }
+
+  private setSay(b: HTMLElement, st: "" | "loading" | "playing") {
+    if (b.dataset.st === st && b.firstChild) return;
+    b.dataset.st = st;
+    b.className = `say-btn${st ? " " + st : ""}`;
+    b.setAttribute("aria-label", st ? "Stop reading" : "Read aloud");
+    b.textContent = "";
+    b.append(
+      st === "loading" ? h("span.spin.xs") : h("span.icw", { html: icon(st ? "stop" : "volume") }),
+      h("span", { text: st === "loading" ? "Loading" : st ? "Stop" : "Listen" }),
+    );
+    b.closest(".ent")?.classList.toggle("speaking", st === "playing");
+  }
+
+  private updateSay() {
+    this.list.querySelectorAll<HTMLElement>(".say-btn").forEach((b) => this.setSay(b, sayStatus(b.dataset.say || "")));
   }
 
   private fullBtn(entryId: string, label: string): HTMLElement {

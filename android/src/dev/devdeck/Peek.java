@@ -62,6 +62,15 @@ final class Peek {
         }
     }
 
+    /** Top-level boolean member, or def if absent or not a boolean. */
+    static boolean bool(String s, String key, boolean def) {
+        int i = find(s, key);
+        if (i < 0) return def;
+        if (s.startsWith("true", i)) return true;
+        if (s.startsWith("false", i)) return false;
+        return def;
+    }
+
     /** Index of the first character of the value of top-level member key, or -1. */
     private static int find(String s, String key) {
         int n = s.length();

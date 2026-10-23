@@ -12,6 +12,11 @@ interface DDBridge {
   haptic(): void;
   ready(): void;
   backResult?(handled: boolean): void;
+  // voice (absent on older shells)
+  listen?(json: string): void;
+  stopListening?(): void;
+  stopSpeaking?(): void;
+  setVoiceMode?(on: boolean): void;
 }
 
 const noop = () => {};
@@ -60,6 +65,11 @@ export const bridge = {
     }
   },
   ready: () => dd().ready(),
+  hasVoice: () => typeof dd().listen === "function",
+  listen: (opts: { lang: string; partial?: boolean; preferOffline?: boolean }) => dd().listen?.(JSON.stringify(opts)),
+  stopListening: () => dd().stopListening?.(),
+  stopSpeaking: () => dd().stopSpeaking?.(),
+  setVoiceMode: (on: boolean) => dd().setVoiceMode?.(on),
   backResult: (handled: boolean) => dd().backResult?.(handled),
 };
 

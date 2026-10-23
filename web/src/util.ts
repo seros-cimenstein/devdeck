@@ -180,6 +180,10 @@ const ICON_PATHS: Record<string, string> = {
   list: "M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01",
   pin: "M9 4h6l-1 6 3 3H7l3-3zM12 13v8",
   search: "M11 4a7 7 0 100 14 7 7 0 000-14zM20 20l-4-4",
+  mic: "M12 3a3 3 0 00-3 3v6a3 3 0 006 0V6a3 3 0 00-3-3zM5 11a7 7 0 0014 0M12 18v3M9 21h6",
+  headset: "M4 15v-3a8 8 0 0116 0v3M4 14h3v6H5a1 1 0 01-1-1zM20 14h-3v6h2a1 1 0 001-1z",
+  volume: "M4 9h4l5-4v14l-5-4H4zM16.5 9a4 4 0 010 6M19 6.5a8 8 0 010 11",
+  sliders: "M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1M15 4v4M9 10v4M17 16v4",
 };
 export function icon(name: string, cls = ""): string {
   return `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true"><path d="${ICON_PATHS[name] || ""}"/></svg>`;

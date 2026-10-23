@@ -1,5 +1,6 @@
 package dev.devdeck;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.NotificationManager;
 import android.content.ActivityNotFoundException;
@@ -10,6 +11,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -22,6 +25,7 @@ import android.provider.Settings;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.webkit.ConsoleMessage;
 import android.webkit.JavascriptInterface;
 import android.webkit.RenderProcessGoneDetail;
@@ -60,6 +64,7 @@ public class MainActivity extends Activity implements LinkService.Listener {
     private static final String HOST = "appassets.androidplatform.net";
     private static final String INDEX = "https://" + HOST + "/web/index.html";
     private static final int REQ_FILES = 1;
+    private static final int REQ_MIC = 2;
     private static final long BACK_TIMEOUT_MS = 1000;
 
     static volatile MainActivity current;
@@ -72,6 +77,12 @@ public class MainActivity extends Activity implements LinkService.Listener {
     private String pendingOpen;
     private boolean backPending;
     private final Runnable backTimeout = this::backUnhandled;
+    private Recognizer recognizer;
+    private String pendingListen;  // listen opts waiting for the microphone permission
+    // Local events (stt) coalesced into one dd.receive script per main-loop turn.
+    private final ArrayList<String> localOut = new ArrayList<>();
+    private boolean localPosted;
+    private final Runnable flushLocal = this::flushLocal;
 
     private final ServiceConnection conn = new ServiceConnection() {
         @Override
@@ -93,6 +104,8 @@ public class MainActivity extends Activity implements LinkService.Listener {
         super.onCreate(saved);
         current = this;
         prefs = LinkService.prefs(this);
+        setVolumeControlStream(AudioManager.STREAM_MUSIC);  // volume keys adjust the TTS voice
+        recognizer = new Recognizer(this, this::emitLocal);
         WebView.setWebContentsDebuggingEnabled(true);
         createWeb();
         applyPairing(getIntent());
@@ -123,6 +136,7 @@ public class MainActivity extends Activity implements LinkService.Listener {
     @Override
     protected void onStop() {
         started = false;
+        recognizer.cancel();  // the microphone is only ours while visible
         if (svc != null) svc.setVisible(false);
         if (web != null) {
             web.onPause();
@@ -135,6 +149,8 @@ public class MainActivity extends Activity implements LinkService.Listener {
     protected void onDestroy() {
         if (current == this) current = null;
         main.removeCallbacks(backTimeout);
+        resetVoice();
+        recognizer.destroy();
         if (svc != null) {
             svc.setVisible(false);
             svc.setListener(null);
@@ -194,7 +210,10 @@ public class MainActivity extends Activity implements LinkService.Listener {
     private final class Client extends WebViewClient {
         @Override
         public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
-            if (view == web) ready = false;
+            if (view == web) {
+                ready = false;
+                resetVoice();  // a new page instance starts with voice mode off
+            }
         }
 
         @Override
@@ -292,6 +311,22 @@ public class MainActivity extends Activity implements LinkService.Listener {
         onMessages(one);
     }
 
+    private void emitLocal(String m) {
+        localOut.add(m);
+        if (!localPosted) {
+            localPosted = true;
+            main.post(flushLocal);
+        }
+    }
+
+    private void flushLocal() {
+        localPosted = false;
+        if (localOut.isEmpty()) return;
+        List<String> batch = new ArrayList<>(localOut);
+        localOut.clear();
+        onMessages(batch);
+    }
+
     private void replay() {
         List<String> out = svc != null ? svc.replay() : new ArrayList<>();
         String target = pendingOpen != null ? pendingOpen : LinkService.watchTarget(this);
@@ -381,6 +416,68 @@ public class MainActivity extends Activity implements LinkService.Listener {
 
     private void backUnhandled() {
         backResult(false);
+    }
+
+    // ---- voice ----
+
+    /** Main thread. Barge-in: speaking stops before the microphone opens. */
+    private void listen(String opts) {
+        if (svc != null) svc.stopSpeaking();
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            startListening(opts);
+            return;
+        }
+        boolean asking = pendingListen != null;
+        pendingListen = opts;
+        if (!asking) requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
+    }
+
+    private void startListening(String opts) {
+        JSONObject o;
+        try {
+            o = new JSONObject(opts == null || opts.isEmpty() ? "{}" : opts);
+        } catch (JSONException e) {
+            Log.w(TAG, "bad listen opts: " + opts);
+            o = new JSONObject();
+        }
+        recognizer.start(o.optString("lang", "en-US"), o.optBoolean("partial", true),
+                o.optBoolean("preferOffline", true));
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (requestCode != REQ_MIC) return;
+        String opts = pendingListen;
+        pendingListen = null;
+        if (opts == null) return;
+        if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
+            startListening(opts);
+            return;
+        }
+        recognizer.fail("permission");
+        // Denied for good: the system no longer asks, only the app settings can grant it.
+        if (results.length > 0 && !shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO)) {
+            toast("Allow the microphone for DevDeck to talk to the agent");
+            try {
+                startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.fromParts("package", getPackageName(), null)));
+            } catch (ActivityNotFoundException ignored) {
+            }
+        }
+    }
+
+    private void setVoiceMode(boolean on) {
+        if (on) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+    }
+
+    /** Main thread. UI page replaced or gone: microphone, playback, screen and server voice off. */
+    private void resetVoice() {
+        pendingListen = null;
+        recognizer.cancel();
+        setVoiceMode(false);
+        if (svc != null) svc.resetVoice();
     }
 
     // ---- files ----
@@ -539,6 +636,33 @@ public class MainActivity extends Activity implements LinkService.Listener {
         @JavascriptInterface
         public void backResult(boolean handled) {
             main.post(() -> MainActivity.this.backResult(handled));
+        }
+
+        /** Opens the microphone: opts JSON {lang?: "en-US", partial?: true, preferOffline?: true}. */
+        @JavascriptInterface
+        public void listen(String opts) {
+            main.post(() -> {
+                if (owner == web) MainActivity.this.listen(opts);
+            });
+        }
+
+        /** Finishes the listen session with what was heard so far. */
+        @JavascriptInterface
+        public void stopListening() {
+            main.post(recognizer::stop);
+        }
+
+        @JavascriptInterface
+        public void stopSpeaking() {
+            LinkService s = svc;
+            if (s != null) s.stopSpeaking();
+        }
+
+        @JavascriptInterface
+        public void setVoiceMode(boolean on) {
+            main.post(() -> {
+                if (owner == web) MainActivity.this.setVoiceMode(on);
+            });
         }
     }
 }

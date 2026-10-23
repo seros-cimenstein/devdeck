@@ -246,6 +246,52 @@ export interface GitLogMsg {
   commits: GitCommit[];
 }
 
+/** One synthesised sentence of an utterance (server `audio`, forwarded by the shell after it queued playback). */
+export interface AudioMsg {
+  t: "audio";
+  req?: string;
+  auto?: boolean;
+  ask?: boolean;
+  toolCallId?: string;
+  target: string;
+  entryId?: string;
+  seq: number;
+  last: boolean;
+  text: string;
+  dur?: number;
+}
+/** Native speech recognizer events. */
+export interface SttMsg {
+  t: "stt";
+  phase: "ready" | "partial" | "final" | "error" | "end" | "rms";
+  text?: string;
+  error?: string;
+  rms?: number;
+}
+/** Native player events; `stopped` carries the utterance that was playing. */
+export interface TtsMsg {
+  t: "tts";
+  phase: "start" | "chunk" | "end" | "stopped" | "error";
+  seq?: number;
+  text?: string;
+  req?: string;
+  entryId?: string;
+  target?: string;
+  auto?: boolean;
+  ask?: boolean;
+  error?: string;
+}
+export interface VoiceErrorMsg {
+  t: "voice_error";
+  req?: string;
+  auto?: boolean;
+  ask?: boolean;
+  entryId?: string;
+  toolCallId?: string;
+  target?: string;
+  error: string;
+}
+
 /** Any message crossing the bridge; `t` discriminates, the rest is checked by the consumer. */
 export interface Msg {
   t: string;

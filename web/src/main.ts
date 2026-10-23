@@ -13,9 +13,10 @@ import { PagePanel } from "./page";
 import { currentPane, hooks, state, type View } from "./state";
 import { TermView } from "./term";
 import { TopBar } from "./topbar";
-import type { AckMsg, LinkMsg, Msg, Pane, ScreenMsg, SessionsMsg, TranscriptMsg } from "./types";
+import type { AckMsg, AudioMsg, LinkMsg, Msg, Pane, ScreenMsg, SessionsMsg, SttMsg, TranscriptMsg, TtsMsg, VoiceErrorMsg } from "./types";
 import { openMenu, popLayer, toast } from "./ui";
 import { fmtRtt, h, icon, learnHome, lsGet, lsSet } from "./util";
+import { initVoice, onAudio, onStt, onTts, onVoiceError, openVoiceSettings, voiceOnline, voicePanel, voiceSync } from "./voice";
 
 const app = document.getElementById("app")!;
 const viewPref = lsGet<Record<string, View>>("dd.views", {});
@@ -45,7 +46,7 @@ const compose = new Compose((target, text, enter) => {
 const askBanner = h("div.ask-banner", { hidden: true });
 const pageBanner = h("div.ask-banner.page-banner", { hidden: true });
 const main = h("main.main", null, chat.wrap, term.wrap);
-app.append(top.el, strip.el, main, pageBanner, askBanner, compose.el);
+app.append(top.el, strip.el, main, pageBanner, askBanner, voicePanel, compose.el);
 const page = new PagePanel();
 page.onChange = () => updatePageBanner();
 const drawer = new Drawer(
@@ -54,6 +55,13 @@ const drawer = new Drawer(
 );
 const ask = new AskSheet();
 ask.onChange = () => updateAskBanner();
+initVoice({
+  ask,
+  onActive: (on) => {
+    compose.el.hidden = on;
+  },
+  onSent: () => chat.scrollToBottom(true),
+});
 
 hooks.open = (t, v) => openTarget(t, v);
 hooks.openAsk = (t, a) => {
@@ -87,6 +95,7 @@ function openTarget(target: string, view?: View) {
   else term.setTarget(target);
   chat.updateStatus();
   compose.setTarget(target);
+  voiceSync();
   if (changed || !watchSent) watchSent = send({ t: "watch", target, view: v });
   top.update();
   strip.update();
@@ -123,6 +132,7 @@ function openMoreMenu(anchor: HTMLElement) {
     { label: "Keep screen awake", icon: "sun", toggle: true, on: !!l?.wakelock, act: () => bridge.setWakelock(!l?.wakelock) },
     { label: "Notifications", icon: "bell", toggle: true, on: !!l?.notify, act: () => bridge.setNotify(!l?.notify) },
     { label: "Resync", icon: "refresh", act: () => (send({ t: "resync" }) ? toast("Resyncing") : toast("Offline", "err")) },
+    { label: "Voice settings", icon: "headset", act: openVoiceSettings },
     { label: "New terminal", icon: "plus", act: newTerminal },
   ]);
 }
@@ -177,6 +187,7 @@ function onSessions(list: Pane[]) {
   drawer.render();
   chat.updateStatus();
   ask.sync();
+  voiceSync();
   updateAttention();
   maybeAutoAsk();
   updateAskBanner();
@@ -234,7 +245,10 @@ function onLink(l: LinkMsg) {
   if (l.state === "online" && lastLinkState !== "online" && state.target && !watchSent) {
     watchSent = send({ t: "watch", target: state.target, view: state.view });
   }
-  if (l.state === "online" && lastLinkState !== "online") refreshModels().catch(() => {});
+  if (l.state === "online" && lastLinkState !== "online") {
+    refreshModels().catch(() => {});
+    voiceOnline();
+  }
   lastLinkState = l.state;
   strip.update();
   compose.refresh();
@@ -287,6 +301,14 @@ function receive(m: Msg) {
       if (settle(m)) return;
       toast(String(m.error || "Error"), "err");
       return;
+    case "audio":
+      return onAudio(m as unknown as AudioMsg);
+    case "tts":
+      return onTts(m as unknown as TtsMsg);
+    case "stt":
+      return onStt(m as unknown as SttMsg);
+    case "voice_error":
+      return onVoiceError(m as unknown as VoiceErrorMsg);
     case "pong":
       return;
     default:

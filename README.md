@@ -25,6 +25,8 @@ and systemd unit. Both can run at the same time.
   - Linux with Python 3.10+ (stdlib only), tmux and git.
   - `wl-copy` (wl-clipboard) for the clipboard; `notify-send` is optional.
   - omp for the agents.
+  - Voice mode: `ffmpeg` with libopus, `bun`, and omp's local Kokoro TTS runtime, which omp
+    installs on its first `omp say` (into `~/.omp/agent/cache/tts-runtime/`).
   - To build the app: `adb` (`android-tools`), a JDK and `bun` (for the web UI). The
     Android SDK is reused from `../phone_synaptic_trackpad/.sdk`.
 - Phone: Android 8+ (developed on Android 13), with USB or wireless debugging enabled for
@@ -218,6 +220,32 @@ refused when:
 - the omp prompt on the PC holds an unsent draft. omp then shows "Finish or clear the
   current prompt to answer", and every key would go into that draft. Clear the draft on the
   PC (or from the terminal view) and retry.
+
+### Voice mode
+
+Talk to the agent and hear its replies, spoken on the PC by omp's local Kokoro voice.
+- **Toggle**: the headset button in the compose bar (agent panes, chat view). A voice panel
+  replaces the compose bar; its X or Back leaves voice mode. The screen stays on meanwhile.
+- **Loop**: Listening (live transcript and a mic level ring) → Sending → Agent working
+  (elapsed time and current activity) → Reply coming → Speaking (the current sentence is
+  highlighted; tap the text or Stop to stop) → listening again ("Listen again" setting),
+  else Your turn. Tap the mic any time to talk: while it speaks this stops the voice and
+  listens; while it listens it finishes your utterance (as "Done" does). Recognised text is
+  sent like a typed message; the spoken-style hint (on by default) appends "(voice mode:
+  reply in short plain spoken sentences; no tables or code unless I ask)".
+- **Questions**: the question sheet opens as usual, the question is read aloud ("omp asks:
+  ... Options: one, ... two, ...") and then it listens. Say a number or ordinal (English or
+  Turkish: "two", "the second one", "last", "recommended", "ikinci", ...), part of an
+  option's label, several options joined by "and"/"ve"/commas, or "other ..." / "diğer
+  ..." for your own answer; "cancel"/"iptal" stops answering by voice. The pick is ticked
+  in the sheet, read back ("Picked X. Sending.") and sent as a normal answer. When nothing
+  or several options match, the options are read again (three tries, then "answer on
+  screen"). Several questions go one at a time.
+- **Listen** button under every assistant reply (also outside voice mode) reads that reply.
+- **Voice settings** (sliders icon on the panel, or the "..." menu): 12 voices, each with a
+  sample; speed 0.75-1.5× (default 1×); recognition language English (default) or Türkçe;
+  read replies aloud, read questions aloud, listen again and spoken-style replies (all on by
+  default). Saved on the phone.
 
 ### Notifications
 
@@ -440,6 +468,59 @@ the row and presses Up/Down for the rows in between, skipping rules and blank ro
   `diff [--cached] [-- file]` (untracked files as `--no-index` against `/dev/null`), and
   `log -n 50`.
 
+**Voice mode (speech).** Replies and questions are spoken with omp's local Kokoro-82M voice,
+synthesised on the PC and streamed per sentence (protocol: "Voice messages").
+- **Spoken form.** The markdown is turned into what a person would read out: heading, bold,
+  italic and list markers dropped (list items and headings become sentences), links read as
+  their text, bare URLs as "a link", inline code as words (`webApp.render_list()` → "web
+  App dot render list"), each fenced code block as one "Python code block omitted." (with
+  its language), tables as "A table with N rows. Columns: ...", mermaid/svg/dot blocks as
+  "A diagram.", `$$` math as "A formula.", paths shortened to the file name, file names
+  read with "dot", UUIDs as "an ID", hashes as their first 4 characters, numbers of 8+
+  digits as "a long number", emoji dropped. Over 2500 characters it stops at a sentence and
+  adds "The rest is on screen.". Questions are read as "omp asks: <question>. Options: one,
+  <label>. two, <label>. You can also say other, then your answer." (several: "omp asks
+  three questions. Question one of three: ...").
+- **Streaming.** The text is split into sentences; ones shorter than 25 characters are
+  merged with the next, ones longer than 280 are split at a comma (Kokoro reads at most ~510
+  phonemes at a time), and a first sentence longer than 80 characters is split at a comma
+  so speech starts sooner. Each is synthesised, encoded to Ogg/Opus with ffmpeg (mono,
+  24 kbit/s, `-application voip`) and queued as one `audio` message as soon as it is ready,
+  so the phone plays the first sentence while the rest is synthesised. Every reading runs
+  in its own thread; the pane poller only starts them, so synthesis never delays the
+  poller, other requests or other connections. `say_stop` cancels between sentences and
+  drops the audio still waiting in the connection's send queue.
+- **Engine.** One sentence is synthesised at a time for all connections (Kokoro already
+  uses every core). The engine is a persistent worker, `bun tts_worker.ts` (repo root),
+  that loads omp's Kokoro runtime (`~/.omp/agent/cache/tts-runtime/kokoro-*`, CPU
+  `onnxruntime-node`) and the weights in omp's cache (`~/.omp/agent/cache/tiny-models/`)
+  once, then answers one JSON line per sentence with raw PCM. omp itself uses the q8
+  weights; when the fp32 ones (`onnx/model.onnx`, 325 MB) are also in that cache the worker
+  uses them, because on this laptop's CPU (i7-8650U) they are about 2.7× faster. The worker
+  never downloads them; to add them once:
+  `curl -L -o ~/.omp/agent/cache/tiny-models/onnx-community/Kokoro-82M-v1.0-ONNX/onnx/model.onnx https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model.onnx`
+  (sha256 `8fbea51e...a34cb`). The worker starts on the first reading, or ahead of time
+  when voice mode is turned on or a voice-mode agent is working, and exits after 10 minutes
+  without use to give its memory back (about 0.9 GB with fp32). If bun or the runtime is
+  missing, or the worker fails or hangs (60 s per sentence), `omp say --out` (a new process
+  that loads the model on every call) is used for the next minute instead.
+- **Measured** on the i7-8650U (8 threads, no GPU), real-time factor = synthesis time /
+  audio length:
+
+  | engine | start | per sentence (~115 chars, 7.9 s of audio) | real-time factor |
+  |---|---|---|---|
+  | worker, fp32 | 1.2 s (model load 1.0 s) | 4.2-4.7 s | 0.55-0.6 |
+  | worker, q8 | 1.1 s (model load 1.0 s) | 12-12.7 s | 1.5-1.6 |
+  | `omp say --out` (q8) | every call | 15 s | 1.8 (2.2 for a short sentence) |
+
+  With fp32 a 1900-character reply (19 sentences, 149 s of audio) took 90 s in total, the
+  first sentence arrived after 5.7 s (worker start included) and the phone never waits
+  between sentences; with q8 the total was 253 s, so playback would stall. Opus at 24
+  kbit/s is about 3 KB per second of speech.
+- **Cache.** Encoded sentences are kept in memory per (text, voice, speed) for 30 minutes
+  after their last use, at most 50 MB (least recently used dropped first), so replaying a
+  reply is instant.
+
 **State on disk.**
 - Delivered ids (last 2000) are kept in `~/.local/state/devdeck/seen.json`.
 - Partial uploads live in `~/.local/state/devdeck/partial/` until complete.
@@ -459,6 +540,22 @@ the row and presses Up/Down for the rows in between, skipping rules and blank ro
     `haptic`, `ready` and `backResult`.
   - The shell delivers every server message, plus local `link`/`toast`/`open`/`back`
     events, to `window.dd.receive`.
+  - Voice: `listen(opts)` with `{lang:"en-US"|"tr-TR", partial:true, preferOffline:true}`
+    starts Android's `SpeechRecognizer` (asks for `RECORD_AUDIO` on first use, and stops
+    playback); `stopListening()` finalises the utterance; `stopSpeaking()` stops local
+    playback only (the UI sends `say_stop` itself); `setVoiceMode(bool)` keeps the screen on
+    (`FLAG_KEEP_SCREEN_ON`) while voice mode is active.
+  - Local voice events to `window.dd.receive`:
+    - `stt {phase:"ready"|"partial"|"final"|"error"|"end"|"rms", text?, error?, rms?}`:
+      `end` exactly once per listening session; `rms` about 15 times a second.
+    - `tts {phase:"start"|"chunk"|"end"|"stopped"|"error", seq?, text?, req?, target?,
+      entryId?, auto?, ask?, error?}`.
+  - The shell sniffs `audio` and `voice_error` itself and still forwards them to the UI. It
+    plays each reading's chunks in `seq` order from temporary `.ogg` files (cache dir
+    `tts/`) with `MediaPlayer`, holding transient audio focus with ducking. It remembers the
+    UI's last `voice {...}` per target while on and re-sends it after every reconnect; a
+    page reload or the activity's destruction sends `voice {target, on:false}` for those and
+    stops everything.
   - Hardware Back closes, in order: the menu, the question sheet, viewers and panels, the
     drawer. Otherwise the app goes to the background.
 
@@ -478,6 +575,7 @@ Client → PC lines stay plain.
 |---|---|
 | Live | `watch {target, view}`, `pause`, `resume`, `resync`, `ping {ts}`, `keys {target, keys[]}`, `tap {target, row}`, `type {target, text}`, `new {}` (→ `created {target:"phone-N:W.P"}`) |
 | Queued (carry `id`, always answered by `ack {id, ok, error?}`, deduplicated) | `send {target, text, enter}`, `clip {text}`, `answer {target, toolCallId, answers:[{qid, selected[], custom?, note?}]}` |
+| Voice (live, never queued) | `voice {target, on, opts}`, `say {req, target?, entryId?, text?, voice?, speed?}`, `say_stop {req?}` (see "Voice messages") |
 | Requests (carry `req`, answered with the same `req`, or `error {req, error}`) | see below |
 
 Requests:
@@ -510,6 +608,35 @@ Live messages for omp pages: `tap {target, row}` moves the selection of the open
 (single-line text), and `ack ok:false, error:"An empty Enter would stop the agent; use Stop"`
 for an empty `enter:true` send while the pane is working.
 
+**Voice messages.** All live; failures come back as `voice_error`.
+- `voice {target, on:bool, opts:{autoRead, readAsks, voice, speed}}` subscribes this
+  connection to `target` (off: unsubscribes and stops its auto/ask readings). `autoRead` and
+  `readAsks` default to true, `voice` to `af_heart` (one of the 12 voices below), `speed` to
+  1 (clamped to 0.5-2). Re-sending it with on:true only updates the options. The shell
+  re-sends it after every reconnect. While subscribed (and not paused):
+  - when the pane finishes a turn (idle, with a new final assistant message whose
+    `stopReason` is `stop` and that has text), that text is read: `audio {auto:true, entryId}`.
+    Replies that were already there when voice mode was turned on are not read. A phone that
+    reconnects (same `client` id) within 15 minutes still gets the reply that finished while
+    the link was down, and one that was read to the old connection without the phone being
+    heard from after it (a half-open link) is read again; the old connection's subscription
+    is taken over and stops reading.
+  - when it asks (`ask` tool), the question(s) are read once per `toolCallId` per connection:
+    `audio {ask:true, toolCallId}`. An ask that is open when voice mode turns on is read
+    right away.
+  - while it works, the TTS engine is kept loaded so the reply starts quickly.
+- `say {req, target?, entryId?, text?, voice?, speed?}` reads an entry of the target's
+  transcript (`entryId`, needs `target`; its full text, not the 50 000-char display cap) or a
+  literal `text`. `voice`/`speed` may also come as `opts:{voice, speed}`; missing ones are
+  taken from the target's `voice` options, else the defaults. An unknown voice is an error.
+  At most 4 `say` streams run per connection. A new `say` does not stop earlier ones.
+- `say_stop {req?}` stops that `say` (without `req`: every reading of this connection,
+  auto and ask included). Nothing more is sent for a stopped reading: audio still waiting
+  in the PC's send queue is dropped, and no `last` chunk follows.
+
+Voices: `af_heart`, `af_bella`, `af_nicole`, `af_aoede`, `af_kore`, `af_sarah`,
+`am_michael`, `am_fenrir`, `am_puck`, `bf_emma`, `bm_george`, `bm_fable`.
+
 **PC → client**
 
 - **`sessions {list}`**: on connect and on change. While paused, it is sent only when a
@@ -540,6 +667,15 @@ for an empty `enter:true` send while the pane is working.
     `page:true` and hold only the visible rows (no scrollback; diffs are against the
     previous page frame). When the page closes one `{t:"screen", target, page:false}` is
     sent. `resync` sends a full page frame again.
+- **`audio {req?, auto?, ask?, target, entryId?, toolCallId?, seq, last, mime, data, text, dur}`**:
+  one sentence (or a few short ones merged) of a reading, sent as soon as it is synthesised.
+  `seq` counts from 0 per reading, `last:true` is on the final sentence (always with data),
+  `mime` is `audio/ogg; codecs=opus` (mono, about 24 kbit/s), `data` the base64
+  file, `text` the words spoken, `dur` its length in ms. `req` echoes the `say`; `auto`
+  readings carry the reply's `entryId`, `ask` readings the ask's `toolCallId`; `target` is
+  null for a `say` of a text without a target.
+- **`voice_error {error, req?, target?, entryId?, auto?, ask?, toolCallId?}`**: a reading
+  failed or a voice message was malformed; it ends that reading (no `last` chunk follows).
 - **Other replies**: `created`, `ack`, `pong`, `error {error, req?}`, `full`, `ls`, `read`,
   `git`, `models`, `history`, `cmd`.
 
@@ -575,3 +711,8 @@ for an empty `enter:true` send while the pane is working.
   row off; the arrow keys always work.
 - **Rename** makes omp format the title with a small model call (emoji and category).
 - **One watched pane per connection.** The clipboard needs a Wayland session.
+- **Voice mode**: a finished reply is noticed by the 2 s pane poll, so reading starts 2-4 s
+  after the turn ends (plus the link). Only the final message of a turn is read (text
+  written before tool calls is not). Synthesis loads the PC's CPU while it speaks. Nothing
+  is read while the app is paused; a reply or question that arrived meanwhile is read when
+  it comes back. The spoken-form rules are heuristics for English markdown.

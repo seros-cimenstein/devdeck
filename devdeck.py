@@ -26,6 +26,7 @@ import mmap
 import os
 import re
 import secrets
+import select
 import shutil
 import signal
 import socket
@@ -36,6 +37,7 @@ import sys
 import tempfile
 import threading
 import time
+import wave
 import zlib
 from pathlib import Path
 
@@ -119,6 +121,29 @@ PAGE_COMMANDS = ("/model", "/models", "/switch", "/effort", "/settings", "/resum
                  "/rewind", "/modelpreset", "/plan-review", "/session")
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 SEND_REWRITES = ((re.compile(r"^/models?\s+(\S.*)$"), "/switch "), (re.compile(r"^/thinking\s+(\S+)$"), "/effort "))
+
+# voice mode: Kokoro TTS (omp's local runtime), streamed per sentence as Ogg/Opus
+VOICES = ("af_heart", "af_bella", "af_nicole", "af_aoede", "af_kore", "af_sarah", "am_michael", "am_fenrir",
+          "am_puck", "bf_emma", "bm_george", "bm_fable")
+SPEED_RANGE = (0.5, 2.0)
+AUDIO_MIME = "audio/ogg; codecs=opus"
+OPUS_BITRATE = "24k"
+SPOKEN_CAP = 2500         # characters of spoken text per reply; then "The rest is on screen."
+SENTENCE_MIN = 25         # shorter sentences are merged with the next one
+SENTENCE_MAX = 280        # Kokoro reads at most ~510 phonemes per call; longer ones are split
+FIRST_MAX = 80            # the first one is split at a comma beyond this, so speech starts sooner
+AUDIO_CACHE_S = 30 * 60.0
+AUDIO_CACHE_BYTES = 50 << 20
+TTS_IDLE_S = 600.0        # the worker (model in RAM, ~0.9 GB with fp32 weights) exits after this long unused
+TTS_LOAD_S = 180.0        # worker start: model load (and the weights' first download)
+TTS_SENTENCE_S = 60.0     # one sentence in the worker
+TTS_SAY_S = 240.0         # one `omp say --out` (fallback; may install the runtime first)
+TTS_RETRY_S = 60.0        # after a worker failure, use `omp say` this long before retrying it
+TTS_WORKER = HERE / "tts_worker.ts"
+OMP_CACHE = Path.home() / ".omp" / "agent" / "cache"  # omp's own runtime and weights, not DEVDECK_OMP_DIR
+TTS_WEIGHTS = OMP_CACHE / "tiny-models"                # where omp's TTS worker keeps the Kokoro weights
+MAX_UTTERANCES = 4        # concurrent `say` streams per connection
+VOICE_RESUME_S = 15 * 60.0  # a reconnecting phone hears the reply it missed within this long
 
 SKIP_IFACES = ("lo", "docker", "virbr", "br-", "veth", "CloudflareWARP")
 
@@ -639,6 +664,7 @@ class Transcript:
         self.ask_cache: dict[str, dict | None] = {}
         self.cwd: str | None = None
         self.todo_cache: tuple[str, dict | None] | None = None
+        self.reply_cache: tuple[str, str, str] | None = None
         self._reset_state()
 
     def _reset_state(self) -> None:
@@ -1026,6 +1052,27 @@ class Transcript:
                 if node.kind == K_USER:
                     return content_text(m.get("content"))
                 return notice_text(obj.get("type"), m, obj, RESULT_CAP * 1000)
+
+    def final_reply(self) -> tuple[str, str, str] | None:
+        """(entry id, stopReason, text) of the branch's last message when it is the assistant's."""
+        with self.lock:
+            idx = self.last_msg
+            if idx < 0 or idx < self.vis_start:
+                return None
+            ident = self.path_ids[idx]
+            if self.nodes[ident].kind != K_ASSISTANT:
+                return None
+            hit = self.reply_cache
+            if hit is None or hit[0] != ident:
+                try:
+                    with self._open() as f:
+                        m = self._load(f, ident).get("message") or {}
+                except (OSError, ValueError, StaleFile):
+                    return None
+                text = "\n\n".join(b["text"] for b in m.get("content") or []
+                                   if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str))
+                hit = self.reply_cache = (ident, str(m.get("stopReason") or ""), text)
+            return hit
 
     def has_result(self, call: str) -> bool:
         with self.lock:
@@ -1724,6 +1771,532 @@ def git_log(repo: str) -> dict:
     return {"op": "log", "repo": repo, "commits": commits}
 
 
+# ---------------------------------------------------------------- voice: spoken text
+
+FENCE_RE = re.compile(r"^(`{3,}|~{3,})\s*([\w+#.-]*)")
+HEADING_RE = re.compile(r"^#{1,6}\s+(.*?)\s*#*$")
+LIST_RE = re.compile(r"^(?:[-*+]|\d{1,3}[.)])\s+(?:\[[ xX]\]\s+)?(.*)$")
+HR_RE = re.compile(r"^(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$")
+QUOTE_RE = re.compile(r"^(?:>\s?)+")
+URL_RE = re.compile(r"\b(?:https?|ftp|file)://[^\s<>()\[\]`]+|\bwww\.[^\s<>()\[\]`]+")
+# Absolute or ~/ ./ paths, or relative ones ending in a file extension; an optional :line[:col].
+PATH_RE = re.compile(r"(?<![\w/.~@-])(?:(?:~|\.{1,2})?(?:/[\w.@+-]+){2,}/?|(?:~|\.{1,2})/[\w.@+-]+/?"
+                     r"|[\w.@+-]+(?:/[\w.@+-]+)+\.[A-Za-z]\w{0,5})(?::\d+(?:[:-]\d+)?)?")
+FILE_DOT_RE = re.compile(r"(?<![\w.@/-])([A-Za-z_][\w-]+)\.([A-Za-z][A-Za-z0-9]{0,5})(?!\w|\.\w)")
+UUID_ANY_RE = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
+HASH_RE = re.compile(r"(?<![\w#])#?(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])([0-9a-f]{7,64})(?!\w)")
+LONG_NUMBER_RE = re.compile(r"(?<![\w.,])\d{8,}(?![\w.,]\d)")
+EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2300-\u23FF\u2500-\u27BF\u2B00-\u2BFF\uFE0F\u200D]")
+SPOKEN_SYMBOLS = (("->", " to "), ("→", " to "), ("⟶", " to "), ("=>", " to "), ("⇒", " to "), ("<-", " from "),
+                  ("←", " from "), (">=", " at least "), ("≥", " at least "), ("<=", " at most "), ("≤", " at most "),
+                  ("!=", " not "), ("≠", " not "), ("≈", " about "), (" & ", " and "), ("·", ", "), ("•", ", "),
+                  (" | ", ", "), (" — ", ", "), ("—", ", "), (" – ", ", "))
+DIAGRAM_LANGS = {"mermaid", "svg", "dot", "graphviz", "plantuml"}
+MATH_LANGS = {"math", "latex", "tex", "katex"}
+LANG_NAMES = {"py": "Python", "python": "Python", "js": "JavaScript", "javascript": "JavaScript", "jsx": "JavaScript",
+              "ts": "TypeScript", "typescript": "TypeScript", "tsx": "TypeScript", "sh": "shell", "bash": "shell",
+              "zsh": "shell", "fish": "shell", "shell": "shell", "console": "shell", "json": "JSON", "jsonl": "JSON",
+              "yaml": "YAML", "yml": "YAML", "toml": "TOML", "html": "HTML", "css": "CSS", "sql": "SQL", "rs": "Rust",
+              "rust": "Rust", "go": "Go", "java": "Java", "kotlin": "Kotlin", "c": "C", "cpp": "C plus plus",
+              "c++": "C plus plus", "diff": "diff", "md": "Markdown", "markdown": "Markdown", "xml": "XML",
+              "text": "", "txt": "", "plain": "", "plaintext": ""}
+NUMBER_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
+                "twelve")
+
+
+def number_word(n: int) -> str:
+    return NUMBER_WORDS[n] if 0 <= n < len(NUMBER_WORDS) else str(n)
+
+
+def code_marker(lang: str) -> str:
+    if lang in DIAGRAM_LANGS:
+        return "A diagram."
+    if lang in MATH_LANGS:
+        return "A formula."
+    name = LANG_NAMES.get(lang, lang if re.fullmatch(r"[a-z][a-z0-9]{0,11}", lang) else "")
+    return f"{name[:1].upper()}{name[1:]} code block omitted." if name else "Code block omitted."
+
+
+def file_name(path: str) -> str:
+    """The last component of a path (line suffix dropped), keeping a sentence's final period."""
+    path = re.sub(r":\d+(?:[:-]\d+)?$", "", path)
+    return path.rstrip("/").rsplit("/", 1)[-1] or path
+
+
+def code_words(code: str) -> str:
+    """Inline code read as words: paths shortened, camelCase and snake_case split, symbols dropped."""
+    c = code.strip()
+    if URL_RE.fullmatch(c):
+        return "a link"
+    c = UUID_ANY_RE.sub(" an ID ", URL_RE.sub(" a link ", c))
+    c = PATH_RE.sub(lambda m: file_name(m.group(0)), c)
+    c = re.sub(r"(?<=[a-z0-9])(?=[A-Z][a-z])", " ", c)
+    c = re.sub(r"(?<=[A-Za-z])\.(?=[A-Za-z])", " dot ", c)
+    c = re.sub(r"[^\w\s.,'%]+|_+", " ", c)
+    return " ".join(c.split())
+
+
+def math_words(tex: str) -> str:
+    return " ".join(re.sub(r"[\\{}^_$]+", " ", tex).split())
+
+
+def inline_spoken(text: str) -> str:
+    """One line of markdown as plain spoken text."""
+    t = re.sub(r"!\[([^\]]*)\]\((?:[^()\s]|\([^)]*\))*\)", lambda m: m.group(1) or "an image", text)
+    t = re.sub(r"\[([^\]]+)\]\((?:[^()\s]|\([^)]*\))*\)", r"\1", t)
+    t = re.sub(r"\[([^\]]+)\]\[[^\]]*\]", r"\1", t)
+    t = re.sub(r"(`+)(.+?)\1", lambda m: " " + code_words(m.group(2)) + " ", t)
+    t = re.sub(r"(?<![\\$\w])\$(?![\s\d])([^$\n]+?)(?<!\s)\$(?![\w$])", lambda m: math_words(m.group(1)), t)
+    t = re.sub(r"<(?:https?|ftp|file)://[^>\s]+>", "a link", t)
+    t = URL_RE.sub("a link", t)
+    t = re.sub(r"<br\s*/?>", " ", t, flags=re.I)
+    t = re.sub(r"</?[A-Za-z][^<>]*>", "", t)
+    t = UUID_ANY_RE.sub("an ID", t)
+    t = PATH_RE.sub(lambda m: file_name(m.group(0)), t)
+    t = FILE_DOT_RE.sub(r"\1 dot \2", t)
+    t = re.sub(r"(\*\*|__)(?=\S)(.+?)(?<=\S)\1", r"\2", t)
+    t = re.sub(r"(?<![\w*])\*(?=\S)(.+?)(?<=\S)\*(?![\w*])", r"\1", t)
+    t = re.sub(r"(?<![\w_])_(?=\S)(.+?)(?<=\S)_(?![\w_])", r"\1", t)
+    t = re.sub(r"~~(.+?)~~", r"\1", t)
+    t = HASH_RE.sub(lambda m: " ".join(m.group(1)[:4]), t)
+    t = LONG_NUMBER_RE.sub("a long number", t)
+    for sym, word in SPOKEN_SYMBOLS:
+        t = t.replace(sym, word)
+    t = EMOJI_RE.sub("", t)
+    t = re.sub(r"#(?=\w)", "", t)
+    t = re.sub(r"[*`~^]+|(?<=\w)_+(?=\w)", " ", t)
+    t = re.sub(r"\s+([,.;:!?])", r"\1", " ".join(t.split()))
+    t = re.sub(r"\s*\(\s*\)|\s*\[\s*\]", "", re.sub(r"([(\[])\s+", r"\1", re.sub(r"\s+([)\]])", r"\1", t)))
+    t = re.sub(r"([.!?])\s+(\([^()]*\))\.?", r" \2\1", t)  # "done. (web/)" -> "done (web)."
+    return t.strip(" ,")
+
+
+def as_sentence(text: str) -> str:
+    t = text.strip()
+    if not t:
+        return ""
+    core = t.rstrip("\"')]")
+    if core.endswith((":", ";", ",")):
+        return core[:-1].rstrip() + "."
+    return t if core.endswith((".", "!", "?", "…")) else t + "."
+
+
+def table_cells(line: str) -> list[str]:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def spoken_text(md: str, limit: int = SPOKEN_CAP) -> str:
+    """Spoken form of an assistant's markdown: headings, emphasis and list markers dropped, links
+    read as their text, URLs as "a link", inline code as words, code blocks, tables and diagrams
+    replaced by one short sentence each, paths shortened to the file name, hashes and long
+    numbers shortened. Longer than `limit` characters: cut at a sentence, "The rest is on screen."."""
+    units: list[str] = []
+    para, para_quote = "", False
+
+    def flush() -> None:
+        nonlocal para
+        if para:
+            units.append(as_sentence(para))
+            para = ""
+
+    lines = md.replace("\r\n", "\n").split("\n")
+    i = 0
+    while i < len(lines):
+        quote = lines[i].lstrip().startswith(">")
+        s = QUOTE_RE.sub("", lines[i].strip()).strip()
+        m = FENCE_RE.match(s)
+        if m:
+            flush()
+            j = i + 1
+            while j < len(lines) and not lines[j].strip().startswith(m.group(1)):
+                j += 1
+            units.append(code_marker(m.group(2).lower()))
+            i = j + 1
+            continue
+        if s.startswith("$$"):
+            flush()
+            j = i
+            if s == "$$" or not s[2:].rstrip().endswith("$$"):
+                j = i + 1
+                while j < len(lines) and "$$" not in lines[j]:
+                    j += 1
+            units.append("A formula.")
+            i = j + 1
+            continue
+        if s.lower().startswith("<svg"):
+            flush()
+            j = i
+            while j < len(lines) and "</svg>" not in lines[j].lower():
+                j += 1
+            units.append("A diagram.")
+            i = j + 1
+            continue
+        nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+        if s.startswith("|") and "-" in nxt and "|" in nxt and not nxt.strip("|:- "):
+            flush()
+            header = [h for h in (inline_spoken(c) for c in table_cells(s)) if h]
+            j = i + 2
+            while j < len(lines) and lines[j].strip().startswith("|"):
+                j += 1
+            rows = j - i - 2
+            units.append(f"A table with {number_word(rows)} row{'' if rows == 1 else 's'}."
+                         + (f" Columns: {', '.join(header)}." if header else ""))
+            i = j
+            continue
+        i += 1
+        if not s or HR_RE.match(s):
+            flush()
+            continue
+        m = HEADING_RE.match(s) or LIST_RE.match(s)
+        if m:
+            flush()
+            units.append(as_sentence(inline_spoken(m.group(1))))
+            continue
+        t = inline_spoken(s)
+        if not t:
+            continue
+        # Hard-wrapped prose continues in lower case; anything else is a line of its own.
+        if (para and quote == para_quote and not para.rstrip("\"')]").endswith((".", "!", "?", ":", "…"))
+                and t[0].islower()):
+            para += " " + t
+        else:
+            flush()
+            para, para_quote = t, quote
+    flush()
+    text = " ".join(u for u in units if u)
+    if len(text) > limit:
+        cut = max(text.rfind(p, 0, limit) for p in (". ", "! ", "? "))
+        if cut < limit // 2:
+            cut = text.rfind(" ", 0, limit)
+        text = text[:cut + 1].rstrip() + " The rest is on screen."
+    return text
+
+
+def split_sentences(text: str) -> list[str]:
+    """Streaming units: sentences, long ones split at a comma (or a space), short ones merged."""
+    pieces: list[str] = []
+    for s in re.split(r"(?<=[.!?…])\s+|(?<=[.!?…][\"')\]])\s+", text):
+        s = s.strip()
+        while len(s) > SENTENCE_MAX:
+            cut = max(s.rfind(sep, SENTENCE_MIN, SENTENCE_MAX) for sep in (", ", "; ", ": ", " (", " - "))
+            if cut <= 0:
+                cut = s.rfind(" ", SENTENCE_MIN, SENTENCE_MAX)
+            if cut <= 0:
+                cut = SENTENCE_MAX
+            pieces.append(s[:cut + 1].strip())
+            s = s[cut + 1:].strip()
+        if s:
+            pieces.append(s)
+    out: list[str] = []
+    for s in pieces:
+        if out and len(out[-1]) < SENTENCE_MIN and len(out[-1]) + 1 + len(s) <= SENTENCE_MAX:
+            out[-1] += " " + s
+        else:
+            out.append(s)
+    if len(out) > 1 and len(out[-1]) < SENTENCE_MIN and len(out[-2]) + 1 + len(out[-1]) <= SENTENCE_MAX:
+        out[-2] += " " + out.pop()
+    if out and len(out[0]) > FIRST_MAX:
+        cut = max(out[0].rfind(sep, SENTENCE_MIN, FIRST_MAX) for sep in (", ", "; ", ": ", " - "))
+        if cut > 0 and len(out[0]) - cut > SENTENCE_MIN:
+            out[0:1] = [out[0][:cut + 1], out[0][cut + 1:].strip()]
+    return out
+
+
+def ask_speech(questions: list[dict]) -> str:
+    """omp's pending question(s) read aloud with numbered options."""
+    n = len(questions)
+    parts = [f"omp asks {number_word(n)} questions." if n > 1 else "omp asks:"]
+    for qi, q in enumerate(questions):
+        if n > 1:
+            parts.append(f"Question {number_word(qi + 1)} of {number_word(n)}:")
+        parts.append(as_sentence(inline_spoken(q.get("question") or "")))
+        opts = [as_sentence(inline_spoken(o.get("label") or "")) for o in q.get("options") or []]
+        if opts:
+            parts.append("Options: " + " ".join(f"{number_word(k + 1)}, {o}" for k, o in enumerate(opts)))
+            if q.get("multi"):
+                parts.append("You can pick more than one.")
+    parts.append("You can also say other, then your answer.")
+    return " ".join(p for p in parts if p)
+
+
+# ---------------------------------------------------------------- voice: synthesis
+
+class SpeechError(Exception):
+    """Synthesis failed; the message is shown to the user."""
+
+
+class WorkerFailed(SpeechError):
+    """The persistent worker died, hung or never started; `omp say` takes over for a while."""
+
+
+class Cancelled(Exception):
+    """The utterance was stopped (say_stop, voice off, disconnect)."""
+
+
+def tool_binary(name: str, *extra: Path) -> str | None:
+    # The systemd user service may not have ~/.bun/bin or ~/.local/bin on its PATH.
+    for cand in (shutil.which(name), *(str(p) for p in extra)):
+        if cand and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def kokoro_runtime() -> Path | None:
+    """omp's installed Kokoro runtime dir (newest kokoro-* holding kokoro-js), if any."""
+    found = [p.parents[2] for p in (OMP_CACHE / "tts-runtime").glob("kokoro-*/node_modules/kokoro-js/package.json")]
+    return max(found, key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)]) if found else None
+
+
+def omp_say_pcm(text: str, voice: str, speed: float) -> tuple[bytes, int]:
+    """(mono PCM16, rate) from `omp say --out`: a new process that loads the model every call."""
+    with tempfile.TemporaryDirectory(prefix="devdeck-tts-") as tmp:
+        src, wav = Path(tmp) / "text.txt", Path(tmp) / "out.wav"
+        src.write_text(text)
+        try:
+            r = subprocess.run([omp_binary(), "say", "-f", str(src), "--voice", voice, "--speed", f"{speed:g}",
+                                "--out", str(wav)], stdin=subprocess.DEVNULL, capture_output=True, timeout=TTS_SAY_S)
+        except (OSError, subprocess.TimeoutExpired) as ex:
+            raise SpeechError(f"omp say: {ex}") from None
+        if r.returncode != 0 or not wav.exists():
+            msg = (r.stderr or r.stdout).decode(errors="replace").strip().splitlines()
+            raise SpeechError(f"omp say failed: {msg[-1] if msg else f'exit {r.returncode}'}")
+        with wave.open(str(wav)) as w:
+            if w.getsampwidth() != 2 or w.getnchannels() != 1:
+                raise SpeechError("omp say wrote an unexpected WAV format")
+            return w.readframes(w.getnframes()), w.getframerate()
+
+
+def encode_opus(pcm: bytes, rate: int) -> bytes:
+    """Mono PCM16 to Ogg/Opus (speech-tuned, OPUS_BITRATE) with ffmpeg."""
+    ffmpeg = tool_binary("ffmpeg")
+    if ffmpeg is None:
+        raise SpeechError("ffmpeg is not installed")
+    try:
+        r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "s16le", "-ar", str(rate), "-ac", "1",
+                            "-i", "pipe:0", "-c:a", "libopus", "-b:a", OPUS_BITRATE, "-application", "voip",
+                            "-f", "ogg", "pipe:1"], input=pcm, capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        raise SpeechError(f"ffmpeg: {ex}") from None
+    if r.returncode != 0 or not r.stdout:
+        raise SpeechError(f"ffmpeg failed: {r.stderr.decode(errors='replace').strip()[:300]}")
+    return r.stdout
+
+
+class Speech:
+    """Kokoro-82M synthesis for every connection: one sentence at a time (Kokoro already uses all
+    cores), Ogg/Opus encoded, cached per (text, voice, speed). The engine is a persistent bun
+    worker (tts_worker.ts) that loads omp's model once; it starts on first use (or when voice
+    mode turns on), and exits after TTS_IDLE_S unused to give its memory back. When it cannot
+    start or fails, `omp say --out` (a new process per sentence) is used instead."""
+
+    def __init__(self):
+        self.lock = threading.Lock()    # the engine; held for one sentence at a time
+        self.proc: subprocess.Popen | None = None
+        self.buf = bytearray()
+        self.used = 0.0
+        self.failed = -TTS_RETRY_S      # monotonic time of the last worker failure
+        self.warming = False
+        self.errlog: collections.deque[str] = collections.deque(maxlen=20)
+        self.cache_lock = threading.Lock()
+        self.cache: collections.OrderedDict[tuple, tuple[float, bytes, int]] = collections.OrderedDict()
+        self.cache_bytes = 0
+        threading.Thread(target=self._reaper, daemon=True).start()
+
+    # ------------------------------------------------------------ public
+
+    def synth(self, text: str, voice: str, speed: float, cancel: threading.Event) -> tuple[bytes, int, str]:
+        """(ogg, duration ms, engine) of one sentence; engine is "cache", "worker" or "omp say"."""
+        key = (text, voice, speed)
+        hit = self._cached(key)
+        if hit is not None:
+            return hit[0], hit[1], "cache"
+        while not self.lock.acquire(timeout=0.2):
+            if cancel.is_set():
+                raise Cancelled()
+        try:
+            if cancel.is_set():
+                raise Cancelled()
+            pcm, rate, engine = self._pcm(text, voice, speed)
+            self.used = time.monotonic()
+        finally:
+            self.lock.release()
+        ogg = encode_opus(pcm, rate)
+        dur = round(len(pcm) / 2 * 1000 / rate)
+        self._store(key, ogg, dur)
+        return ogg, dur, engine
+
+    def warm(self) -> None:
+        """Voice mode is on, or a voice-mode agent is working: have the model loaded by the time a
+        reply needs it (and count this as use, so the idle timer does not unload it meanwhile)."""
+        self.used = time.monotonic()
+        if self.warming or (self.proc is not None and self.proc.poll() is None):
+            return
+        self.warming = True
+        threading.Thread(target=self._warm, daemon=True).start()
+
+    # ------------------------------------------------------------ engine
+
+    def _warm(self) -> None:
+        try:
+            with self.lock:
+                if time.monotonic() - self.failed < TTS_RETRY_S:
+                    return
+                try:
+                    self._worker()
+                except WorkerFailed as ex:
+                    log(f"tts worker: {ex}")
+                    self._stop_worker()
+                    self.failed = time.monotonic()
+        finally:
+            self.warming = False
+
+    def _pcm(self, text: str, voice: str, speed: float) -> tuple[bytes, int, str]:
+        if time.monotonic() - self.failed >= TTS_RETRY_S:
+            try:
+                if self._worker() is not None:
+                    pcm, rate = self._ask_worker(text, voice, speed)
+                    return pcm, rate, "worker"
+            except WorkerFailed as ex:
+                log(f"tts worker: {ex}; using omp say for {TTS_RETRY_S:.0f} s")
+                self._stop_worker()
+                self.failed = time.monotonic()
+        pcm, rate = omp_say_pcm(text, voice, speed)
+        return pcm, rate, "omp say"
+
+    def _worker(self) -> subprocess.Popen | None:
+        """The running worker, started if needed; None when bun or omp's runtime is missing
+        (the first `omp say` installs the runtime)."""
+        if self.proc is not None:
+            if self.proc.poll() is None:
+                return self.proc
+            log(f"tts worker exited ({self.proc.returncode}): {self._errtail()}")
+            self._stop_worker()
+        bun, runtime = tool_binary("bun", Path.home() / ".bun" / "bin" / "bun"), kokoro_runtime()
+        if bun is None or runtime is None or not TTS_WORKER.exists():
+            return None
+        start = time.monotonic()
+        try:
+            self.proc = subprocess.Popen([bun, str(TTS_WORKER), str(runtime), str(TTS_WEIGHTS)], cwd=str(runtime),
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                         bufsize=0, start_new_session=True)
+        except OSError as ex:
+            raise WorkerFailed(f"cannot start: {ex}") from None
+        self.buf = bytearray()
+        threading.Thread(target=self._drain, args=(self.proc,), daemon=True).start()
+        head = self._read_head(start + TTS_LOAD_S)
+        if head.get("ready") is not True:
+            raise WorkerFailed(f"unexpected first line {head!r}")
+        log(f"tts worker ready in {(time.monotonic() - start) * 1000:.0f} ms "
+            f"({head.get('dtype')} model loaded in {head.get('ms')} ms)")
+        return self.proc
+
+    def _ask_worker(self, text: str, voice: str, speed: float) -> tuple[bytes, int]:
+        proc = self.proc
+        try:
+            proc.stdin.write(json.dumps({"text": text, "voice": voice, "speed": speed}).encode() + b"\n")
+        except OSError as ex:
+            raise WorkerFailed(f"write: {ex}; {self._errtail()}") from None
+        deadline = time.monotonic() + TTS_SENTENCE_S
+        head = self._read_head(deadline)
+        if head.get("ok") is not True:
+            raise SpeechError(f"Kokoro: {head.get('error') or head!r}")
+        size, rate = head.get("bytes"), head.get("rate")
+        if not isinstance(size, int) or not isinstance(rate, int) or size < 0 or rate <= 0:
+            raise WorkerFailed(f"bad header {head!r}")
+        while len(self.buf) < size:
+            self._fill(deadline)
+        pcm = bytes(self.buf[:size])
+        del self.buf[:size]
+        return pcm, rate
+
+    def _fill(self, deadline: float) -> None:
+        fd = self.proc.stdout.fileno()
+        left = deadline - time.monotonic()
+        if left <= 0 or not select.select([fd], [], [], left)[0]:
+            raise WorkerFailed(f"no answer in time; {self._errtail()}")
+        chunk = os.read(fd, 1 << 16)
+        if not chunk:
+            raise WorkerFailed(f"exited: {self._errtail()}")
+        self.buf += chunk
+
+    def _read_head(self, deadline: float) -> dict:
+        while (end := self.buf.find(b"\n")) < 0:
+            self._fill(deadline)
+        line = bytes(self.buf[:end])
+        del self.buf[:end + 1]
+        try:
+            head = json.loads(line)
+        except ValueError:
+            head = None
+        if not isinstance(head, dict):
+            raise WorkerFailed(f"bad output {line[:200]!r}")
+        return head
+
+    def _drain(self, proc: subprocess.Popen) -> None:
+        for line in proc.stderr:
+            text = line.decode(errors="replace").rstrip()
+            if text:
+                self.errlog.append(text)
+
+    def _errtail(self) -> str:
+        return " | ".join(list(self.errlog)[-3:]) or "no error output"
+
+    def _stop_worker(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            proc.stdin.close()
+            proc.wait(timeout=3)
+        except (OSError, subprocess.TimeoutExpired):
+            proc.kill()
+            proc.wait()
+
+    def _reaper(self) -> None:
+        while True:
+            time.sleep(30)
+            self._expire()
+            if self.proc is not None and time.monotonic() - self.used > TTS_IDLE_S and self.lock.acquire(blocking=False):
+                try:
+                    if self.proc is not None and time.monotonic() - self.used > TTS_IDLE_S:
+                        log(f"tts worker idle for {TTS_IDLE_S:.0f} s, stopping it")
+                        self._stop_worker()
+                finally:
+                    self.lock.release()
+
+    # ------------------------------------------------------------ audio cache
+
+    def _cached(self, key: tuple) -> tuple[bytes, int] | None:
+        with self.cache_lock:
+            hit = self.cache.get(key)
+            if hit is None or hit[0] < time.monotonic():
+                return None
+            self.cache[key] = (time.monotonic() + AUDIO_CACHE_S, hit[1], hit[2])
+            self.cache.move_to_end(key)
+            return hit[1], hit[2]
+
+    def _store(self, key: tuple, ogg: bytes, dur: int) -> None:
+        with self.cache_lock:
+            old = self.cache.pop(key, None)
+            if old is not None:
+                self.cache_bytes -= len(old[1])
+            self.cache[key] = (time.monotonic() + AUDIO_CACHE_S, ogg, dur)
+            self.cache_bytes += len(ogg)
+            while self.cache_bytes > AUDIO_CACHE_BYTES:
+                _, (_, data, _) = self.cache.popitem(last=False)
+                self.cache_bytes -= len(data)
+
+    def _expire(self) -> None:
+        now = time.monotonic()
+        with self.cache_lock:
+            while self.cache:
+                key, (expires, data, _) = next(iter(self.cache.items()))
+                if expires >= now:
+                    break
+                del self.cache[key]
+                self.cache_bytes -= len(data)
+
+
 # ---------------------------------------------------------------- server
 
 def encode(msg: dict) -> bytes:
@@ -1781,6 +2354,11 @@ class Server:
         self.pane_models: dict[str, str] = {}
         # target -> omp fields last read from its footer (kept while a page hides the footer)
         self.footers: dict[str, dict] = {}
+        self.speech = Speech()
+        self.pane_trs: dict[str, Transcript] = {}  # agent pane target -> its transcript, from the last poll
+        # (client id, target) -> (session path, last reply id) of a voice subscription whose
+        # connection ended, so a reconnecting phone still hears a reply it missed
+        self.voice_left: dict[tuple[str, str], tuple[str | None, str | None, float]] = {}
         self.sock = socket.create_server(("0.0.0.0", port), reuse_port=False, backlog=16)
 
     def next_rev(self) -> int:
@@ -1837,6 +2415,10 @@ class Server:
                     controls = []
             for ctl in controls:
                 ctl.kick()
+            try:
+                self.voice_tick(panes)
+            except Exception as ex:
+                log(f"voice tick failed: {ex!r}")
             self.evict_transcripts()
             self.poll_now.wait(SESSIONS_POLL_S)
 
@@ -1853,7 +2435,7 @@ class Server:
         r = tmux("list-panes", "-a", "-F", fmt)
         if r.returncode != 0:
             return []
-        panes = []
+        panes, trs = [], {}
         with self.ctl_cond:
             watched = {c.target for c in self.controls if not c.paused and c.view == "chat"}
         for line in r.stdout.decode(errors="replace").splitlines():
@@ -1869,10 +2451,13 @@ class Server:
             if not agent:
                 pane["state"] = "shell" if cmd in SHELLS else "running"
             else:
-                fields, _, _ = self.inspect_agent(pane["target"], f[6], int(f[7]), working,
-                                                  pane["target"] in watched)
+                fields, tr, _ = self.inspect_agent(pane["target"], f[6], int(f[7]), working,
+                                                   pane["target"] in watched)
                 pane.update(fields)
+                if tr is not None:
+                    trs[pane["target"]] = tr
             panes.append(pane)
+        self.pane_trs = trs
         return panes
 
     def inspect_agent(self, target: str, tty: str, pid: int, working: bool, page: bool):
@@ -1940,6 +2525,66 @@ class Server:
             sel = default.split(":", 1)[0]
             prefer += [sel, sel.split("/", 1)[0]]
         return prefer
+
+    # ------------------------------------------------------------ voice mode
+
+    def voice_tick(self, panes: list[dict]) -> None:
+        """Read aloud, for each phone in voice mode, the finished replies (working -> idle with a
+        new final assistant text, stopReason stop) and new questions of the panes it listens to.
+        Only starts utterance threads: synthesis never runs on the poller."""
+        with self.ctl_cond:
+            controls = [c for c in self.controls if c.voice]
+        if not controls:
+            return
+        by_target = {p["target"]: p for p in panes}
+        for ctl in controls:
+            for target, sub in ctl.voice_subs():
+                pane = by_target.get(target)
+                if pane is None or not pane["agent"]:
+                    continue
+                tr = self.pane_trs.get(target)
+                path = tr.path if tr is not None else None
+                reply = tr.final_reply() if tr is not None else None
+                rid = reply[0] if reply else None
+                if sub["path"] != path:  # first look, /new, /resume: nothing that was there is read
+                    sub["path"], sub["heard"], sub["prev"], sub["done_at"] = path, rid, rid, 0.0
+                if ctl.paused:  # read when the app is back on screen
+                    continue
+                state, opts = pane["state"], sub["opts"]
+                if state == "working":
+                    self.speech.warm()
+                elif state == "asking":
+                    ask = pane.get("ask")
+                    if ask and opts["readAsks"] and ask["toolCallId"] not in sub["asked"]:
+                        sub["asked"].add(ask["toolCallId"])
+                        ctl.speak_ask(target, ask, opts)
+                elif rid is not None and rid != sub["heard"]:
+                    read = reply[1] == "stop" and reply[2].strip() and opts["autoRead"]
+                    sub["prev"] = sub["heard"] if read else rid
+                    sub["heard"], sub["done_at"] = rid, None if read else 0.0
+                    if read:
+                        ctl.speak_reply(target, rid, reply[2], opts, sub)
+
+    def voice_sub(self, ctl: Control, target: str, opts: dict) -> dict:
+        """A new voice subscription of `ctl` to `target`. A reconnecting phone (same client id)
+        continues where its previous connection left off, so a reply that finished while the
+        link was down is still read, and one that went to a dead connection is read again."""
+        sub = {"opts": opts, "path": None, "heard": None, "prev": None, "done_at": 0.0, "asked": set()}
+        if not ctl.client:
+            return sub
+        with self.ctl_cond:
+            twins = [c for c in self.controls if c is not ctl and c.client == ctl.client]
+        for twin in twins:  # the old connection has not noticed the drop yet: take over from it
+            old = twin.drop_voice(target)
+            if old is not None:
+                sub["path"], sub["heard"] = old["path"], twin.delivered(old)
+                sub["prev"] = sub["heard"]
+                return sub
+        left = self.voice_left.pop((ctl.client, target), None)
+        if left is not None and time.monotonic() - left[2] < VOICE_RESUME_S:
+            sub["path"], sub["heard"] = left[0], left[1]
+            sub["prev"] = sub["heard"]
+        return sub
 
     def cmd_lock(self, target: str) -> threading.Lock:
         with self.cmd_locks_lock:
@@ -2362,6 +3007,25 @@ class PaneCommand:
         return self.confirm(before, check, timeout=PAGE_WAIT_S)
 
 
+class Utterance:
+    """One text being spoken to one connection: `say` (req), an auto-read reply or a question."""
+    __slots__ = ("req", "target", "kind", "cancel", "pushed")
+
+    def __init__(self, req: str | None, target: str | None, kind: str):
+        self.req, self.target, self.kind = req, target, kind
+        self.cancel = threading.Event()
+        self.pushed: list[dict] = []  # audio messages queued for the writer (dropped again on stop)
+
+
+def voice_opts(raw) -> dict:
+    o = raw if isinstance(raw, dict) else {}
+    speed = o.get("speed")
+    speed = float(speed) if isinstance(speed, (int, float)) and not isinstance(speed, bool) else 1.0
+    return {"autoRead": o.get("autoRead") is not False, "readAsks": o.get("readAsks") is not False,
+            "voice": o.get("voice") if o.get("voice") in VOICES else VOICES[0],
+            "speed": round(min(SPEED_RANGE[1], max(SPEED_RANGE[0], speed)), 2)}
+
+
 class Control:
     """One phone's control connection: a reader (this thread) handles requests, a writer
     thread owns the zlib stream and streams the watched pane (screen diffs in the term view,
@@ -2391,6 +3055,11 @@ class Control:
         self.requests = threading.BoundedSemaphore(MAX_REQUESTS)
         self.info_cache: tuple[str, float, dict | str] | None = None
         self.poke = False  # check the watched pane for an omp page right away (after keys, cmd page)
+        self.voice_lock = threading.Lock()
+        # target -> {opts, path, heard, prev, done_at, asked} (see Server.voice_tick and delivered())
+        self.voice: dict[str, dict] = {}
+        self.utterances: set[Utterance] = set()  # guarded by self.cond
+        self.last_rx = time.monotonic()  # when the phone last sent anything
 
     def poke_page(self) -> None:
         with self.cond:
@@ -2422,6 +3091,11 @@ class Control:
             with self.cond:
                 self.closed = True
                 self.cond.notify()
+            self.stop_utterances(lambda u: True)
+            now = time.monotonic()
+            for target, sub in self.voice_subs():
+                if self.client:
+                    self.server.voice_left[(self.client, target)] = (sub["path"], self.delivered(sub), now)
             try:
                 self.sock.shutdown(socket.SHUT_RDWR)
             except OSError:
@@ -2433,6 +3107,7 @@ class Control:
         while True:
             try:
                 line = self.rf.readline(MAX_LINE)
+                self.last_rx = time.monotonic()
             except TimeoutError:
                 log(f"{self.peer}: silent for {self.sock.gettimeout():.0f} s, dropping")
                 return
@@ -2489,6 +3164,13 @@ class Control:
             self.do_type(msg)
         elif kind == "new":
             self.new_terminal()
+        elif kind == "voice":
+            self.do_voice(msg)
+        elif kind == "say":
+            self.do_say(msg)
+        elif kind == "say_stop":
+            req = msg.get("req")
+            self.stop_utterances(lambda u: u.req == req if isinstance(req, str) else True)
         elif kind in ("more", "full", "ls", "read", "git", "models", "history", "cmd"):
             self.request(msg)
         else:
@@ -2678,6 +3360,174 @@ class Control:
             self.push({"t": "error", "error": f"type: {tmux_error(r)}"})
             return
         self.poke_page()
+
+    # ------------------------------------------------------------ voice mode
+
+    def voice_subs(self) -> list[tuple[str, dict]]:
+        with self.voice_lock:
+            return list(self.voice.items())
+
+    def delivered(self, sub: dict) -> str | None:
+        """The last reply of `sub` this phone surely got: the newest one when it was queued
+        completely and the phone was heard from afterwards (so the link was alive), else the
+        one before it."""
+        done = sub["done_at"]
+        return sub["heard"] if done is not None and self.last_rx > done else sub["prev"]
+
+    def drop_voice(self, target: str) -> dict | None:
+        """Hand this (stale) connection's subscription to `target` over to a new connection."""
+        with self.voice_lock:
+            sub = self.voice.pop(target, None)
+        if sub is not None:
+            self.stop_utterances(lambda u: u.kind != "say" and u.target == target)
+        return sub
+
+    def voice_error(self, error: str, **fields) -> None:
+        self.push({"t": "voice_error", "error": error, **{k: v for k, v in fields.items() if v is not None}})
+
+    def do_voice(self, msg: dict) -> None:
+        target, on = msg.get("target"), msg.get("on")
+        if not isinstance(target, str) or not target or not isinstance(on, bool):
+            self.voice_error("voice needs a target and on")
+            return
+        info = self.pane(target)
+        canon = info["target"] if isinstance(info, dict) else target
+        if not on:
+            with self.voice_lock:
+                self.voice.pop(canon, None)
+                self.voice.pop(target, None)
+            self.server.voice_left.pop((self.client, canon), None)
+            self.stop_utterances(lambda u: u.kind != "say" and u.target == canon)
+            return
+        if isinstance(info, str):
+            self.voice_error(f"{info}: {target}")
+            return
+        opts = voice_opts(msg.get("opts"))
+        with self.voice_lock:
+            sub = self.voice.get(canon)
+            if sub is not None:
+                sub["opts"] = opts
+        if sub is None:
+            sub = self.server.voice_sub(self, canon, opts)
+            with self.voice_lock:
+                self.voice.setdefault(canon, sub)
+        self.server.speech.warm()
+        self.server.poll_now.set()  # an open question is read right away
+
+    def do_say(self, msg: dict) -> None:
+        req, target, entry, text = msg.get("req"), msg.get("target"), msg.get("entryId"), msg.get("text")
+        req = req if isinstance(req, str) and req else None
+        target = target if isinstance(target, str) and target else None
+        if entry is not None and (not isinstance(entry, str) or not entry or target is None):
+            self.voice_error("say with an entryId needs a target", req=req)
+            return
+        if entry is None and (not isinstance(text, str) or not text.strip()):
+            self.voice_error("say needs an entryId or a text", req=req)
+            return
+        # voice/speed: the message's own (top level or opts), else this target's voice mode, else defaults
+        given = {**(msg.get("opts") if isinstance(msg.get("opts"), dict) else {}),
+                 **{k: msg[k] for k in ("voice", "speed") if k in msg}}
+        if "voice" in given and given["voice"] not in VOICES:
+            self.voice_error(f"unknown voice {given['voice']!r}", req=req)
+            return
+        with self.voice_lock:
+            sub = self.voice.get(target) if target else None
+            base = dict(sub["opts"]) if sub else voice_opts(None)
+        opts = voice_opts({**base, **given})
+        utt = Utterance(req, target, "say")
+        with self.cond:
+            if sum(1 for u in self.utterances if u.kind == "say") >= MAX_UTTERANCES:
+                utt = None
+            else:
+                self.utterances.add(utt)
+        if utt is None:
+            self.voice_error("too many readings at once; stop one first", req=req)
+            return
+        threading.Thread(target=self._say, args=(utt, entry, text, opts), daemon=True).start()
+
+    def _say(self, utt: Utterance, entry: str | None, text: str | None, opts: dict) -> None:
+        fields = {"req": utt.req, "entryId": entry}
+
+        def make_text() -> str:
+            if entry is None:
+                return spoken_text(text)
+            tr = self.transcript_of(utt.target)
+            if tr is None:
+                raise RequestError("no omp session in that terminal")
+            tr.refresh()
+            return spoken_text(tr.full(entry))
+
+        self.stream(utt, make_text, fields, opts)
+
+    def speak_reply(self, target: str, entry: str, text: str, opts: dict, sub: dict) -> None:
+        self.speak(Utterance(None, target, "auto"), lambda: spoken_text(text), {"auto": True, "entryId": entry}, opts,
+                   sub)
+
+    def speak_ask(self, target: str, ask: dict, opts: dict) -> None:
+        self.speak(Utterance(None, target, "ask"), lambda: spoken_text(ask_speech(ask["questions"])),
+                   {"ask": True, "toolCallId": ask["toolCallId"]}, opts)
+
+    def speak(self, utt: Utterance, make_text, fields: dict, opts: dict, sub: dict | None = None) -> None:
+        with self.cond:
+            if self.closed:
+                return
+            self.utterances.add(utt)
+        threading.Thread(target=self.stream, args=(utt, make_text, fields, opts, sub), daemon=True).start()
+
+    def stream(self, utt: Utterance, make_text, fields: dict, opts: dict, sub: dict | None = None) -> None:
+        """Synthesise the text sentence by sentence and queue each as an `audio` message as soon
+        as it is ready, so the phone starts playing the first while the rest is synthesised."""
+        fields = {k: v for k, v in fields.items() if v is not None}
+        start, first, engines = time.monotonic(), 0.0, set()
+        try:
+            spoken = make_text()
+            sentences = split_sentences(spoken)
+            if not sentences:
+                raise SpeechError("nothing to read")
+            base = {"t": "audio", "target": utt.target, **fields}
+            for seq, sentence in enumerate(sentences):
+                ogg, dur, engine = self.server.speech.synth(sentence, opts["voice"], opts["speed"], utt.cancel)
+                engines.add(engine)
+                msg = {**base, "seq": seq, "last": seq == len(sentences) - 1, "mime": AUDIO_MIME,
+                       "data": base64.b64encode(ogg).decode(), "text": sentence, "dur": dur}
+                with self.cond:
+                    if utt.cancel.is_set():
+                        raise Cancelled()
+                    utt.pushed.append(msg)
+                    self.out.append(msg)
+                    self.cond.notify()
+                if not seq:
+                    first = time.monotonic() - start
+            log(f"{self.peer}: spoke {utt.kind} {utt.req or fields.get('entryId') or ''}: {len(sentences)} sentences, "
+                f"{len(spoken)} chars, first after {first * 1000:.0f} ms, all after "
+                f"{(time.monotonic() - start) * 1000:.0f} ms ({'/'.join(sorted(engines))})")
+        except Cancelled:
+            pass
+        except (SpeechError, RequestError) as ex:
+            log(f"{self.peer}: {utt.kind} speech failed: {ex}")
+            self.voice_error(str(ex), target=utt.target, **fields)
+        except StaleFile:
+            self.voice_error("the session file changed; try again", target=utt.target, **fields)
+        finally:
+            self.finish(utt)
+            if sub is not None:
+                sub["done_at"] = time.monotonic()
+
+    def finish(self, utt: Utterance) -> None:
+        with self.cond:
+            self.utterances.discard(utt)
+            utt.pushed = []
+
+    def stop_utterances(self, pred) -> None:
+        """Cancel matching utterances and drop their audio the writer has not sent yet."""
+        with self.cond:
+            hit = [u for u in self.utterances if pred(u)]
+            drop = set()
+            for u in hit:
+                u.cancel.set()
+                drop.update(id(m) for m in u.pushed)
+            if drop:
+                self.out = collections.deque(m for m in self.out if id(m) not in drop)
 
     # ------------------------------------------------------------ requests
 

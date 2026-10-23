@@ -8,6 +8,7 @@ import { onOutboxChange, outboxFor, retrySend } from "./outbox";
 import { state } from "./state";
 import { openMenu, toast } from "./ui";
 import { debounce, h, icon, lsGet, lsSet } from "./util";
+import { setEnabled, voiceEnabled } from "./voice";
 
 const LONG_PRESS_MS = 450;
 const DRAFTS_KEY = "dd.drafts";
@@ -40,6 +41,7 @@ export class Compose {
   private readonly ta: HTMLTextAreaElement;
   private readonly sendBtn: HTMLButtonElement;
   private readonly keysBtn: HTMLButtonElement;
+  private readonly voiceBtn: HTMLButtonElement;
   private readonly keys: QuickKeys;
   private readonly slash: HTMLElement;
   private readonly status: HTMLElement;
@@ -64,7 +66,8 @@ export class Compose {
     this.keys.el.classList.add("c-qkeys");
     this.slash = h("div.slash", { role: "listbox", hidden: true });
     this.status = h("div.c-status", { hidden: true });
-    this.el = h("div.compose", null, this.slash, this.status, this.keys.el, h("div.c-row", null, attach, this.keysBtn, this.ta, this.sendBtn));
+    this.voiceBtn = h("button.ib.c-attach.c-voice", { "aria-label": "Voice mode", title: "Voice mode", html: icon("headset"), onclick: () => setEnabled(!voiceEnabled()) }) as HTMLButtonElement;
+    this.el = h("div.compose", null, this.slash, this.status, this.keys.el, h("div.c-row", null, attach, this.keysBtn, this.ta, this.voiceBtn, this.sendBtn));
 
     const saveDraft = debounce(() => {
       if (!this.target) return;
@@ -151,6 +154,7 @@ export class Compose {
     this.ta.placeholder = !p || agent ? (busy ? "Steer (hold send to queue)" : "Message") : "Type a command";
     const keysAvail = agent && state.view === "chat";
     this.keysBtn.hidden = !keysAvail;
+    this.voiceBtn.hidden = !keysAvail;
     this.keysBtn.classList.toggle("on", this.keysOn);
     this.keys.el.hidden = !(keysAvail && this.keysOn);
     this.renderSlash();
