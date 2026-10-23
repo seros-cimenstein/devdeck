@@ -1,4 +1,5 @@
 /devdeck.apk
+/devdeck-*.apk
 /android/build/
 /android/assets/
 /web/node_modules/

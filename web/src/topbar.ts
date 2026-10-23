@@ -8,6 +8,8 @@ export interface TopBarHandlers {
   toggleView(): void;
   more(anchor: HTMLElement): void;
   linkInfo(): void;
+  /** Long-press on the terminal name (agent panes). */
+  sessionMenu(anchor: HTMLElement): void;
 }
 
 export class TopBar {
@@ -30,7 +32,23 @@ export class TopBar {
     this.badge = badgeEl("shell");
     this.title = h("span.tb-name");
     this.ctx = h("div.tb-ctx");
-    const titles = h("button.tb-titles", { onclick: hd.drawer }, h("div.tb-line", null, this.badge, this.title), this.ctx);
+    const titles = h("button.tb-titles", null, h("div.tb-line", null, this.badge, this.title), this.ctx);
+    let pressTimer = 0;
+    let longPressed = false;
+    titles.addEventListener("pointerdown", () => {
+      longPressed = false;
+      pressTimer = window.setTimeout(() => {
+        if (!currentPane()?.agent) return;
+        longPressed = true;
+        hd.sessionMenu(titles);
+      }, 500);
+    });
+    for (const ev of ["pointerup", "pointerleave", "pointercancel"]) titles.addEventListener(ev, () => clearTimeout(pressTimer));
+    titles.addEventListener("contextmenu", (e) => e.preventDefault());
+    titles.addEventListener("click", () => {
+      if (!longPressed) hd.drawer();
+      longPressed = false;
+    });
     this.viewBtn = h("button.ib.tb-view", { onclick: hd.toggleView }) as HTMLButtonElement;
     this.linkDot = h("span.l-dot");
     this.linkText = h("span.l-rtt");

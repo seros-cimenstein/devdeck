@@ -34,6 +34,8 @@ for (const f of katexFonts) await copyFile(join(nm, "katex/dist/fonts", f), join
 const mono = join(nm, "@fontsource/jetbrains-mono/files");
 await copyFile(join(mono, "jetbrains-mono-latin-400-normal.woff2"), join(out, "fonts/jbmono-400.woff2"));
 await copyFile(join(mono, "jetbrains-mono-latin-700-normal.woff2"), join(out, "fonts/jbmono-700.woff2"));
+// Box drawing, arrows and symbols (subset of JetBrains Mono, OFL) for omp's TUI pages; the npm subsets lack them.
+await copyFile(join(root, "src/fonts/jbmono-symbols-400.woff"), join(out, "fonts/jbmono-symbols-400.woff"));
 
 const appCss = await Bun.file(join(root, "src/app.css")).text();
 await Bun.write(join(out, "app.css"), katexCss + "\n" + minifyCss(appCss));

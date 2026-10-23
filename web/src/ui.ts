@@ -144,8 +144,107 @@ export function openMenu(anchor: HTMLElement, items: MenuItem[]) {
   });
   document.body.append(scrim, menu);
   const r = anchor.getBoundingClientRect();
-  menu.style.top = `${r.bottom + 4}px`;
   menu.style.right = `${Math.max(8, innerWidth - r.right)}px`;
+  const mh = menu.offsetHeight;
+  if (r.bottom + 4 + mh > innerHeight - 8 && r.top - 4 - mh >= 8) {
+    menu.style.top = `${r.top - 4 - mh}px`;
+    menu.style.transformOrigin = "bottom right";
+  } else menu.style.top = `${r.bottom + 4}px`;
   requestAnimationFrame(() => menu.classList.add("open"));
   pushLayer(layer);
+}
+
+// ---- bottom sheet created on demand and removed when closed; later sheets stack above earlier ones
+let sheetDepth = 0;
+export class Sheet implements Layer {
+  readonly scrim: HTMLElement;
+  readonly el: HTMLElement;
+  readonly titleEl: HTMLElement;
+  readonly subEl: HTMLElement;
+  readonly body: HTMLElement;
+  readonly foot: HTMLElement;
+  isOpen = true;
+  onClose?: () => void;
+
+  constructor(title: string, sub = "", cls = "") {
+    this.titleEl = h("div.sheet-title", { text: title });
+    this.subEl = h("div.sheet-sub", { text: sub, hidden: !sub });
+    this.body = h("div.sheet-body");
+    this.foot = h("div.sheet-foot", { hidden: true });
+    this.scrim = h("div.scrim.sheet-scrim", { onclick: () => this.close() });
+    this.el = h(
+      `div.sheet${cls ? "." + cls : ""}`,
+      { role: "dialog", "aria-modal": "true" },
+      h("div.grab"),
+      h(
+        "div.sheet-head.pad",
+        null,
+        h("div.sh-titles", null, this.titleEl, this.subEl),
+        h("button.ib", { "aria-label": "Close", html: icon("close"), onclick: () => this.close() }),
+      ),
+      this.body,
+      this.foot,
+    );
+    const z = 30 + 2 * sheetDepth++;
+    this.scrim.style.zIndex = String(z);
+    this.el.style.zIndex = String(z + 1);
+    document.getElementById("app")!.append(this.scrim, this.el);
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        if (!this.isOpen) return;
+        this.scrim.classList.add("open");
+        this.el.classList.add("open");
+      }),
+    );
+    pushLayer(this);
+  }
+
+  setSub(sub: string) {
+    this.subEl.textContent = sub;
+    this.subEl.hidden = !sub;
+  }
+
+  close() {
+    if (!this.isOpen) return;
+    this.isOpen = false;
+    sheetDepth--;
+    removeLayer(this);
+    this.scrim.classList.remove("open");
+    this.el.classList.remove("open");
+    const { el, scrim } = this;
+    const done = () => {
+      el.remove();
+      scrim.remove();
+    };
+    el.addEventListener("transitionend", done, { once: true });
+    setTimeout(done, 450);
+    this.onClose?.();
+  }
+}
+
+export interface ConfirmOpts {
+  title: string;
+  text: string;
+  ok: string;
+  danger?: boolean;
+}
+/** Small confirmation sheet; resolves true only when the user confirms. */
+export function confirmSheet(o: ConfirmOpts): Promise<boolean> {
+  const { promise, resolve } = Promise.withResolvers<boolean>();
+  const s = new Sheet(o.title, "", "small");
+  s.body.append(h("p.sheet-text", { text: o.text }));
+  s.foot.hidden = false;
+  s.foot.classList.add("row");
+  s.foot.append(
+    h("button.btn.wide", { text: "Cancel", onclick: () => s.close() }),
+    h(`button.btn.wide.primary${o.danger ? ".danger" : ""}`, {
+      text: o.ok,
+      onclick: () => {
+        resolve(true);
+        s.close();
+      },
+    }),
+  );
+  s.onClose = () => resolve(false);
+  return promise;
 }

@@ -34,6 +34,61 @@ export interface Pane {
   agent: boolean;
   sessionId?: string;
   ask?: Ask;
+  /** Live omp session facts (agent panes only). */
+  omp?: OmpInfo;
+}
+
+export interface OmpInfo {
+  model: string | null;
+  modelName: string | null;
+  thinking: string | null;
+  fast: boolean;
+  mode: string;
+  ctx: { used: number; window: number } | null;
+  todo: { done: number; total: number; text: string } | null;
+  cwd: string | null;
+  sessionId: string | null;
+  /** omp shows a full-screen page/picker/overlay instead of the transcript. */
+  page?: { title?: string } | null;
+}
+
+export interface ModelInfo {
+  selector: string;
+  provider: string;
+  id: string;
+  name: string;
+  contextWindow?: number;
+  reasoning?: boolean;
+  thinking: string[] | null;
+}
+export interface ModelsMsg {
+  t: "models";
+  req: string;
+  models: ModelInfo[];
+  roles: Record<string, string>;
+  fetchedAt?: number;
+}
+export interface HistorySession {
+  id: string;
+  title: string;
+  recap?: string;
+  mtime: number;
+  live: boolean;
+  current: boolean;
+  pinned: boolean;
+}
+export interface HistoryMsg {
+  t: "history";
+  req: string;
+  cwd: string;
+  sessions: HistorySession[];
+}
+export interface CmdMsg {
+  t: "cmd";
+  req: string;
+  ok: boolean;
+  error?: string;
+  info?: string;
 }
 
 export interface ToolCall {
@@ -111,6 +166,8 @@ export interface ScreenMsg {
   lines?: string[];
   len?: number;
   set?: [number, string][];
+  /** Frame of an omp page mirrored into chat view; `false` once the page closed. */
+  page?: boolean;
 }
 export interface AckMsg {
   t: "ack";

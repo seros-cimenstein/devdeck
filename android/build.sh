@@ -15,6 +15,11 @@ die() {
     echo "build.sh: $*" >&2
     exit 1
 }
+# DEVDECK_VARIANT=plus builds a side-by-side copy: package dev.devdeckplus, label "DevDeck+",
+# output devdeck-plus.apk. The Java classes stay in dev.devdeck (all intents are explicit).
+VARIANT=${DEVDECK_VARIANT:-}
+[[ -z $VARIANT || $VARIANT =~ ^[a-z][a-z0-9]*$ ]] || die "DEVDECK_VARIANT must be lowercase letters/digits"
+APK_NAME=devdeck${VARIANT:+-$VARIANT}.apk
 
 # 1. Web UI -> android/assets/web/ (the web build wipes and rewrites it).
 command -v bun >/dev/null || PATH="$HOME/.bun/bin:$PATH"
@@ -35,9 +40,18 @@ OUT=build
 rm -rf "$OUT"
 mkdir -p "$OUT/classes" "$OUT/dex" "$OUT/gen"
 
+MANIFEST=AndroidManifest.xml
+RENAME=()
+if [[ -n $VARIANT ]]; then
+    if [[ $VARIANT == plus ]]; then LABEL="DevDeck+"; else LABEL="DevDeck $VARIANT"; fi
+    sed "s/android:label=\"DevDeck\"/android:label=\"$LABEL\"/g" AndroidManifest.xml > "$OUT/AndroidManifest.xml"
+    MANIFEST=$OUT/AndroidManifest.xml
+    RENAME=(--rename-manifest-package "dev.devdeck$VARIANT")
+fi
+
 # 2. Resources + assets; also generates R.java for the drawables the code uses.
 "$BT/aapt2" compile --dir res -o "$OUT/res.zip"
-"$BT/aapt2" link -I "$JAR" --manifest AndroidManifest.xml -R "$OUT/res.zip" -A assets \
+"$BT/aapt2" link -I "$JAR" --manifest "$MANIFEST" "${RENAME[@]}" -R "$OUT/res.zip" -A assets \
     --java "$OUT/gen" --auto-add-overlay -o "$OUT/unsigned.apk"
 
 # 3. Code.
@@ -55,6 +69,6 @@ if [[ ! -f $KS ]]; then
         -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
 fi
 "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android --v4-signing-enabled false \
-    --out "$ROOT/devdeck.apk" "$OUT/aligned.apk"
+    --out "$ROOT/$APK_NAME" "$OUT/aligned.apk"
 rm -rf "$OUT"
-echo "built $ROOT/devdeck.apk"
+echo "built $ROOT/$APK_NAME"

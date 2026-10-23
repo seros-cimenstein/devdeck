@@ -3,16 +3,19 @@ import { AskSheet } from "./ask";
 import { bridge, send, settle } from "./bridge";
 import { ChatView } from "./chat";
 import { Compose } from "./compose";
+import { ControlStrip, openSessionMenu } from "./controls";
 import { Drawer } from "./drawer";
 import { FilesPanel, findRepo, openFileViewer } from "./files";
 import { openGit } from "./git";
+import { refreshModels } from "./omp";
 import { outboxAck, sendText } from "./outbox";
+import { PagePanel } from "./page";
 import { currentPane, hooks, state, type View } from "./state";
 import { TermView } from "./term";
 import { TopBar } from "./topbar";
 import type { AckMsg, LinkMsg, Msg, Pane, ScreenMsg, SessionsMsg, TranscriptMsg } from "./types";
 import { openMenu, popLayer, toast } from "./ui";
-import { fmtRtt, h, learnHome, lsGet, lsSet } from "./util";
+import { fmtRtt, h, icon, learnHome, lsGet, lsSet } from "./util";
 
 const app = document.getElementById("app")!;
 const viewPref = lsGet<Record<string, View>>("dd.views", {});
@@ -30,7 +33,9 @@ const top = new TopBar({
     const parts = [l.state, l.host, fmtRtt(l.rtt) && `rtt ${fmtRtt(l.rtt)}`, l.queued ? `${l.queued} queued` : ""];
     toast(parts.filter(Boolean).join(" · "));
   },
+  sessionMenu: (anchor) => openSessionMenu(anchor),
 });
+const strip = new ControlStrip();
 const chat = new ChatView();
 const term = new TermView();
 const compose = new Compose((target, text, enter) => {
@@ -38,8 +43,11 @@ const compose = new Compose((target, text, enter) => {
   if (state.view === "chat") chat.scrollToBottom(true);
 });
 const askBanner = h("div.ask-banner", { hidden: true });
+const pageBanner = h("div.ask-banner.page-banner", { hidden: true });
 const main = h("main.main", null, chat.wrap, term.wrap);
-app.append(top.el, main, askBanner, compose.el);
+app.append(top.el, strip.el, main, pageBanner, askBanner, compose.el);
+const page = new PagePanel();
+page.onChange = () => updatePageBanner();
 const drawer = new Drawer(
   (t) => openTarget(t),
   () => newTerminal(),
@@ -79,9 +87,10 @@ function openTarget(target: string, view?: View) {
   else term.setTarget(target);
   chat.updateStatus();
   compose.setTarget(target);
-  compose.setPlaceholder(p && !p.agent ? "Type a command" : "Message");
   if (changed || !watchSent) watchSent = send({ t: "watch", target, view: v });
   top.update();
+  strip.update();
+  syncPage();
   drawer.render();
   updateAttention();
   maybeAutoAsk();
@@ -162,6 +171,9 @@ function onSessions(list: Pane[]) {
     }, 400);
   }
   top.update();
+  strip.update();
+  compose.refresh();
+  syncPage();
   drawer.render();
   chat.updateStatus();
   ask.sync();
@@ -178,6 +190,27 @@ function maybeAutoAsk() {
   const p = currentPane();
   if (!p?.ask || ask.dismissed.has(p.ask.toolCallId) || ask.openFor === p.ask.toolCallId) return;
   ask.open(p.target, p.ask);
+}
+
+function syncPage() {
+  const p = currentPane();
+  if (state.view === "chat" && p?.agent) page.sync(p.target, p.omp?.page);
+  else page.reset();
+  updatePageBanner();
+}
+
+function updatePageBanner() {
+  const p = currentPane();
+  const pg = p?.omp?.page;
+  const show = !!pg && state.view === "chat" && page.hiddenFor === p?.target && !page.isOpen;
+  pageBanner.hidden = !show;
+  if (!show) return;
+  pageBanner.textContent = "";
+  pageBanner.append(
+    h("span.ab-badge", { html: icon("term") }),
+    h("span.ab-text", { text: `omp page open: ${pg?.title || "page"}` }),
+    h("button.btn.primary.sm", { text: "Show", onclick: () => page.show() }),
+  );
 }
 
 function updateAskBanner() {
@@ -201,7 +234,10 @@ function onLink(l: LinkMsg) {
   if (l.state === "online" && lastLinkState !== "online" && state.target && !watchSent) {
     watchSent = send({ t: "watch", target: state.target, view: state.view });
   }
+  if (l.state === "online" && lastLinkState !== "online") refreshModels().catch(() => {});
   lastLinkState = l.state;
+  strip.update();
+  compose.refresh();
   drawer.render();
 }
 
@@ -226,6 +262,10 @@ function receive(m: Msg) {
     }
     case "screen": {
       const sm = m as unknown as ScreenMsg;
+      if (sm.page != null) {
+        if (state.view === "chat" && sm.target === state.target) page.onScreen(sm);
+        return;
+      }
       if (state.view === "term" && sm.target === state.target) term.onScreen(sm);
       return;
     }

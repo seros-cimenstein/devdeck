@@ -22,12 +22,14 @@ import datetime
 import hmac
 import json
 import mimetypes
+import mmap
 import os
 import re
 import secrets
 import shutil
 import signal
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -93,7 +95,58 @@ KEY_PAUSE_S = 0.04
 BOX_PAUSE_S = 0.15       # around text typed into the dialog's note / custom answer boxes
 DRAFT_TRAP = "Finish or clear the current prompt to answer"
 
+# omp controls (models, history, cmd) and live pages
+MODELS_FILE = STATE_DIR / "models.json"
+MODELS_TTL_S = 6 * 3600.0
+MODELS_TIMEOUT_S = 90.0
+CMD_WAIT_S = 6.0
+CMD_QUEUE_S = 20.0        # how long a command waits for the previous one on the same pane
+CMD_SETTLE_S = 0.8        # footer-confirmed commands wait this long for an error line first
+ESCAPE_GAP_S = 0.6        # two Escapes closer than 500 ms open omp's rewind picker
+PAGE_WAIT_S = 4.0
+PAGE_CHECK_S = 0.6        # chat view: how often the watched pane is checked for an open page
+TODO_CAP = 4000
+HISTORY_MAX = 50
+TITLE_MAX = 120
+TYPE_MAX = 200
+TAP_MAX = 200
+THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "auto")
+# Footer model segment, e.g. "◒ Opus 5.5", "◔ Sonnet 4.5 ⚡", "⬢ GPT-5·high"; the glyph is the thinking level.
+FOOTER_MODEL_RE = re.compile(r"^([○◔◑◒◕◉⟳⬢⦸])\s+(.+?)(\s⚡)?(·.*)?$")
+FOOTER_GLYPHS = {"⦸": "off", "○": "minimal", "◔": "low", "◑": "medium", "◒": "high", "◕": "xhigh",
+                 "◉": "max", "⟳": "auto"}
+PAGE_COMMANDS = ("/model", "/models", "/switch", "/effort", "/settings", "/resume", "/tree", "/branch",
+                 "/rewind", "/modelpreset", "/plan-review", "/session")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+SEND_REWRITES = ((re.compile(r"^/models?\s+(\S.*)$"), "/switch "), (re.compile(r"^/thinking\s+(\S+)$"), "/effort "))
+
 SKIP_IFACES = ("lo", "docker", "virbr", "br-", "veth", "CloudflareWARP")
+
+INSTANCE_RE = re.compile(r"^[a-z][a-z0-9]{0,15}$")
+INSTANCE = ""
+LABEL = "DevDeck"
+
+
+def apply_instance(name: str) -> None:
+    """Point every per-install path and name at a side-by-side instance `name` (e.g. "plus":
+    app dev.devdeckplus, ~/.config/devdeck-plus, devdeck-plus.service, port 47491)."""
+    global INSTANCE, LABEL, APK, APP_PACKAGE, APP_ACTIVITY, CONFIG_DIR, TOKEN_FILE, STATE_DIR, SEEN_FILE
+    global PARTIAL_DIR, MODELS_FILE, UNIT_NAME, DEFAULT_PORT
+    if not INSTANCE_RE.match(name):
+        sys.exit(f"bad instance name {name!r}: lowercase letters and digits, starting with a letter")
+    INSTANCE = name
+    LABEL = "DevDeck+" if name == "plus" else f"DevDeck {name}"
+    APK = HERE / f"devdeck-{name}.apk"
+    APP_PACKAGE = f"dev.devdeck{name}"
+    APP_ACTIVITY = f"{APP_PACKAGE}/dev.devdeck.MainActivity"  # the Java classes keep package dev.devdeck
+    CONFIG_DIR = CONFIG_DIR.with_name(f"devdeck-{name}")
+    TOKEN_FILE = CONFIG_DIR / "token"
+    STATE_DIR = STATE_DIR.with_name(f"devdeck-{name}")
+    SEEN_FILE = STATE_DIR / "seen.json"
+    PARTIAL_DIR = STATE_DIR / "partial"
+    MODELS_FILE = STATE_DIR / "models.json"
+    UNIT_NAME = f"devdeck-{name}.service"
+    DEFAULT_PORT = 47491
 
 
 def log(msg: str) -> None:
@@ -190,7 +243,9 @@ def title_status(cmd: str, title: str) -> tuple[bool, bool, str]:
         return False, False, ("" if title in ("", HOSTNAME, cmd) else title)
     rest = title[agent.end():]
     working = SPINNER_RE.match(rest)
-    return True, bool(working), (rest[working.end():] if working else rest).strip()
+    # omp 18.12 shows "π > <context>" while idle, the spinner in place of ">" while working.
+    rest = rest[working.end():] if working else re.sub(r"^>(\s+|$)", "", rest)
+    return True, bool(working), rest.strip()
 
 
 def visible_lines(target: str) -> list[str] | None:
@@ -205,11 +260,6 @@ def last_box_top(lines: list[str]) -> str:
     # boxes ("│ ╭─ Ask"), and finished asks render as "╭─── Ask".
     tops = [ln for ln in lines if ln.startswith("╭─")]
     return tops[-1] if tops else ""
-
-
-def screen_asking(pane_id: str) -> bool:
-    lines = visible_lines(pane_id)  # visible area only: the dialog sits at the bottom
-    return lines is not None and last_box_top(lines).startswith(ASK_MARKERS)
 
 
 _btime: float | None = None
@@ -236,9 +286,9 @@ def process_start(pid: int) -> float:
     return start
 
 
-def breadcrumb_session(tty: str, pane_pid: int) -> str | None:
-    """Session JSONL path omp recorded for this pane's terminal, if written during the pane's life
-    (pts numbers are recycled, so an older breadcrumb belongs to some earlier terminal)."""
+def breadcrumb(tty: str, pane_pid: int) -> tuple[str, str] | None:
+    """(cwd, session JSONL path) omp recorded for this pane's terminal, if written during the pane's
+    life (pts numbers are recycled, so an older breadcrumb belongs to some earlier terminal)."""
     if not tty.startswith("/dev/pts/"):
         return None
     crumb = OMP_DIR / "terminal-sessions" / f"pts-{tty[len('/dev/pts/'):]}"
@@ -250,7 +300,12 @@ def breadcrumb_session(tty: str, pane_pid: int) -> str | None:
         return None
     if len(lines) < 2 or not lines[1].startswith("/") or mtime < process_start(pane_pid) - 2:
         return None
-    return lines[1]
+    return lines[0], lines[1]
+
+
+def breadcrumb_session(tty: str, pane_pid: int) -> str | None:
+    crumb = breadcrumb(tty, pane_pid)
+    return crumb[1] if crumb else None
 
 
 def session_id_of(path: str) -> str:
@@ -258,29 +313,31 @@ def session_id_of(path: str) -> str:
     return stem.split("_", 1)[1] if "_" in stem else stem
 
 
-def capture(target: str) -> dict | str:
-    """Screen of the pane `target` resolves to, or an error string."""
+def capture(target: str, scrollback: bool = True) -> dict | str:
+    """Screen of the pane `target` resolves to (visible rows only without `scrollback`), or an
+    error string. `alt`: the pane shows the alternate screen (omp's full-screen pages)."""
     if not target:
         return "no target"
-    fmt = "#{pane_width}\t#{pane_height}\t#{cursor_x}\t#{cursor_y}\t#{session_name}:#{window_index}.#{pane_index}"
+    fmt = ("#{pane_width}\t#{pane_height}\t#{cursor_x}\t#{cursor_y}\t#{alternate_on}\t"
+           "#{session_name}:#{window_index}.#{pane_index}")
     # One tmux invocation, so the pane is resolved once for both commands.
     r = tmux("display-message", "-p", "-t", target, fmt, ";",
-             "capture-pane", "-p", "-J", "-t", target, "-S", f"-{HISTORY_LINES}")
+             "capture-pane", "-p", "-J", "-t", target, *(("-S", f"-{HISTORY_LINES}") if scrollback else ()))
     if r.returncode != 0:
         return tmux_error(r)
     head, _, body = r.stdout.decode(errors="replace").partition("\n")
-    f = head.split("\t", 4)
-    if len(f) < 5 or not all(x.isdigit() for x in f[:4]):
+    f = head.split("\t", 5)
+    if len(f) < 6 or not all(x.isdigit() for x in f[:5]):
         return f"unexpected tmux output: {head[:80]}"
     lines = [line.rstrip() for line in body.split("\n")]
     while lines and not lines[-1]:
         lines.pop()
-    return {"target": f[4], "cols": int(f[0]), "rows": int(f[1]),
-            "cursor": [int(f[2]), int(f[3])], "lines": lines}
+    return {"target": f[5], "cols": int(f[0]), "rows": int(f[1]),
+            "cursor": [int(f[2]), int(f[3])], "lines": lines, "alt": f[4] == "1"}
 
 
 def pane_info(target: str) -> dict | str:
-    """Canonical target, tty, agent flag and session file of a pane, or an error string."""
+    """Canonical target, tty, pid, agent and working flags of a pane, or an error string."""
     fmt = "#{session_name}:#{window_index}.#{pane_index}\t#{pane_tty}\t#{pane_pid}\t#{pane_title}"
     r = tmux("display-message", "-p", "-t", target, fmt)
     if r.returncode != 0:
@@ -288,7 +345,80 @@ def pane_info(target: str) -> dict | str:
     f = r.stdout.decode(errors="replace").rstrip("\n").split("\t", 3)
     if len(f) < 4 or not f[2].isdigit():
         return "unexpected tmux output"
-    return {"target": f[0], "tty": f[1], "pid": int(f[2]), "agent": bool(AGENT_TITLE_RE.match(f[3]))}
+    agent, working, _ = title_status("", f[3])
+    return {"target": f[0], "tty": f[1], "pid": int(f[2]), "agent": agent, "working": working}
+
+
+# ---------------------------------------------------------------- omp screen (footer, editor, pages)
+
+def parse_footer(lines: list[str]) -> dict | None:
+    """{line, name, thinking, fast, mode} from omp's status footer near the bottom of the screen,
+    e.g. " π > ◒ Opus 5.5 ⚡ > 🗺 Plan ⏸ > 🗑 cwd > ...", or None when no footer is visible."""
+    for i in range(len(lines) - 1, max(-1, len(lines) - 14), -1):
+        segs = [s.strip() for s in lines[i].split(" > ")]
+        for j, seg in enumerate(segs):
+            m = FOOTER_MODEL_RE.match(seg)
+            if not m or j == 0:
+                continue
+            name, level = m.group(2).strip(), FOOTER_GLYPHS.get(m.group(1))
+            if m.group(1) == "⬢" and m.group(4):
+                level = m.group(4)[1:].strip() or None
+            mode = "none"
+            for s in segs[j + 1:]:
+                if s.startswith("🗺") and "Plan" in s:
+                    mode = "plan_paused" if "⏸" in s else "plan"
+            return {"line": i, "name": name, "thinking": level, "fast": bool(m.group(3)), "mode": mode}
+    return None
+
+
+def editor_draft(lines: list[str], footer: dict | None) -> bool:
+    """Whether omp's prompt (the "╰─" line under the footer) holds text; a pasted command would
+    be appended to it and the whole thing sent to the model."""
+    if footer is None:
+        return False
+    for ln in lines[footer["line"] + 1:footer["line"] + 3]:
+        if ln.startswith("╰─"):
+            # Text starts one space after the corner; omp's own hint sits far to the right.
+            return bool(re.match(r"╰─ \S", ln))
+    return False
+
+
+def box_title(line: str) -> str:
+    m = re.match(r"╭─+\s*(.*?)\s*[─┬╮]*$", line)
+    return m.group(1).strip(" ─") if m else ""
+
+
+def screen_page(lines: list[str], alt: bool) -> dict | None:
+    """{title?} when omp shows a page/picker/overlay instead of its transcript and prompt: a
+    full-screen page (alternate screen), or a box drawn at column 0 with the footer gone (inline
+    pickers like /effort). omp's ask dialog is not a page: it has the native answer sheet."""
+    if alt:
+        tops = [ln for ln in lines[:3] if ln.startswith("╭─")]
+        title = box_title(tops[0]) if tops else ""
+        return {"title": title} if title else {}
+    top = last_box_top(lines)
+    if not top or top.startswith(ASK_MARKERS + TEXT_BOX_MARKERS) or parse_footer(lines) is not None:
+        return None
+    title = box_title(top)
+    return {"title": title} if title else {}
+
+
+def screen_news(before: list[str], after: list[str]) -> list[str]:
+    """Stripped non-empty lines of `after` that were not on screen in `before` (status lines omp
+    printed in between), footer and prompt excluded."""
+    pool = collections.Counter(ln.strip() for ln in before)
+    out = []
+    for ln in after:
+        s = ln.strip()
+        if not s or s.startswith(("╰─", "╭─", "│", "├")):
+            continue
+        if pool[s] > 0:
+            pool[s] -= 1
+            continue
+        if " > " in s and parse_footer([ln]) is not None:
+            continue
+        out.append(s)
+    return out
 
 
 def deliver_text(ident: str, target: str, text: str, enter: bool) -> str | None:
@@ -326,7 +456,7 @@ def set_clipboard(text: str) -> str | None:
 
 def notify(body: str) -> None:
     try:
-        subprocess.Popen(["notify-send", "DevDeck", body], stdout=subprocess.DEVNULL,
+        subprocess.Popen(["notify-send", LABEL, body], stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError:
         pass
@@ -378,10 +508,41 @@ SHOWN = {K_USER, K_ASSISTANT, K_EXIT, K_COMPACTION, K_NOTICE}
 
 
 class Node:
-    __slots__ = ("id", "parent", "off", "ln", "kind", "calls")
+    __slots__ = ("id", "parent", "off", "ln", "kind", "calls", "meta")
 
-    def __init__(self, ident: str, parent, off: int, ln: int, kind: int, calls):
+    def __init__(self, ident: str, parent, off: int, ln: int, kind: int, calls, meta):
         self.id, self.parent, self.off, self.ln, self.kind, self.calls = ident, parent, off, ln, kind, calls
+        self.meta = meta
+
+
+def entry_meta(obj: dict) -> tuple | None:
+    """What one session entry changes in the pane's omp state (model, thinking, fast tier, mode,
+    context usage, todo list), as a small tuple kept on its node."""
+    t = obj.get("type")
+    if t == "model_change":
+        return ("model", obj["model"]) if isinstance(obj.get("model"), str) else None
+    if t == "thinking_level_change":
+        lvl = obj.get("thinkingLevel")
+        return ("thinking", lvl) if isinstance(lvl, str) else None
+    if t == "service_tier_change":
+        return ("fast", bool(obj.get("serviceTier")))
+    if t == "mode_change":
+        return ("mode", obj["mode"]) if isinstance(obj.get("mode"), str) else None
+    if t in ("compaction", "reset_boundary"):
+        return ("ctx0",)
+    if t != "message" or not isinstance(obj.get("message"), dict):
+        return None
+    m = obj["message"]
+    if m.get("role") == "assistant":
+        u = m.get("usage") if isinstance(m.get("usage"), dict) else {}
+        used = sum(v for k in ("input", "cacheRead", "cacheWrite", "output")
+                   if isinstance(v := u.get(k), int) and not isinstance(v, bool))
+        p, mid = m.get("provider"), m.get("model")
+        model = f"{p}/{mid}" if isinstance(p, str) and isinstance(mid, str) and p and mid else None
+        return ("asst", model, used) if model or used else None
+    if m.get("role") == "toolResult" and m.get("toolName") == "todo":
+        return ("todo",)
+    return None
 
 
 def classify(obj: dict) -> tuple[int, object]:
@@ -476,6 +637,41 @@ class Transcript:
         self.changes: list[tuple[int, int]] = []
         self.cache: collections.OrderedDict[tuple, dict] = collections.OrderedDict()
         self.ask_cache: dict[str, dict | None] = {}
+        self.cwd: str | None = None
+        self.todo_cache: tuple[str, dict | None] | None = None
+        self._reset_state()
+
+    def _reset_state(self) -> None:
+        self.st_model: str | None = None
+        self.st_asst_model: str | None = None
+        self.st_thinking: str | None = None
+        self.st_fast = False
+        self.st_mode = "none"
+        self.st_used: int | None = None
+        self.st_todo: str | None = None
+
+    def _track(self, node: Node) -> None:
+        m = node.meta
+        if m is None:
+            return
+        k = m[0]
+        if k == "model":
+            self.st_model = m[1]
+        elif k == "thinking":
+            self.st_thinking = m[1]
+        elif k == "fast":
+            self.st_fast = m[1]
+        elif k == "mode":
+            self.st_mode = m[1]
+        elif k == "ctx0":
+            self.st_used = None
+        elif k == "asst":
+            if m[1]:
+                self.st_asst_model = m[1]
+            if m[2]:
+                self.st_used = m[2]
+        elif k == "todo":
+            self.st_todo = node.id
 
     def _reset(self) -> None:
         self._clear()
@@ -552,9 +748,12 @@ class Transcript:
             return
         kind, calls = classify(obj)
         parent = obj.get("parentId")
-        node = Node(ident, parent if isinstance(parent, str) else None, off, len(line), kind, calls)
+        node = Node(ident, parent if isinstance(parent, str) else None, off, len(line), kind, calls, entry_meta(obj))
         self.nodes[ident] = node
-        if obj.get("type") != "model_usage":  # may be appended to another branch than the active one
+        if obj.get("type") == "session":
+            if isinstance(obj.get("cwd"), str):
+                self.cwd = obj["cwd"]
+        elif obj.get("type") != "model_usage":  # may be appended to another branch than the active one
             self.leaf_candidate = ident
         if kind == K_ASSISTANT:
             for call, name in calls:
@@ -607,6 +806,7 @@ class Transcript:
         idx = len(self.path_ids)
         self.path_ids.append(node.id)
         self.path_index[node.id] = idx
+        self._track(node)
         if node.kind in (K_USER, K_ASSISTANT):
             self.last_msg = idx
         elif node.kind == K_EXIT:
@@ -633,11 +833,13 @@ class Transcript:
                 start = i + 1
         self.path_ids, self.path_index, self.display, self.seq_of = [], {}, [], {}
         self.last_msg = self.last_exit = -1
+        self._reset_state()
         self.changes, self.cache = [], collections.OrderedDict()
         for i, node in enumerate(chain):
             if i < start:
                 self.path_index[node.id] = len(self.path_ids)
                 self.path_ids.append(node.id)
+                self._track(node)
             else:
                 self._append(node)
         self.vis_start = start
@@ -854,6 +1056,28 @@ class Transcript:
                 self.ask_cache[call] = {"toolCallId": call, "questions": questions} if questions else None
             return self.ask_cache[call]
 
+    def omp_state(self) -> dict:
+        """omp settings along the current branch: {model, thinking, fast, mode, used, todo, cwd}
+        (model/thinking None when the file has not recorded them yet)."""
+        with self.lock:
+            if self.st_todo is not None and (self.todo_cache is None or self.todo_cache[0] != self.st_todo):
+                ident = self.st_todo
+                try:
+                    with self._open() as f:
+                        text = content_text((self._load(f, ident).get("message") or {}).get("content"))
+                except (OSError, ValueError, StaleFile):
+                    text = None
+                if text is not None:
+                    m = re.search(r"Overall:\s*(\d+)/(\d+) done", text)
+                    capped, _ = cap(text, TODO_CAP)
+                    self.todo_cache = (ident, {"done": int(m.group(1)) if m else 0,
+                                               "total": int(m.group(2)) if m else 0, "text": capped})
+            hit = self.todo_cache
+            todo = hit[1] if hit is not None and self.st_todo == hit[0] else None
+            return {"model": self.st_model or self.st_asst_model, "thinking": self.st_thinking,
+                    "fast": self.st_fast, "mode": self.st_mode, "used": self.st_used, "todo": todo,
+                    "cwd": self.cwd}
+
 
 def notice_text(t, m: dict, obj: dict, limit: int = RESULT_CAP) -> str:
     if t == "message":
@@ -992,6 +1216,290 @@ def ask_keystrokes(questions: list[dict], answers: list) -> list[tuple[str, obje
         keys.append("Enter")               # on the Submit tab
     flush()
     return batches
+
+
+# ---------------------------------------------------------------- omp models and session history
+
+def omp_binary() -> str:
+    # The systemd user service may not have ~/.local/bin on its PATH.
+    for cand in (shutil.which("omp"), str(Path.home() / ".local" / "bin" / "omp"), str(Path.home() / ".bun" / "bin" / "omp")):
+        if cand and os.access(cand, os.X_OK):
+            return cand
+    return "omp"
+
+
+class ModelCatalog:
+    """`omp models --json` (no model calls: omp's own catalog cache), kept in memory and in
+    MODELS_FILE; served stale while a background refresh runs."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.cond = threading.Condition()
+        self.data: dict | None = None
+        self.index: dict[str, dict] = {}
+        self.refreshing = False
+        self.error: str | None = None
+        self.failed_at = 0.0
+        try:
+            data = json.loads(path.read_text())
+            if isinstance(data.get("models"), list) and isinstance(data.get("fetchedAt"), int):
+                self._set(data)
+        except (OSError, ValueError, AttributeError) as ex:
+            if path.exists():
+                log(f"ignoring unreadable {path}: {ex}")
+
+    def _set(self, data: dict) -> None:
+        self.data = data
+        self.index = {m["selector"]: m for m in data["models"] if isinstance(m, dict) and "selector" in m}
+
+    def get(self, wait: bool) -> dict | None:
+        """The catalog; refreshes in the background when missing or older than MODELS_TTL_S.
+        With `wait` and nothing cached, waits for the refresh (RequestError if it fails)."""
+        with self.cond:
+            data = self.data
+            stale = data is None or time.time() * 1000 - data["fetchedAt"] > MODELS_TTL_S * 1000
+            backoff = not wait and time.monotonic() - self.failed_at < 60
+            if stale and not self.refreshing and not backoff:
+                self.refreshing = True
+                threading.Thread(target=self._refresh, daemon=True).start()
+            if data is None and wait:
+                self.cond.wait_for(lambda: not self.refreshing, timeout=MODELS_TIMEOUT_S + 10)
+                data = self.data
+                if data is None:
+                    raise RequestError(self.error or "omp models did not answer")
+            return data
+
+    def _refresh(self) -> None:
+        data, err = None, None
+        try:
+            r = subprocess.run([omp_binary(), "models", "--json"], capture_output=True, stdin=subprocess.DEVNULL,
+                               timeout=MODELS_TIMEOUT_S, cwd=Path.home())
+            out = r.stdout.decode(errors="replace")
+            line = next((ln for ln in out.splitlines() if ln.startswith("{")), None)
+            if line is None:
+                tail = (r.stderr.decode(errors="replace").strip().splitlines() or [f"exit {r.returncode}"])[-1]
+                raise ValueError(tail)
+            models = []
+            for m in json.loads(line)["models"]:
+                if not isinstance(m, dict) or not isinstance(m.get("provider"), str) or not isinstance(m.get("id"), str):
+                    continue
+                if isinstance(m.get("kind"), str) and m["kind"] not in ("chat", "llm"):
+                    continue
+                thinking = m.get("thinking")
+                models.append({"selector": f"{m['provider']}/{m['id']}", "provider": m["provider"], "id": m["id"],
+                               "name": m.get("name") if isinstance(m.get("name"), str) else m["id"],
+                               "contextWindow": m.get("contextWindow") if isinstance(m.get("contextWindow"), int) else None,
+                               "reasoning": m.get("reasoning") is True,
+                               "thinking": [x for x in thinking if isinstance(x, str)] if isinstance(thinking, list) else None})
+            data = {"models": models, "fetchedAt": int(time.time() * 1000)}
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+                os.replace(tmp, self.path)
+            except OSError as ex:
+                log(f"cannot persist {self.path}: {ex}")
+        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as ex:
+            err = f"omp models failed: {ex}"
+            log(err)
+        with self.cond:
+            if data is not None:
+                self._set(data)
+            else:
+                self.failed_at = time.monotonic()
+            self.error, self.refreshing = err, False
+            self.cond.notify_all()
+
+    def lookup(self, selector: str | None) -> dict | None:
+        return self.index.get(selector) if selector else None
+
+    def by_footer_name(self, name: str, prefer: list[str]) -> dict | None:
+        """The model omp's footer shows as `name` (catalog name minus a leading "Claude ").
+        Several providers serve the same name: `prefer` lists selectors/providers to try first."""
+        hits = [m for m in self.index.values() if footer_name(m["name"]) == name]
+        if not hits:
+            return None
+
+        def rank(m: dict) -> tuple:
+            for i, p in enumerate(prefer):
+                if m["selector"] == p or m["provider"] == p:
+                    return i, len(m["id"])
+            return len(prefer), len(m["id"])
+        return min(hits, key=rank)
+
+
+def footer_name(name: str) -> str:
+    return name[7:] if name.startswith("Claude ") else name
+
+
+def model_roles() -> dict[str, str]:
+    """`modelRoles:` of omp's config.yml (a flat block of `role: provider/id[:level]` lines)."""
+    try:
+        text = (OMP_DIR / "config.yml").read_text()
+    except OSError:
+        return {}
+    roles, inside = {}, False
+    for ln in text.splitlines():
+        if not inside:
+            inside = bool(re.match(r"^modelRoles:\s*(#.*)?$", ln))
+            continue
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        if not ln[0].isspace():
+            break
+        m = re.match(r"^\s+([\w.-]+)\s*:\s*(.*?)\s*$", ln)
+        if m:
+            value = re.sub(r"\s+#.*$", "", m.group(2)).strip().strip("'\"")
+            if value:
+                roles[m.group(1)] = value
+    return roles
+
+
+_heads_lock = threading.Lock()
+_heads: dict[str, tuple[tuple, dict | None]] = {}
+_users: dict[str, tuple[tuple, str | None]] = {}
+
+
+def session_head(path: str, st: os.stat_result) -> dict | None:
+    """{id, cwd, title} from a session file's title slot and header (first two lines)."""
+    key = (st.st_ino, st.st_size, st.st_mtime_ns)
+    with _heads_lock:
+        hit = _heads.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    head = None
+    try:
+        with open(path, "rb") as f:
+            data = f.read(65536)
+        title = None
+        for raw in data.split(b"\n")[:3]:
+            try:
+                obj = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("type") == "title" and isinstance(obj.get("title"), str):
+                title = obj["title"]
+            elif obj.get("type") == "session" and isinstance(obj.get("id"), str):
+                t = obj.get("title")
+                head = {"id": obj["id"], "cwd": obj.get("cwd") if isinstance(obj.get("cwd"), str) else "",
+                        "title": title or (t if isinstance(t, str) else None)}
+                break
+    except OSError:
+        return None
+    with _heads_lock:
+        _heads[path] = (key, head)
+    return head
+
+
+def session_first_user(path: str, st: os.stat_result) -> str | None:
+    """First line of the session's first user message ("" if it has no text), None if it has none."""
+    with _heads_lock:
+        hit = _users.get(path)
+    # Files only grow: a found message stays found; a miss is rechecked when the size changes.
+    if hit and hit[0][0] == st.st_ino and (hit[1] is not None or hit[0][1] == st.st_size):
+        return hit[1]
+    found = None
+    try:
+        with open(path, "rb") as f:
+            if st.st_size:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    idx = mm.find(b'"message":{"role":"user"')
+                    if idx >= 0:
+                        start = mm.rfind(b"\n", 0, idx) + 1
+                        end = mm.find(b"\n", idx)
+                        found = ""
+                        try:
+                            obj = json.loads(mm[start:end if end >= 0 else len(mm)])
+                            text = content_text((obj.get("message") or {}).get("content")).strip()
+                            found = text.splitlines()[0][:TITLE_MAX] if text else ""
+                        except (ValueError, AttributeError):
+                            pass
+    except (OSError, ValueError):
+        return None
+    with _heads_lock:
+        _users[path] = ((st.st_ino, st.st_size), found)
+    return found
+
+
+def history_db_info(ids: list[str]) -> tuple[dict[str, str], dict[str, str]]:
+    """(titles, latest recaps) by session id from omp's history.db."""
+    titles, recaps = {}, {}
+    if not ids:
+        return titles, recaps
+    try:
+        db = sqlite3.connect(f"file:{OMP_DIR / 'history.db'}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error as ex:
+        log(f"history.db: {ex}")
+        return titles, recaps
+    try:
+        marks = ",".join("?" * len(ids))
+        for sid, title in db.execute(f"SELECT session_id, title FROM session_titles WHERE session_id IN ({marks})", ids):
+            titles[sid] = title
+        for sid, recap in db.execute(f"SELECT session_id, recap FROM session_recaps WHERE session_id IN ({marks}) "
+                                     "ORDER BY created_at, id", ids):
+            recaps[sid] = recap
+    except sqlite3.Error as ex:
+        log(f"history.db: {ex}")
+    finally:
+        db.close()
+    return titles, recaps
+
+
+def live_session_paths() -> set[str]:
+    """Session files some open terminal's omp has recorded in its breadcrumb."""
+    live = set()
+    for crumb in (OMP_DIR / "terminal-sessions").glob("pts-*"):
+        if not os.path.exists("/dev/pts/" + crumb.name[4:]):
+            continue
+        try:
+            lines = crumb.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        if len(lines) >= 2:
+            live.add(lines[1])
+    return live
+
+
+def session_history(cwd: str, current: str | None) -> list[dict]:
+    """omp sessions of `cwd`: pinned first, then newest; empty ones (no user message) skipped."""
+    cwd = os.path.normpath(cwd)
+    try:
+        pins = json.loads((OMP_DIR / "session-pins.json").read_text())
+        pins = {p for p in pins if isinstance(p, str)} if isinstance(pins, list) else set()
+    except (OSError, ValueError):
+        pins = set()
+    cands = []
+    for path in (OMP_DIR / "sessions").glob("*/*.jsonl"):
+        path = str(path)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        head = session_head(path, st)
+        if head and head["cwd"] and os.path.normpath(head["cwd"]) == cwd:
+            cands.append((head["id"] in pins, st.st_mtime, path, st, head))
+    cands.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    picked = []
+    for pinned, mtime, path, st, head in cands:
+        first = session_first_user(path, st)
+        if first is None and not pinned:
+            continue
+        picked.append((pinned, mtime, path, head, first))
+        if len(picked) >= HISTORY_MAX:
+            break
+    titles, recaps = history_db_info([h["id"] for _, _, _, h, _ in picked])
+    live = live_session_paths()
+    out = []
+    for pinned, mtime, path, head, first in picked:
+        sid = head["id"]
+        item = {"id": sid, "title": head["title"] or titles.get(sid) or first or "", "mtime": int(mtime * 1000),
+                "live": path in live, "current": sid == current, "pinned": pinned}
+        if recaps.get(sid):
+            item["recap"] = recaps[sid]
+        out.append(item)
+    return out
 
 
 # ---------------------------------------------------------------- files and git
@@ -1265,6 +1773,14 @@ class Server:
         self.panes_sig: tuple = ()
         self.panes_rev = 0
         self.poll_now = threading.Event()
+        self.catalog = ModelCatalog(MODELS_FILE)
+        self.cmd_locks_lock = threading.Lock()
+        self.cmd_locks: dict[str, threading.Lock] = {}
+        self.last_escape: dict[str, float] = {}
+        # target -> selector this daemon last switched it to, to resolve ambiguous footer names
+        self.pane_models: dict[str, str] = {}
+        # target -> omp fields last read from its footer (kept while a page hides the footer)
+        self.footers: dict[str, dict] = {}
         self.sock = socket.create_server(("0.0.0.0", port), reuse_port=False, backlog=16)
 
     def next_rev(self) -> int:
@@ -1338,6 +1854,8 @@ class Server:
         if r.returncode != 0:
             return []
         panes = []
+        with self.ctl_cond:
+            watched = {c.target for c in self.controls if not c.paused and c.view == "chat"}
         for line in r.stdout.decode(errors="replace").splitlines():
             f = line.split("\t", 9)
             if len(f) < 10 or not f[1].isdigit() or not f[2].isdigit() or not f[7].isdigit():
@@ -1351,23 +1869,81 @@ class Server:
             if not agent:
                 pane["state"] = "shell" if cmd in SHELLS else "running"
             else:
-                state = "working" if working else "idle"
-                path = breadcrumb_session(f[6], int(f[7]))
-                tr = None
-                if path:
-                    pane["sessionId"] = session_id_of(path)
-                    tr = self.transcript(path)
-                    tr.refresh()
-                if tr is not None and tr.exists:
-                    ask = tr.pending_ask()
-                    if ask:
-                        state = "asking"
-                        pane["ask"] = ask
-                elif screen_asking(f[5]):
-                    state = "asking"
-                pane["state"] = state
+                fields, _, _ = self.inspect_agent(pane["target"], f[6], int(f[7]), working,
+                                                  pane["target"] in watched)
+                pane.update(fields)
             panes.append(pane)
         return panes
+
+    def inspect_agent(self, target: str, tty: str, pid: int, working: bool, page: bool):
+        """({state, ask?, sessionId?, omp}, transcript or None, visible screen or None) of an omp
+        pane. The screen is captured only when needed: no session file yet (asking and the omp
+        settings come from the screen), settings missing from the file, or `page` detection."""
+        fields: dict = {"state": "working" if working else "idle"}
+        crumb = breadcrumb(tty, pid)
+        tr = None
+        if crumb:
+            fields["sessionId"] = session_id_of(crumb[1])
+            tr = self.transcript(crumb[1])
+            tr.refresh()
+        exists = tr is not None and tr.exists
+        st = tr.omp_state() if exists else None
+        scr = None
+        if page or not exists or not st["model"] or not st["thinking"]:
+            cur = capture(target, scrollback=False)
+            scr = cur if isinstance(cur, dict) else None
+        if exists:
+            ask = tr.pending_ask()
+            if ask:
+                fields["state"] = "asking"
+                fields["ask"] = ask
+        elif scr is not None and last_box_top(scr["lines"]).startswith(ASK_MARKERS):
+            fields["state"] = "asking"
+        fields["omp"] = self.omp_field(target, crumb, st, scr, page)
+        return fields, tr, scr
+
+    def omp_field(self, target: str, crumb, st: dict | None, scr: dict | None, page: bool) -> dict:
+        model = thinking = name = None
+        fast, mode, used, todo, cwd = False, "none", None, None, None
+        if st is not None:
+            model, thinking, fast, mode = st["model"], st["thinking"], st["fast"], st["mode"]
+            used, todo, cwd = st["used"], st["todo"], st["cwd"]
+        catalog = self.catalog
+        catalog.get(wait=False)  # starts a refresh when missing or old
+        entry = catalog.lookup(model)
+        if st is None or not model or not thinking:
+            foot = parse_footer(scr["lines"]) if scr is not None else None
+            if foot is not None:
+                self.footers[target] = foot
+            else:
+                foot = self.footers.get(target)  # a page or dialog hides the footer for now
+            if foot is not None:
+                if not model:
+                    entry = catalog.by_footer_name(foot["name"], self.preferred_models(target))
+                    model, name = (entry["selector"], None) if entry else (None, foot["name"])
+                thinking = thinking or foot["thinking"]
+                if st is None:  # brand-new session: nothing on disk yet
+                    fast, mode = foot["fast"], foot["mode"]
+        if entry is not None:
+            name = entry["name"]
+        window = entry["contextWindow"] if entry else None
+        return {"model": model, "modelName": name, "thinking": thinking, "fast": fast, "mode": mode,
+                "ctx": {"used": used, "window": window} if used is not None and window else None,
+                "todo": todo, "cwd": cwd or (crumb[0] if crumb else None),
+                "sessionId": session_id_of(crumb[1]) if crumb else None,
+                "page": screen_page(scr["lines"], scr["alt"]) if page and scr is not None else None}
+
+    def preferred_models(self, target: str) -> list[str]:
+        prefer = [self.pane_models[target]] if target in self.pane_models else []
+        default = model_roles().get("default")
+        if default:
+            sel = default.split(":", 1)[0]
+            prefer += [sel, sel.split("/", 1)[0]]
+        return prefer
+
+    def cmd_lock(self, target: str) -> threading.Lock:
+        with self.cmd_locks_lock:
+            return self.cmd_locks.setdefault(target, threading.Lock())
 
     # ------------------------------------------------------------ connections
 
@@ -1486,6 +2062,306 @@ def unique_path(folder: Path, name: str) -> Path:
     return path
 
 
+class CmdFailed(Exception):
+    """A refused or failed omp command; the message is shown to the user."""
+
+
+PLAN_EXIT_PROMPT = "Exit plan mode?"
+
+
+class PaneCommand:
+    """One `cmd` on one omp pane: preconditions, the slash command (or key), then confirmation
+    from the session file, the breadcrumb or the footer. Callers serialise per pane."""
+
+    NAMES = ("switch", "effort", "fast", "plan", "compact", "new", "clear", "retry", "resume", "rename",
+             "stop", "queue", "page")
+
+    def __init__(self, server: Server, info: dict, name: str, arg):
+        self.server, self.target, self.tty, self.pid = server, info["target"], info["tty"], info["pid"]
+        self.name, self.arg = name, arg if isinstance(arg, str) else ""
+
+    # ------------------------------------------------------------ helpers
+
+    def screen(self) -> dict:
+        cur = capture(self.target, scrollback=False)
+        if isinstance(cur, str):
+            raise CmdFailed(cur)
+        return cur
+
+    def baseline(self) -> dict:
+        crumb = breadcrumb(self.tty, self.pid)
+        base = {"path": crumb[1] if crumb else None, "size": 0, "ino": None}
+        if base["path"]:
+            try:
+                st = os.stat(base["path"])
+                base["size"], base["ino"] = st.st_size, st.st_ino
+            except OSError:
+                pass
+        return base
+
+    def new_entries(self, base: dict) -> list[dict]:
+        """Entries appended to the session file since `base` (all of it if the file is new)."""
+        path = base["path"]
+        if not path:
+            return []
+        try:
+            with open(path, "rb") as f:
+                start = base["size"] if os.fstat(f.fileno()).st_ino == base["ino"] else 0
+                f.seek(start)
+                data = f.read(8 << 20)
+        except OSError:
+            return []
+        out = []
+        for line in data[:data.rfind(b"\n") + 1].split(b"\n"):
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                out.append(obj)
+        return out
+
+    def paste(self, text: str, enter: bool = True) -> None:
+        err = deliver_text("cmd-" + secrets.token_hex(4), self.target, text, enter)
+        if err:
+            raise CmdFailed(err)
+
+    def confirm(self, before: list[str], check, timeout: float = CMD_WAIT_S, errors: tuple = ()) -> str | None:
+        """Poll until `check(screen, new_status_lines, elapsed)` returns something other than
+        False (True = ok, a string = ok with that info). An `Error:` status line (or one containing
+        one of `errors`) fails at once; a timeout fails with what the screen shows."""
+        start = time.monotonic()
+        while True:
+            time.sleep(0.2)
+            cur = self.screen()
+            news = screen_news(before, cur["lines"])
+            for s in news:
+                if s.startswith("Error:") or any(e in s for e in errors):
+                    raise CmdFailed(s.removeprefix("Error:").strip())
+            res = check(cur, news, time.monotonic() - start)
+            if res is not False:
+                return None if res is True else res
+            if time.monotonic() - start > timeout:
+                foot = parse_footer(cur["lines"])
+                shown = news[-4:] + ([cur["lines"][foot["line"]].strip()] if foot else [])
+                raise CmdFailed(f"omp did not confirm {self.name} within {timeout:.0f} s"
+                                + ("; the PC shows:\n" + "\n".join(shown) if shown else ""))
+
+    def entry(self, base: dict, kind: str, pred=lambda e: True) -> dict | None:
+        return next((e for e in reversed(self.new_entries(base)) if e.get("type") == kind and pred(e)), None)
+
+    # ------------------------------------------------------------ entry point
+
+    def run(self) -> str | None:
+        info = pane_info(self.target)
+        if isinstance(info, str):
+            raise CmdFailed(info)
+        if not info["agent"]:
+            raise CmdFailed("that terminal is not running omp")
+        fields, _, scr = self.server.inspect_agent(self.target, info["tty"], info["pid"], info["working"], True)
+        if scr is None:
+            raise CmdFailed("cannot read the terminal")
+        state, omp, lines = fields["state"], fields["omp"], scr["lines"]
+        if state == "asking":
+            raise CmdFailed("Answer omp's question first")
+        if omp["page"] is not None:
+            what = omp["page"].get("title")
+            raise CmdFailed(f"omp shows {repr(what) if what else 'a page or picker'} on the PC; close it first (Esc)")
+        if any(DRAFT_TRAP in ln for ln in lines):
+            raise CmdFailed("the PC prompt has an unsent draft: clear it on the PC first")
+        if self.name != "stop" and editor_draft(lines, parse_footer(lines)):
+            raise CmdFailed("omp's prompt on the PC holds unsent text; clear it first")
+        if self.name in ("clear", "retry") and state == "working":
+            raise CmdFailed("omp is working; stop it first")
+        return getattr(self, "c_" + self.name)(state, omp, lines)
+
+    # ------------------------------------------------------------ commands
+
+    def c_switch(self, state, omp, before):
+        sel, _, level = self.arg.strip().partition(":")
+        try:
+            self.server.catalog.get(wait=True)
+        except RequestError as ex:
+            raise CmdFailed(str(ex)) from None
+        model = self.server.catalog.lookup(sel)
+        if model is None:
+            raise CmdFailed(f"unknown model {sel!r}")
+        if level:
+            if level not in THINKING_LEVELS:
+                raise CmdFailed(f"unknown thinking level {level!r}")
+            if level not in ("off", "auto") and level not in (model["thinking"] or []):
+                raise CmdFailed(f"{model['name']} supports thinking: "
+                                + ", ".join(["off", "auto", *(model["thinking"] or [])]))
+        base = self.baseline()
+        self.paste(f"/switch {sel}" + (f":{level}" if level else ""))
+        want = footer_name(model["name"])
+
+        def check(cur, news, t):
+            if self.entry(base, "model_change", lambda e: e.get("model") == sel):
+                return True
+            f = parse_footer(cur["lines"])
+            return bool(f and f["name"] == want and (not level or f["thinking"] == level) and t >= CMD_SETTLE_S)
+        res = self.confirm(before, check)
+        self.server.pane_models[self.target] = sel
+        return res
+
+    def c_effort(self, state, omp, before):
+        level = self.arg.strip()
+        if level not in THINKING_LEVELS:
+            raise CmdFailed(f"unknown thinking level {level!r}")
+        model = self.server.catalog.lookup(omp["model"])
+        if model and level not in ("off", "auto") and level not in (model["thinking"] or []):
+            raise CmdFailed(f"{model['name']} supports thinking: " + ", ".join(["off", "auto", *(model["thinking"] or [])]))
+        base = self.baseline()
+        self.paste(f"/effort {level}")
+
+        def check(cur, news, t):
+            if self.entry(base, "thinking_level_change", lambda e: e.get("thinkingLevel") == level):
+                return True
+            f = parse_footer(cur["lines"])
+            return bool(f and f["thinking"] == level and t >= CMD_SETTLE_S)
+        return self.confirm(before, check)
+
+    def c_fast(self, state, omp, before):
+        if self.arg not in ("on", "off"):
+            raise CmdFailed("fast needs on or off")
+        on = self.arg == "on"
+        base = self.baseline()
+        self.paste(f"/fast {self.arg}")
+
+        def check(cur, news, t):
+            if self.entry(base, "service_tier_change", lambda e: bool(e.get("serviceTier")) == on):
+                return True
+            f = parse_footer(cur["lines"])
+            return bool(f and f["fast"] == on and t >= CMD_SETTLE_S)
+        return self.confirm(before, check, errors=("unavailable",))
+
+    def c_plan(self, state, omp, before):
+        base = self.baseline()
+        was = (parse_footer(before) or {}).get("mode")
+        self.paste("/plan")
+
+        def check(cur, news, t):
+            if any(PLAN_EXIT_PROMPT in ln for ln in cur["lines"]):
+                raise CmdFailed("omp asks to confirm leaving plan mode; answer on the terminal view")
+            e = self.entry(base, "mode_change")
+            if e:
+                return str(e.get("mode"))
+            f = parse_footer(cur["lines"])
+            return f["mode"] if f and was is not None and f["mode"] != was else False
+        return self.confirm(before, check)
+
+    def c_compact(self, state, omp, before):
+        focus = clean_text(self.arg)
+        base = self.baseline()
+        self.paste("/compact" + (f" {focus}" if focus else ""))
+
+        def check(cur, news, t):
+            if self.entry(base, "compaction") or any("ompact" in s for s in news) or t >= 3.0:
+                return "compacting"
+            return False
+        return self.confirm(before, check)
+
+    def c_new(self, state, omp, before):
+        base = self.baseline()
+        self.paste("/new")
+
+        def check(cur, news, t):
+            crumb = breadcrumb(self.tty, self.pid)
+            return session_id_of(crumb[1]) if crumb and crumb[1] != base["path"] else False
+        return self.confirm(before, check, errors=("Exit vibe mode first",))
+
+    def c_clear(self, state, omp, before):
+        base = self.baseline()
+        self.paste("/clear")
+
+        def check(cur, news, t):
+            return bool(self.entry(base, "reset_boundary") or any(s.startswith("✔ Context reset") for s in news))
+        return self.confirm(before, check)
+
+    def c_retry(self, state, omp, before):
+        self.paste("/retry")
+        return self.confirm(before, lambda cur, news, t: t >= 2.0, errors=("Nothing to retry",))
+
+    def c_resume(self, state, omp, before):
+        sid = self.arg.strip().lower()
+        if not UUID_RE.match(sid):
+            raise CmdFailed("resume needs a full session id")
+        if sid == omp["sessionId"]:
+            raise CmdFailed("that is already this terminal's session")
+        if not omp["cwd"] or sid not in {h["id"] for h in session_history(omp["cwd"], omp["sessionId"])}:
+            raise CmdFailed(f"no session {sid} in {omp['cwd'] or 'this directory'}")
+        base = self.baseline()
+        self.paste(f"/resume {sid}")
+
+        def check(cur, news, t):
+            crumb = breadcrumb(self.tty, self.pid)
+            if not crumb or crumb[1] == base["path"]:
+                return False
+            got = session_id_of(crumb[1])
+            return "resumed" if got == sid else f"opened a copy {got}: that session is open in another terminal"
+        return self.confirm(before, check, timeout=10.0)
+
+    def c_rename(self, state, omp, before):
+        title = clean_text(self.arg)
+        if not title or len(title) > TITLE_MAX or "\n" in self.arg:
+            raise CmdFailed(f"rename needs a single-line title of at most {TITLE_MAX} characters")
+        base = self.baseline()
+        self.paste(f"/rename {title}")
+
+        def check(cur, news, t):
+            e = self.entry(base, "title_change")
+            if e:
+                return str(e.get("title") or title)
+            done = next((s for s in news if s.startswith("Session renamed to")), None)
+            return done.removeprefix("Session renamed to").strip().strip(".").strip('"') if done else False
+        return self.confirm(before, check)
+
+    def c_stop(self, state, omp, before):
+        if state != "working":
+            raise CmdFailed("omp is not working")
+        wait = self.server.last_escape.get(self.target, 0.0) + ESCAPE_GAP_S - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        base = self.baseline()
+        r = tmux("send-keys", "-t", self.target, "Escape")
+        self.server.last_escape[self.target] = time.monotonic()
+        if r.returncode != 0:
+            raise CmdFailed(tmux_error(r))
+
+        def check(cur, news, t):
+            info = pane_info(self.target)
+            if isinstance(info, dict) and not info["working"]:
+                return True
+            return bool(self.entry(base, "message", lambda e: (e.get("message") or {}).get("stopReason") == "aborted"))
+        return self.confirm(before, check)
+
+    def c_queue(self, state, omp, before):
+        if not self.arg.strip():
+            raise CmdFailed("nothing to queue")
+        if state == "working":
+            self.paste(self.arg, enter=False)
+            r = tmux("send-keys", "-t", self.target, "C-q")
+            if r.returncode != 0:
+                raise CmdFailed(tmux_error(r))
+            return "queued"
+        self.paste(self.arg)
+        return "sent"
+
+    def c_page(self, state, omp, before):
+        cmd = self.arg.strip()
+        if cmd not in PAGE_COMMANDS:
+            raise CmdFailed(f"{cmd!r} is not a page command; allowed: " + " ".join(PAGE_COMMANDS))
+        self.paste(cmd)
+
+        def check(cur, news, t):
+            page = screen_page(cur["lines"], cur["alt"])
+            if page is not None:
+                return page.get("title") or True
+            return t >= PAGE_WAIT_S - 0.2 and cur["lines"] != before
+        return self.confirm(before, check, timeout=PAGE_WAIT_S)
+
+
 class Control:
     """One phone's control connection: a reader (this thread) handles requests, a writer
     thread owns the zlib stream and streams the watched pane (screen diffs in the term view,
@@ -1514,6 +2390,12 @@ class Control:
         self.comp = zlib.compressobj(6)
         self.requests = threading.BoundedSemaphore(MAX_REQUESTS)
         self.info_cache: tuple[str, float, dict | str] | None = None
+        self.poke = False  # check the watched pane for an omp page right away (after keys, cmd page)
+
+    def poke_page(self) -> None:
+        with self.cond:
+            self.poke = True
+            self.cond.notify()
 
     def push(self, msg: dict) -> None:
         with self.cond:
@@ -1601,9 +2483,13 @@ class Control:
                              daemon=True).start()
         elif kind == "keys":
             self.do_keys(msg)
+        elif kind == "tap":
+            self.do_tap(msg)
+        elif kind == "type":
+            self.do_type(msg)
         elif kind == "new":
             self.new_terminal()
-        elif kind in ("more", "full", "ls", "read", "git"):
+        elif kind in ("more", "full", "ls", "read", "git", "models", "history", "cmd"):
             self.request(msg)
         else:
             self.push({"t": "error", "error": f"unknown message type {kind!r}"})
@@ -1637,7 +2523,22 @@ class Control:
             return "no target"
         if not isinstance(text, str):
             return "text must be a string"
-        return deliver_text(msg["id"], target, text, bool(msg.get("enter")))
+        enter = bool(msg.get("enter"))
+        info = pane_info(target)
+        if isinstance(info, str):
+            return info
+        if info["agent"]:
+            if enter and not text.strip() and info["working"]:
+                return "An empty Enter would stop the agent; use Stop"
+            # omp sends commands with arguments they do not take to the model as a prompt.
+            line = text.strip()
+            if "\n" not in line:
+                for rx, repl in SEND_REWRITES:
+                    m = rx.match(line)
+                    if m:
+                        text = repl + m.group(1)
+                        break
+        return deliver_text(msg["id"], target, text, enter)
 
     def do_clip(self, msg: dict) -> str | None:
         text = msg.get("text")
@@ -1722,6 +2623,61 @@ class Control:
         r = tmux("send-keys", "-t", target, *keys)
         if r.returncode != 0:
             self.push({"t": "error", "error": f"keys: {tmux_error(r)}"})
+            return
+        if "Escape" in keys:
+            info = self.pane(target)
+            if isinstance(info, dict):
+                self.server.last_escape[info["target"]] = time.monotonic()
+        self.poke_page()
+
+    def do_tap(self, msg: dict) -> None:
+        """Move the selection of the omp page shown in `target` to screen row `row` (Up/Down only;
+        the UI sends Enter itself)."""
+        target, row = msg.get("target"), msg.get("row")
+        if not isinstance(target, str) or not target or not isinstance(row, int) or isinstance(row, bool) or row < 0:
+            self.push({"t": "error", "error": "tap needs a target and a row"})
+            return
+        cur = capture(target, scrollback=False)
+        if isinstance(cur, str):
+            self.push({"t": "error", "error": f"tap: {cur}"})
+            return
+        lines = cur["lines"]
+        marks = [(i, ln.index("❯")) for i, ln in enumerate(lines) if "❯" in ln]
+        if not marks:
+            self.push({"t": "error", "error": "can't locate the selection on this page; use the arrow keys"})
+            return
+        at, col = min(marks, key=lambda m: abs(m[0] - row))
+        step = 1 if row > at else -1
+        n = 0
+        for r in range(at + step, row + step, step):
+            # Rules and blank rows in the selector's column are skipped by omp's own navigation.
+            if (lines[r] if r < len(lines) else "")[col:col + 4].strip(" ─│┆"):
+                n += 1
+        n = min(n, TAP_MAX)
+        key = "Down" if step > 0 else "Up"
+        for i in range(0, n, 32):
+            if i:
+                time.sleep(KEY_PAUSE_S)
+            r = tmux("send-keys", "-t", target, *([key] * min(32, n - i)))
+            if r.returncode != 0:
+                self.push({"t": "error", "error": f"tap: {tmux_error(r)}"})
+                return
+        self.poke_page()
+
+    def do_type(self, msg: dict) -> None:
+        target, text = msg.get("target"), msg.get("text")
+        if not isinstance(target, str) or not target or not isinstance(text, str):
+            self.push({"t": "error", "error": "type needs a target and text"})
+            return
+        text = re.sub(r"[\x00-\x1f\x7f]", "", text)  # no Enter/Escape/Tab smuggled in as text
+        if len(text) > TYPE_MAX or not text:
+            self.push({"t": "error", "error": f"type takes one line of 1 to {TYPE_MAX} characters"})
+            return
+        r = tmux("send-keys", "-t", target, "-l", "--", text)
+        if r.returncode != 0:
+            self.push({"t": "error", "error": f"type: {tmux_error(r)}"})
+            return
+        self.poke_page()
 
     # ------------------------------------------------------------ requests
 
@@ -1746,8 +2702,16 @@ class Control:
                 reply = {"t": "ls", **list_dir(msg.get("path"))}
             elif kind == "read":
                 reply = {"t": "read", **read_file(msg.get("path"))}
-            else:
+            elif kind == "git":
                 reply = {"t": "git", **git_request(msg)}
+            elif kind == "models":
+                data = self.server.catalog.get(wait=True)
+                reply = {"t": "models", "models": data["models"], "roles": model_roles(),
+                         "fetchedAt": data["fetchedAt"]}
+            elif kind == "history":
+                reply = self.do_history(msg)
+            else:
+                reply = self.do_cmd(msg)
             reply["req"] = req
         except RequestError as ex:
             reply = {"t": "error", "req": req, "error": str(ex)}
@@ -1766,6 +2730,53 @@ class Control:
             raise RequestError(info)
         path = breadcrumb_session(info["tty"], info["pid"])
         return self.server.transcript(path) if path else None
+
+    def agent_pane(self, target) -> tuple[dict, dict]:
+        """(pane_info, inspect_agent fields) of an omp pane, else RequestError."""
+        if not isinstance(target, str) or not target:
+            raise RequestError("no target")
+        info = pane_info(target)
+        if isinstance(info, str):
+            raise RequestError(info)
+        if not info["agent"]:
+            raise RequestError("that terminal is not running omp")
+        fields, _, _ = self.server.inspect_agent(info["target"], info["tty"], info["pid"], info["working"], False)
+        return info, fields
+
+    def do_history(self, msg: dict) -> dict:
+        _, fields = self.agent_pane(msg.get("target"))
+        omp = fields["omp"]
+        if not omp["cwd"]:
+            raise RequestError("omp has not told which directory this terminal works in")
+        return {"t": "history", "cwd": omp["cwd"], "sessions": session_history(omp["cwd"], omp["sessionId"])}
+
+    def do_cmd(self, msg: dict) -> dict:
+        target, name = msg.get("target"), msg.get("cmd")
+        if name not in PaneCommand.NAMES:
+            return {"t": "cmd", "ok": False, "error": f"unknown command {name!r}"}
+        if not isinstance(target, str) or not target:
+            return {"t": "cmd", "ok": False, "error": "no target"}
+        info = pane_info(target)
+        if isinstance(info, str):
+            return {"t": "cmd", "ok": False, "error": info}
+        lock = self.server.cmd_lock(info["target"])
+        if not lock.acquire(timeout=CMD_QUEUE_S):
+            return {"t": "cmd", "ok": False, "error": "another command is still running in that terminal"}
+        try:
+            result = PaneCommand(self.server, info, name, msg.get("arg")).run()
+            reply = {"t": "cmd", "ok": True}
+            if result:
+                reply["info"] = result
+            log(f"{self.peer}: cmd {name} on {info['target']}: ok" + (f" ({result})" if result else ""))
+        except CmdFailed as ex:
+            reply = {"t": "cmd", "ok": False, "error": str(ex)}
+            log(f"{self.peer}: cmd {name} on {info['target']} failed: {str(ex).splitlines()[0]}")
+        finally:
+            lock.release()
+        self.server.poll_now.set()
+        if name == "page":
+            self.poke_page()
+        return reply
 
     def do_more(self, msg: dict) -> dict:
         target, before = msg.get("target"), msg.get("before")
@@ -1810,9 +2821,10 @@ class Control:
         sent_panes: list | None = None
         sent_sig: tuple | None = None
         seen_rev = -1
-        next_screen = next_chat = 0.0
+        next_screen = next_chat = next_page = 0.0
         view_error: str | None = None
         chat: dict | None = None    # {target, path, gen, rev} of what this client has
+        page: dict | None = None    # last omp page frame written in the chat view
         try:
             while True:
                 with self.cond:
@@ -1820,16 +2832,16 @@ class Control:
                         self.cond.wait_for(lambda: self.out or self.closed or self.dirty or not self.paused)
                     else:
                         due = next_screen if self.view == "term" else next_chat
-                        self.cond.wait_for(lambda: self.out or self.closed or self.force or self.dirty or self.paused,
-                                           timeout=max(0.0, due - time.monotonic()))
+                        self.cond.wait_for(lambda: self.out or self.closed or self.force or self.dirty or self.paused
+                                           or self.poke, timeout=max(0.0, due - time.monotonic()))
                     if self.closed:
                         return
                     msgs = list(self.out)
                     self.out.clear()
-                    target, view, paused, force = self.target, self.view, self.paused, self.force
+                    target, view, paused, force, poke = self.target, self.view, self.paused, self.force, self.poke
                     self.dirty = False
                     if not paused:
-                        self.force = False
+                        self.force = self.poke = False
                 if msgs:
                     self.write(msgs)
                 with self.server.ctl_cond:
@@ -1846,7 +2858,7 @@ class Control:
                     continue
                 now = time.monotonic()
                 if view == "term":
-                    chat = None
+                    chat = page = None
                     if now < next_screen and not force:
                         continue
                     next_screen = now + SCREEN_POLL_S
@@ -1867,7 +2879,7 @@ class Control:
                     if self.client:
                         self.server.client_screens[self.client] = self.last
                 else:
-                    if now < next_chat and not force:
+                    if now < next_chat and not force and not poke:
                         continue
                     next_chat = now + CHAT_POLL_S
                     if not target:
@@ -1882,6 +2894,16 @@ class Control:
                         continue
                     view_error = None
                     chat = self.chat_tick(info, chat, force)
+                    if page is not None and page["target"] != info["target"]:
+                        page = None
+                    if info["agent"] and (force or poke or page is not None or now >= next_page):
+                        next_page = now + PAGE_CHECK_S
+                        page = self.page_tick(info["target"], page, force)
+                        if page is not None:
+                            next_chat = min(next_chat, time.monotonic() + MIN_FRAME_S)
+                    elif page is not None:
+                        self.write([{"t": "screen", "target": page["target"], "page": False}])
+                        page = None
         except OSError:
             pass
         finally:
@@ -1890,6 +2912,28 @@ class Control:
                 self.sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+
+    def page_tick(self, target: str, last: dict | None, force: bool) -> dict | None:
+        """Stream the omp page (picker, settings, ...) open in the watched pane as `screen` frames
+        tagged `page:true`; one `page:false` frame when it closes. Returns the last frame."""
+        cur = capture(target, scrollback=False)
+        if isinstance(cur, str):
+            return last
+        if screen_page(cur["lines"], cur["alt"]) is None:
+            if last is not None:
+                self.write([{"t": "screen", "target": cur["target"], "page": False}])
+                self.server.poll_now.set()  # pane omp.page back to null
+            return None
+        if last is None:
+            self.server.poll_now.set()
+        base = None if force else last
+        if base is not None and all(base[k] == cur[k] for k in ("target", "lines", "cursor", "cols", "rows")):
+            return last
+        rev = self.server.next_rev()
+        msg = screen_message(rev, cur, base)
+        msg["page"] = True
+        self.write([msg])
+        return {**cur, "rev": rev}
 
     def chat_tick(self, info: dict, chat: dict | None, force: bool) -> dict | None:
         target = info["target"]
@@ -1925,7 +2969,7 @@ class Control:
 
 def cmd_serve(args) -> None:
     if not load_token():
-        sys.exit(f"no token at {TOKEN_FILE}; run: {sys.argv[0]} pair")
+        sys.exit(f"no token at {TOKEN_FILE}; run: {sys.argv[0]}{f' --instance {INSTANCE}' if INSTANCE else ''} pair")
     server = Server(args.port, Path(args.dest).expanduser())
 
     def on_signal(*_):
@@ -1984,7 +3028,8 @@ def cmd_pair(args) -> None:
         sys.exit(f"phone {serial} not ready over adb: {(state.stderr or state.stdout).strip()} "
                  "(enable USB/wireless debugging and accept the prompt, or pass -s SERIAL)")
     if not APK.exists() or args.rebuild:
-        subprocess.run([str(HERE / "android" / "build.sh")], check=True)
+        env = {**os.environ, "DEVDECK_VARIANT": INSTANCE} if INSTANCE else None
+        subprocess.run([str(HERE / "android" / "build.sh")], check=True, env=env)
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if not load_token():
@@ -2022,12 +3067,12 @@ def cmd_install_service(args) -> None:
     unit_dir.mkdir(parents=True, exist_ok=True)
     dest = Path(args.dest).expanduser().resolve()
     (unit_dir / UNIT_NAME).write_text(f"""[Unit]
-Description=DevDeck daemon (drive omp agents and tmux sessions from the phone)
+Description={LABEL} daemon (drive omp agents and tmux sessions from the phone)
 PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
-ExecStart={sys.executable} {Path(__file__).resolve()} --port {args.port} serve --dest "{dest}"
+ExecStart={sys.executable} {Path(__file__).resolve()}{f" --instance {INSTANCE}" if INSTANCE else ""} --port {args.port} serve --dest "{dest}"
 Restart=on-failure
 RestartSec=2
 
@@ -2044,7 +3089,10 @@ WantedBy=graphical-session.target
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"TCP port (default {DEFAULT_PORT})")
+    ap.add_argument("--port", type=int, help=f"TCP port (default {DEFAULT_PORT}, or 47491 with --instance)")
+    ap.add_argument("--instance", default=os.environ.get("DEVDECK_INSTANCE") or None, metavar="NAME",
+                    help="run a separate side-by-side install NAME (own app package, token, state, unit "
+                         "and port; env DEVDECK_INSTANCE)")
     sub = ap.add_subparsers(dest="cmd")
     p_serve = sub.add_parser("serve", help="run the daemon (default)")
     p_pair = sub.add_parser("pair", help="install the app on the phone via adb and pair it")
@@ -2059,6 +3107,10 @@ def main() -> None:
     args = ap.parse_args(argv)
     if args.cmd is None:
         args = ap.parse_args([*argv, "serve"])
+    if args.instance:
+        apply_instance(args.instance)
+    if args.port is None:
+        args.port = DEFAULT_PORT
     {"serve": cmd_serve, "pair": cmd_pair, "install-service": cmd_install_service}[args.cmd](args)
 
 

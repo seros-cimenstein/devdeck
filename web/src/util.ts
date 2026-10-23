@@ -171,6 +171,15 @@ const ICON_PATHS: Record<string, string> = {
   sun: "M12 7a5 5 0 100 10 5 5 0 000-10zM12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2",
   play: "M8 5l11 7-11 7z",
   history: "M3 12a9 9 0 103-6.7L3 8M3 3v5h5M12 7v5l3 3",
+  stop: "M7 7h10v10H7z",
+  keyboard: "M3 6h18v12H3zM7 10h.01M11 10h.01M15 10h.01M18 10h-.01M7 14h10",
+  edit: "M4 20h4L19 9l-4-4L4 16zM13 7l4 4",
+  eraser: "M8 20h12M5 15l9-9 5 5-8 8H8z",
+  compress: "M4 9h16M4 15h16M12 3v4M10 5l2 2 2-2M12 21v-4M10 19l2-2 2 2",
+  plan: "M9 4L3 6v14l6-2 6 2 6-2V4l-6 2zM9 4v14M15 6v14",
+  list: "M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01",
+  pin: "M9 4h6l-1 6 3 3H7l3-3zM12 13v8",
+  search: "M11 4a7 7 0 100 14 7 7 0 000-14zM20 20l-4-4",
 };
 export function icon(name: string, cls = ""): string {
   return `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true"><path d="${ICON_PATHS[name] || ""}"/></svg>`;

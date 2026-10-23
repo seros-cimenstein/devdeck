@@ -31,13 +31,13 @@ export class AskSheet implements Layer {
   onChange?: () => void;
 
   constructor() {
-    this.scrim = h("div.scrim.sheet-scrim", { onclick: () => this.close() });
+    this.scrim = h("div.scrim.sheet-scrim.ask-scrim", { onclick: () => this.close() });
     this.body = h("div.sheet-body");
     this.statusEl = h("div.ask-status", { hidden: true });
     this.submitBtn = h("button.btn.primary.wide", { text: "Submit", onclick: () => this.submit() }) as HTMLButtonElement;
     this.foot = h("div.sheet-foot", null, this.statusEl, this.submitBtn);
     this.sheet = h(
-      "div.sheet",
+      "div.sheet.ask-sheet",
       { role: "dialog", "aria-modal": "true" },
       h("div.grab"),
       this.body,
