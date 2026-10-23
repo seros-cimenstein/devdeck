@@ -26,7 +26,9 @@ and systemd unit. Both can run at the same time.
   - `wl-copy` (wl-clipboard) for the clipboard; `notify-send` is optional.
   - omp for the agents.
   - Voice mode: `ffmpeg` with libopus, `bun`, and omp's local Kokoro TTS runtime, which omp
-    installs on its first `omp say` (into `~/.omp/agent/cache/tts-runtime/`).
+    installs on its first `omp say` (into `~/.omp/agent/cache/tts-runtime/`). Optional: an
+    NVIDIA GPU with private CUDA 12 / cuDNN 9 libraries makes it about twice as fast (see
+    "Engine" under How it works).
   - To build the app: `adb` (`android-tools`), a JDK and `bun` (for the web UI). The
     Android SDK is reused from `../phone_synaptic_trackpad/.sdk`.
 - Phone: Android 8+ (developed on Android 13), with USB or wireless debugging enabled for
@@ -322,6 +324,8 @@ Git access is read-only: DevDeck never stages, commits or takes git's index lock
   - `DEVDECK_OMP_DIR` (default `~/.omp/agent`) is where omp's `terminal-sessions/`
     breadcrumbs, sessions, `config.yml` (model roles), `history.db` and
     `session-pins.json` are read. Useful for tests that must not touch the real ones.
+  - `DEVDECK_TTS_DEVICE` = `auto` (default), `cpu` or `cuda`: where the voice is synthesised
+    (see "Engine" under How it works).
 
 ## How it works
 
@@ -490,9 +494,9 @@ synthesised on the PC and streamed per sentence (protocol: "Voice messages").
   in its own thread; the pane poller only starts them, so synthesis never delays the
   poller, other requests or other connections. `say_stop` cancels between sentences and
   drops the audio still waiting in the connection's send queue.
-- **Engine.** One sentence is synthesised at a time for all connections (Kokoro already
-  uses every core). The engine is a persistent worker, `bun tts_worker.ts` (repo root),
-  that loads omp's Kokoro runtime (`~/.omp/agent/cache/tts-runtime/kokoro-*`, CPU
+- **Engine.** One sentence is synthesised at a time for all connections (on the CPU Kokoro
+  already uses every core). The engine is a persistent worker, `bun tts_worker.ts` (repo
+  root), that loads omp's Kokoro runtime (`~/.omp/agent/cache/tts-runtime/kokoro-*`,
   `onnxruntime-node`) and the weights in omp's cache (`~/.omp/agent/cache/tiny-models/`)
   once, then answers one JSON line per sentence with raw PCM. omp itself uses the q8
   weights; when the fp32 ones (`onnx/model.onnx`, 325 MB) are also in that cache the worker
@@ -501,21 +505,83 @@ synthesised on the PC and streamed per sentence (protocol: "Voice messages").
   `curl -L -o ~/.omp/agent/cache/tiny-models/onnx-community/Kokoro-82M-v1.0-ONNX/onnx/model.onnx https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model.onnx`
   (sha256 `8fbea51e...a34cb`). The worker starts on the first reading, or ahead of time
   when voice mode is turned on or a voice-mode agent is working, and exits after 10 minutes
-  without use to give its memory back (about 0.9 GB with fp32). If bun or the runtime is
-  missing, or the worker fails or hangs (60 s per sentence), `omp say --out` (a new process
-  that loads the model on every call) is used for the next minute instead.
-- **Measured** on the i7-8650U (8 threads, no GPU), real-time factor = synthesis time /
-  audio length:
+  without use to give its memory back (about 0.9 GB with fp32, plus 1.1-1.9 GB of GPU
+  memory on CUDA). If bun or the runtime is missing, or the worker fails or hangs (60 s per
+  sentence), `omp say --out` (a new process that loads the model on every call) is used for
+  the next minute instead.
+- **GPU (CUDA).** `DEVDECK_TTS_DEVICE` (environment of `serve`) picks the device:
+  - `auto` (default): CUDA when an NVIDIA driver, onnxruntime-node's CUDA provider and the
+    private CUDA libraries (below) are all there, else the CPU. A CUDA worker first
+    synthesises "Ready." and checks the audio. If it fails to start (it reports the error and
+    exits: transformers.js repeats a failed first session for every later one, so the CPU
+    needs a new process), crashes, hangs, or reports a CUDA error or out-of-memory later, the
+    daemon logs why and uses the CPU for the rest of its life (restart it to try CUDA again).
+  - `cpu`: never the GPU (the worker gets no CUDA libraries).
+  - `cuda`: CUDA only; when it fails, `omp say` is used for a minute, then CUDA is retried.
 
-  | engine | start | per sentence (~115 chars, 7.9 s of audio) | real-time factor |
+  The log says which: `tts worker ready on cuda in 2261 ms (fp32 model loaded in 2119 ms)`,
+  or `... ready on cpu ... (...; CUDA not used: <reason>)`, and every reading ends with
+  `(worker cuda)` / `(worker cpu)`. For the service: `systemctl --user edit devdeck-plus`,
+  add `[Service]` / `Environment=DEVDECK_TTS_DEVICE=cpu`, then restart it.
+
+  What it needs (all outside the system, no root): onnxruntime-node 1.26.0's CUDA provider,
+  `libonnxruntime_providers_cuda.so` and `libonnxruntime_providers_shared.so` from NuGet
+  `Microsoft.ML.OnnxRuntime.Gpu.Linux` 1.26.0 (the same version as onnxruntime-node; its
+  postinstall would normally fetch them), next to `libonnxruntime.so.1` in omp's runtime;
+  and CUDA 12.9 (cudart, cuBLAS, cuFFT, cuRAND) plus cuDNN 9.10.2 from NVIDIA's pip wheels,
+  unpacked into `~/.local/share/devdeck/cuda12/lib/` (2.3 GB). Only the worker gets that
+  directory, on its `LD_LIBRARY_PATH`. This laptop's MX150 is a Pascal GPU (compute 6.1):
+  cuDNN dropped Pascal in 9.11 and CUDA 13 (Arch's `cuda` package) dropped it too, so do not
+  upgrade those; the provider ships sm_60 kernels, which run on 6.1. Downloads were 225 MB
+  (nupkg) and 1.56 GB (wheels), about 10 minutes. To install (adjust `kokoro-1.2.1` and
+  `napi-v6` to omp's runtime; a newer onnxruntime-node needs the matching nupkg version):
+
+  ```sh
+  L=~/.local/share/devdeck/cuda12/lib; mkdir -p $L; cd /tmp
+  pip download --no-deps -d cuda12-wheels nvidia-cuda-runtime-cu12==12.9.79 nvidia-cublas-cu12==12.9.2.10 \
+    nvidia-cufft-cu12==11.4.1.4 nvidia-curand-cu12==10.3.10.19 nvidia-cudnn-cu12==9.10.2.21
+  for w in cuda12-wheels/*.whl; do unzip -o -j $w 'nvidia/*/lib/lib*.so.*' -x '*nvblas*' '*cufftw*' -d $L; done
+  curl -L -o ort-gpu.nupkg https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.gpu.linux/1.26.0/microsoft.ml.onnxruntime.gpu.linux.1.26.0.nupkg
+  unzip -j ort-gpu.nupkg runtimes/linux-x64/native/libonnxruntime_providers_cuda.so \
+    runtimes/linux-x64/native/libonnxruntime_providers_shared.so \
+    -d ~/.omp/agent/cache/tts-runtime/kokoro-1.2.1/node_modules/onnxruntime-node/bin/napi-v6/linux/x64/
+  rm -r cuda12-wheels ort-gpu.nupkg
+  ```
+
+  To remove the GPU path: `rm -r ~/.local/share/devdeck/cuda12` and delete the two
+  `libonnxruntime_providers_*.so` files again; `auto` then uses the CPU without trying.
+  - **GPU memory.** The 2 GB MX150 holds 1.1 GB after loading and 1.9 GB after a
+    290-character sentence; a 350-character one (or a long one read slowly) fails to
+    allocate. The worker then synthesises that sentence in two halves split at a comma near
+    the middle (stderr: "out of GPU memory for N characters, splitting it"), and splits
+    anything that long up front from then on.
+  - **fp16** weights on the MX150 were slower (real-time factor 1.2-1.3; Pascal has little
+    fp16 throughput), produced NaN audio and ran out of memory at 290 characters: not used.
+- **Measured** on the i7-8650U (8 threads) and its MX150 (2 GB), real-time factor =
+  synthesis time / audio length:
+
+  | engine | start | per sentence (~115 chars, 7.5-7.9 s of audio) | real-time factor |
   |---|---|---|---|
-  | worker, fp32 | 1.2 s (model load 1.0 s) | 4.2-4.7 s | 0.55-0.6 |
-  | worker, q8 | 1.1 s (model load 1.0 s) | 12-12.7 s | 1.5-1.6 |
+  | worker, fp32, CUDA | 2.2 s (load 1.1 s + warm-up) | 2.1 s | 0.26-0.34 |
+  | worker, fp32, CPU | 1.2 s (model load 1.0 s) | 3.9-4.7 s | 0.5-0.6 |
+  | worker, q8, CPU | 1.1 s (model load 1.0 s) | 12-12.7 s | 1.5-1.6 |
   | `omp say --out` (q8) | every call | 15 s | 1.8 (2.2 for a short sentence) |
 
-  With fp32 a 1900-character reply (19 sentences, 149 s of audio) took 90 s in total, the
-  first sentence arrived after 5.7 s (worker start included) and the phone never waits
-  between sentences; with q8 the total was 253 s, so playback would stall. Opus at 24
+  CPU vs CUDA, fp32, warm, mean of 3 runs (2026-10-23):
+
+  | sentence | audio | CPU | CUDA |
+  |---|---|---|---|
+  | 45 chars | 3.15 s | 1.57 s (RTF 0.50) | 1.08 s (RTF 0.34) |
+  | 116 chars | 7.5 s | 3.94 s (RTF 0.53) | 2.15 s (RTF 0.29) |
+  | 290 chars | 18.75 s | 11.05 s (RTF 0.59) | 4.90 s (RTF 0.26) |
+
+  Both give the same audio (same length, RMS and peak within 1%). CUDA also leaves the CPU
+  free: three 116-character sentences (with model load) took 53 s of CPU time on the CPU
+  path and 8.8 s with CUDA. Through the daemon, a fresh CUDA worker's first sentence
+  arrived 3.5 s after the `say` (worker start included), 1.1 s with a warm worker.
+  With fp32 on the CPU a 1900-character reply (19 sentences, 149 s of audio) took 90 s in
+  total, the first sentence arrived after 5.7 s (worker start included) and the phone never
+  waits between sentences; with q8 the total was 253 s, so playback would stall. Opus at 24
   kbit/s is about 3 KB per second of speech.
 - **Cache.** Encoded sentences are kept in memory per (text, voice, speed) for 30 minutes
   after their last use, at most 50 MB (least recently used dropped first), so replaying a
@@ -713,6 +779,7 @@ Voices: `af_heart`, `af_bella`, `af_nicole`, `af_aoede`, `af_kore`, `af_sarah`,
 - **One watched pane per connection.** The clipboard needs a Wayland session.
 - **Voice mode**: a finished reply is noticed by the 2 s pane poll, so reading starts 2-4 s
   after the turn ends (plus the link). Only the final message of a turn is read (text
-  written before tool calls is not). Synthesis loads the PC's CPU while it speaks. Nothing
-  is read while the app is paused; a reply or question that arrived meanwhile is read when
-  it comes back. The spoken-form rules are heuristics for English markdown.
+  written before tool calls is not). Synthesis loads the PC's CPU (with CUDA, mostly the
+  GPU) while it speaks. Nothing is read while the app is paused; a reply or question that
+  arrived meanwhile is read when it comes back. The spoken-form rules are heuristics for
+  English markdown.

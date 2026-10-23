@@ -142,6 +142,9 @@ TTS_RETRY_S = 60.0        # after a worker failure, use `omp say` this long befo
 TTS_WORKER = HERE / "tts_worker.ts"
 OMP_CACHE = Path.home() / ".omp" / "agent" / "cache"  # omp's own runtime and weights, not DEVDECK_OMP_DIR
 TTS_WEIGHTS = OMP_CACHE / "tiny-models"                # where omp's TTS worker keeps the Kokoro weights
+# Private CUDA 12 + cuDNN 9 runtime libraries (lib/) for the worker's GPU path; see README "Engine".
+TTS_CUDA_LIBS = Path.home() / ".local" / "share" / "devdeck" / "cuda12" / "lib"
+TTS_DEVICES = ("auto", "cpu", "cuda")  # DEVDECK_TTS_DEVICE; auto = CUDA when it works, else the CPU
 MAX_UTTERANCES = 4        # concurrent `say` streams per connection
 VOICE_RESUME_S = 15 * 60.0  # a reconnecting phone hears the reply it missed within this long
 
@@ -2049,6 +2052,18 @@ def kokoro_runtime() -> Path | None:
     return max(found, key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)]) if found else None
 
 
+def cuda_missing(runtime: Path) -> str | None:
+    """Why the worker cannot use CUDA on this PC, or None when the pieces are all there: an NVIDIA
+    driver, onnxruntime-node's CUDA provider in omp's runtime and the private CUDA/cuDNN libs."""
+    if not Path("/dev/nvidiactl").exists():
+        return "no NVIDIA driver (/dev/nvidiactl)"
+    if not any(runtime.glob("node_modules/onnxruntime-node/bin/napi-v*/linux/x64/libonnxruntime_providers_cuda.so")):
+        return "onnxruntime-node has no CUDA provider (libonnxruntime_providers_cuda.so)"
+    if not (TTS_CUDA_LIBS / "libcudnn.so.9").exists():
+        return f"no CUDA 12/cuDNN 9 libraries in {TTS_CUDA_LIBS}"
+    return None
+
+
 def omp_say_pcm(text: str, voice: str, speed: float) -> tuple[bytes, int]:
     """(mono PCM16, rate) from `omp say --out`: a new process that loads the model every call."""
     with tempfile.TemporaryDirectory(prefix="devdeck-tts-") as tmp:
@@ -2088,8 +2103,10 @@ class Speech:
     """Kokoro-82M synthesis for every connection: one sentence at a time (Kokoro already uses all
     cores), Ogg/Opus encoded, cached per (text, voice, speed). The engine is a persistent bun
     worker (tts_worker.ts) that loads omp's model once; it starts on first use (or when voice
-    mode turns on), and exits after TTS_IDLE_S unused to give its memory back. When it cannot
-    start or fails, `omp say --out` (a new process per sentence) is used instead."""
+    mode turns on), and exits after TTS_IDLE_S unused to give its memory back. It runs on the
+    device DEVDECK_TTS_DEVICE names (auto: CUDA when it works, else the CPU, for the rest of
+    the daemon's life once CUDA failed). When it cannot start or fails, `omp say --out` (a new
+    process per sentence) is used instead."""
 
     def __init__(self):
         self.lock = threading.Lock()    # the engine; held for one sentence at a time
@@ -2097,6 +2114,12 @@ class Speech:
         self.buf = bytearray()
         self.used = 0.0
         self.failed = -TTS_RETRY_S      # monotonic time of the last worker failure
+        self.wanted = os.environ.get("DEVDECK_TTS_DEVICE", "").strip().lower() or "auto"
+        if self.wanted not in TTS_DEVICES:
+            log(f"DEVDECK_TTS_DEVICE={self.wanted!r} is not one of {', '.join(TTS_DEVICES)}; using auto")
+            self.wanted = "auto"
+        self.device = "cpu"             # what the running worker uses
+        self.cuda_off: str | None = None  # why auto no longer tries CUDA (it failed once)
         self.warming = False
         self.errlog: collections.deque[str] = collections.deque(maxlen=20)
         self.cache_lock = threading.Lock()
@@ -2107,7 +2130,8 @@ class Speech:
     # ------------------------------------------------------------ public
 
     def synth(self, text: str, voice: str, speed: float, cancel: threading.Event) -> tuple[bytes, int, str]:
-        """(ogg, duration ms, engine) of one sentence; engine is "cache", "worker" or "omp say"."""
+        """(ogg, duration ms, engine) of one sentence; engine is "cache", "worker cpu",
+        "worker cuda" or "omp say"."""
         key = (text, voice, speed)
         hit = self._cached(key)
         if hit is not None:
@@ -2155,15 +2179,33 @@ class Speech:
     def _pcm(self, text: str, voice: str, speed: float) -> tuple[bytes, int, str]:
         if time.monotonic() - self.failed >= TTS_RETRY_S:
             try:
-                if self._worker() is not None:
-                    pcm, rate = self._ask_worker(text, voice, speed)
-                    return pcm, rate, "worker"
+                for _ in range(2):      # a second time only on the CPU after CUDA failed
+                    if self._worker() is None:
+                        break
+                    try:
+                        pcm, rate = self._ask_worker(text, voice, speed)
+                        return pcm, rate, f"worker {self.device}"
+                    except SpeechError as ex:
+                        if not self._drop_cuda(ex):
+                            raise
             except WorkerFailed as ex:
                 log(f"tts worker: {ex}; using omp say for {TTS_RETRY_S:.0f} s")
                 self._stop_worker()
                 self.failed = time.monotonic()
         pcm, rate = omp_say_pcm(text, voice, speed)
         return pcm, rate, "omp say"
+
+    def _drop_cuda(self, ex: SpeechError) -> bool:
+        """auto: a worker running on CUDA died, hung or reported a CUDA error (out of GPU memory
+        even after splitting the sentence, say); stop it and use the CPU from now on. False when
+        that does not apply."""
+        if self.wanted != "auto" or self.device != "cuda" or not (isinstance(ex, WorkerFailed) or re.search(
+                r"(?i)cuda|cudnn|cublas|cufft|curand|gpu|failed to allocate", str(ex))):
+            return False
+        self.cuda_off = f"failed while running: {str(ex)[:300]}"
+        log(f"tts worker on CUDA {self.cuda_off}; using the CPU from now on")
+        self._stop_worker()
+        return True
 
     def _worker(self) -> subprocess.Popen | None:
         """The running worker, started if needed; None when bun or omp's runtime is missing
@@ -2176,21 +2218,47 @@ class Speech:
         bun, runtime = tool_binary("bun", Path.home() / ".bun" / "bin" / "bun"), kokoro_runtime()
         if bun is None or runtime is None or not TTS_WORKER.exists():
             return None
+        device, why = self.wanted, None
+        if device == "auto":
+            why = self.cuda_off or cuda_missing(runtime)
+            device = "cpu" if why else "cuda"
         start = time.monotonic()
         try:
-            self.proc = subprocess.Popen([bun, str(TTS_WORKER), str(runtime), str(TTS_WEIGHTS)], cwd=str(runtime),
+            head = self._start(bun, runtime, device)
+        except WorkerFailed as ex:
+            if self.wanted != "auto" or device != "cuda":
+                raise
+            # The worker reports a CUDA failure and exits (it cannot switch in-process), or crashed.
+            self._stop_worker()
+            self.cuda_off = why = str(ex)[:300]
+            log(f"tts worker on CUDA failed ({why}); starting it on the CPU")
+            device = "cpu"
+            head = self._start(bun, runtime, device)
+        self.device = device
+        note = f"; CUDA not used: {why}" if why else ""
+        log(f"tts worker ready on {device} in {(time.monotonic() - start) * 1000:.0f} ms "
+            f"({head.get('dtype')} model loaded in {head.get('ms')} ms{note})")
+        return self.proc
+
+    def _start(self, bun: str, runtime: Path, device: str) -> dict:
+        """Start the worker on `device` (cpu|cuda) and return its ready line. Only a CUDA worker
+        gets the private CUDA/cuDNN libraries on its LD_LIBRARY_PATH."""
+        env = None
+        if device == "cuda":
+            env = {**os.environ, "LD_LIBRARY_PATH": os.pathsep.join(
+                filter(None, [str(TTS_CUDA_LIBS), os.environ.get("LD_LIBRARY_PATH")]))}
+        try:
+            self.proc = subprocess.Popen([bun, str(TTS_WORKER), str(runtime), str(TTS_WEIGHTS), device], cwd=str(runtime),
                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                         bufsize=0, start_new_session=True)
+                                         bufsize=0, start_new_session=True, env=env)
         except OSError as ex:
             raise WorkerFailed(f"cannot start: {ex}") from None
         self.buf = bytearray()
         threading.Thread(target=self._drain, args=(self.proc,), daemon=True).start()
-        head = self._read_head(start + TTS_LOAD_S)
+        head = self._read_head(time.monotonic() + TTS_LOAD_S)
         if head.get("ready") is not True:
-            raise WorkerFailed(f"unexpected first line {head!r}")
-        log(f"tts worker ready in {(time.monotonic() - start) * 1000:.0f} ms "
-            f"({head.get('dtype')} model loaded in {head.get('ms')} ms)")
-        return self.proc
+            raise WorkerFailed(f"{device}: {head.get('error') or f'unexpected first line {head!r}'}")
+        return head
 
     def _ask_worker(self, text: str, voice: str, speed: float) -> tuple[bytes, int]:
         proc = self.proc
