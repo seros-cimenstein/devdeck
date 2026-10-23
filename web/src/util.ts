@@ -184,6 +184,9 @@ const ICON_PATHS: Record<string, string> = {
   headset: "M4 15v-3a8 8 0 0116 0v3M4 14h3v6H5a1 1 0 01-1-1zM20 14h-3v6h2a1 1 0 001-1z",
   volume: "M4 9h4l5-4v14l-5-4H4zM16.5 9a4 4 0 010 6M19 6.5a8 8 0 010 11",
   sliders: "M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1M15 4v4M9 10v4M17 16v4",
+  micOff: "M9 9v3a3 3 0 005.1 2.1M15 9.3V6a3 3 0 00-5.9-.8M5 11a7 7 0 0011.7 5.2M19 11a7 7 0 01-.5 2.6M12 18v3M9 21h6M3 3l18 18",
+  hangup: "M3 14.5c5-4.7 13-4.7 18 0l-2.6 2.6-3.4-1.6V13c-2-.8-4-.8-6 0v2.5l-3.4 1.6z",
+  wave: "M4 10v4M8 7v10M12 4v16M16 7v10M20 10v4",
 };
 export function icon(name: string, cls = ""): string {
   return `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true"><path d="${ICON_PATHS[name] || ""}"/></svg>`;

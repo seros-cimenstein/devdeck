@@ -7,13 +7,31 @@ import { ControlStrip, openSessionMenu } from "./controls";
 import { Drawer } from "./drawer";
 import { FilesPanel, findRepo, openFileViewer } from "./files";
 import { openGit } from "./git";
+import { initLive, liveEntry, liveStatus, liveSync, onLive, onLiveDelegation, onLiveLocal, onLiveNotice, onLiveTranscript } from "./live";
 import { refreshModels } from "./omp";
 import { outboxAck, sendText } from "./outbox";
 import { PagePanel } from "./page";
 import { currentPane, hooks, state, type View } from "./state";
 import { TermView } from "./term";
 import { TopBar } from "./topbar";
-import type { AckMsg, AudioMsg, LinkMsg, Msg, Pane, ScreenMsg, SessionsMsg, SttMsg, TranscriptMsg, TtsMsg, VoiceErrorMsg } from "./types";
+import type {
+  AckMsg,
+  AudioMsg,
+  LinkMsg,
+  LiveDelegationMsg,
+  LiveLocalMsg,
+  LiveMsg,
+  LiveNoticeMsg,
+  LiveTranscriptMsg,
+  Msg,
+  Pane,
+  ScreenMsg,
+  SessionsMsg,
+  SttMsg,
+  TranscriptMsg,
+  TtsMsg,
+  VoiceErrorMsg,
+} from "./types";
 import { openMenu, popLayer, toast } from "./ui";
 import { fmtRtt, h, icon, learnHome, lsGet, lsSet } from "./util";
 import { initVoice, onAudio, onStt, onTts, onVoiceError, openVoiceSettings, voiceOnline, voicePanel, voiceSync } from "./voice";
@@ -35,6 +53,7 @@ const top = new TopBar({
     toast(parts.filter(Boolean).join(" · "));
   },
   sessionMenu: (anchor) => openSessionMenu(anchor),
+  live: () => liveEntry(),
 });
 const strip = new ControlStrip();
 const chat = new ChatView();
@@ -62,6 +81,7 @@ initVoice({
   },
   onSent: () => chat.scrollToBottom(true),
 });
+initLive({ onStatus: () => top.setLive(liveStatus()) });
 
 hooks.open = (t, v) => openTarget(t, v);
 hooks.openAsk = (t, a) => {
@@ -188,6 +208,7 @@ function onSessions(list: Pane[]) {
   chat.updateStatus();
   ask.sync();
   voiceSync();
+  liveSync();
   updateAttention();
   maybeAutoAsk();
   updateAskBanner();
@@ -309,6 +330,16 @@ function receive(m: Msg) {
       return onStt(m as unknown as SttMsg);
     case "voice_error":
       return onVoiceError(m as unknown as VoiceErrorMsg);
+    case "live":
+      return onLive(m as unknown as LiveMsg);
+    case "live_local":
+      return onLiveLocal(m as unknown as LiveLocalMsg);
+    case "live_transcript":
+      return onLiveTranscript(m as unknown as LiveTranscriptMsg);
+    case "live_delegation":
+      return onLiveDelegation(m as unknown as LiveDelegationMsg);
+    case "live_notice":
+      return onLiveNotice(m as unknown as LiveNoticeMsg);
     case "pong":
       return;
     default:

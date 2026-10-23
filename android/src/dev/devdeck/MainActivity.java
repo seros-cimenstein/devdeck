@@ -65,6 +65,7 @@ public class MainActivity extends Activity implements LinkService.Listener {
     private static final String INDEX = "https://" + HOST + "/web/index.html";
     private static final int REQ_FILES = 1;
     private static final int REQ_MIC = 2;
+    private static final int REQ_LIVE = 3;
     private static final long BACK_TIMEOUT_MS = 1000;
 
     static volatile MainActivity current;
@@ -79,6 +80,7 @@ public class MainActivity extends Activity implements LinkService.Listener {
     private final Runnable backTimeout = this::backUnhandled;
     private Recognizer recognizer;
     private String pendingListen;  // listen opts waiting for the microphone permission
+    private String pendingLive;  // liveStart opts waiting for the microphone permission
     // Local events (stt) coalesced into one dd.receive script per main-loop turn.
     private final ArrayList<String> localOut = new ArrayList<>();
     private boolean localPosted;
@@ -104,7 +106,8 @@ public class MainActivity extends Activity implements LinkService.Listener {
         super.onCreate(saved);
         current = this;
         prefs = LinkService.prefs(this);
-        setVolumeControlStream(AudioManager.STREAM_MUSIC);  // volume keys adjust the TTS voice
+        // Volume keys adjust the TTS voice, or the call during a Live call (LiveService flips it).
+        setVolumeControlStream(LiveService.active() ? AudioManager.STREAM_VOICE_CALL : AudioManager.STREAM_MUSIC);
         recognizer = new Recognizer(this, this::emitLocal);
         WebView.setWebContentsDebuggingEnabled(true);
         createWeb();
@@ -447,24 +450,56 @@ public class MainActivity extends Activity implements LinkService.Listener {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(requestCode, permissions, results);
+        boolean granted = results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED;
+        if (requestCode == REQ_LIVE) {
+            String opts = pendingLive;
+            pendingLive = null;
+            if (opts == null) return;
+            if (granted) {
+                LiveService.start(this, opts);
+                return;
+            }
+            try {
+                deliverLocal(new JSONObject().put("t", "live_local").put("active", false).put("phase", "error")
+                        .put("error", "permission").put("muted", false).put("route", "speaker"));
+            } catch (JSONException e) {
+                throw new IllegalStateException(e);
+            }
+            if (results.length > 0) micDeniedForGood("Allow the microphone for DevDeck to use Live");
+            return;
+        }
         if (requestCode != REQ_MIC) return;
         String opts = pendingListen;
         pendingListen = null;
         if (opts == null) return;
-        if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
+        if (granted) {
             startListening(opts);
             return;
         }
         recognizer.fail("permission");
-        // Denied for good: the system no longer asks, only the app settings can grant it.
-        if (results.length > 0 && !shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO)) {
-            toast("Allow the microphone for DevDeck to talk to the agent");
-            try {
-                startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                        Uri.fromParts("package", getPackageName(), null)));
-            } catch (ActivityNotFoundException ignored) {
-            }
+        if (results.length > 0) micDeniedForGood("Allow the microphone for DevDeck to talk to the agent");
+    }
+
+    /** Denied for good: the system no longer asks, only the app settings can grant it. */
+    private void micDeniedForGood(String hint) {
+        if (shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO)) return;
+        toast(hint);
+        try {
+            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.fromParts("package", getPackageName(), null)));
+        } catch (ActivityNotFoundException ignored) {
         }
+    }
+
+    /** Main thread. Starts (or replaces) a GPT Live call once the microphone is allowed. */
+    private void liveStart(String opts) {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            LiveService.start(this, opts);
+            return;
+        }
+        boolean asking = pendingLive != null;
+        pendingLive = opts;
+        if (!asking) requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_LIVE);
     }
 
     private void setVoiceMode(boolean on) {
@@ -663,6 +698,28 @@ public class MainActivity extends Activity implements LinkService.Listener {
             main.post(() -> {
                 if (owner == web) MainActivity.this.setVoiceMode(on);
             });
+        }
+
+        /** GPT Live call (LiveService): opts JSON {voice, mode: "concierge"|"direct", target?}. */
+        @JavascriptInterface
+        public void liveStart(String opts) {
+            main.post(() -> {
+                if (owner == web) MainActivity.this.liveStart(opts);
+            });
+        }
+
+        /** Hangs up (also a start still in flight: intents are handled in order); tells the daemon. */
+        @JavascriptInterface
+        public void liveStop() {
+            main.post(() -> {
+                pendingLive = null;
+                LiveService.stop(MainActivity.this);
+            });
+        }
+
+        @JavascriptInterface
+        public void liveMute(boolean on) {
+            LiveService.requestMute(on);
         }
     }
 }

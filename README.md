@@ -29,6 +29,9 @@ and systemd unit. Both can run at the same time.
     installs on its first `omp say` (into `~/.omp/agent/cache/tts-runtime/`). Optional: an
     NVIDIA GPU with private CUDA 12 / cuDNN 9 libraries makes it about twice as fast (see
     "Engine" under How it works).
+  - Live mode: omp logged in to ChatGPT (`/login`, provider `openai-codex`) with an account
+    whose plan includes GPT Live (a free account is refused with HTTP 404). Nothing else:
+    the call's audio goes straight between the phone and OpenAI.
   - To build the app: `adb` (`android-tools`), a JDK and `bun` (for the web UI). The
     Android SDK is reused from `../phone_synaptic_trackpad/.sdk`.
 - Phone: Android 8+ (developed on Android 13), with USB or wireless debugging enabled for
@@ -49,6 +52,12 @@ The build is `android/build.sh`:
 2. It runs `aapt2` (resources plus `-A assets`), `javac`, `d8`, `zipalign` and `apksigner`
    (debug key), with no Gradle.
 3. It writes `devdeck.apk`, and fails loudly if the web build fails.
+
+Live mode's native WebRTC is the pinned libwebrtc AAR `io.github.webrtc-sdk:android`
+144.7559.15 (sha256 `fc7c8d02...0cde4071`) from Maven Central. `build.sh` downloads it once
+to `${XDG_CACHE_HOME:-~/.cache}/devdeck-build/` (override with `WEBRTC_CACHE`), checks the
+checksum on every build, and packages its `classes.jar` plus only
+`lib/arm64-v8a/libjingle_peerconnection_so.so`. This adds about 5.9 MB to the APK.
 
 **Token and addresses.** On first run `pair` creates `~/.config/devdeck/token` (mode 600).
 It starts the app with the token, the port and every reachable IPv4 address of the PC: LAN
@@ -249,6 +258,40 @@ Talk to the agent and hear its replies, spoken on the PC by omp's local Kokoro v
   read replies aloud, read questions aloud, listen again and spoken-style replies (all on by
   default). Saved on the phone.
 
+### Live (GPT Live voice calls)
+
+A ChatGPT-voice-like conversation about your terminals: natural replies right away, talk
+over it to interrupt, no buttons while it runs. It works phone in hand, with earbuds and the
+screen off, or on the speaker at the desk. It uses GPT Live (`gpt-live-1-codex`, the model
+behind omp's `/live`) through omp's ChatGPT login.
+- **Who you talk to.** By default a quick voice assistant, the **concierge**: a small omp
+  session (tmux `devdeck-voice`) that sees every terminal through `ddctl`. Ask it what the
+  terminals are doing, give coding tasks ("tell the devdeck agent to ..."), stop or switch
+  models, answer an agent's question, open a new terminal, or think out loud. It hands real
+  coding work to the right terminal instead of doing it. **Direct mode** talks to one
+  terminal's coding agent instead: what you ask goes into that terminal prefixed `[voice] `,
+  and its question is read to you; your spoken answer picks the option you name, else it is
+  sent as your own answer. Switch with the mode chip, or by voice ("let me talk to main
+  directly", "back to the concierge").
+- **While agents work** it keeps talking with you, mentions short progress, and tells you the
+  result when the turn ends. When another terminal's agent finishes or asks something, it
+  says so at the next pause ("main finished: ...", "docs is asking: ..."); these also appear
+  as cards in the Live view.
+- **Ending.** End (in the view or the notification) hangs up. If the phone's link to the PC
+  drops, the call keeps going (audio does not use that link) and ends 60 s later unless the
+  link comes back.
+
+**Live view (web).** An orb button in the top bar starts a call with the saved voice and
+mode (`dd.live` in localStorage: voice, mode, last direct terminal) and opens the full-screen
+Live view: orb driven by `live_local` mic/spk levels and coloured by phase, phase label +
+hint, captions (`live_transcript`, partial -> final per role+turn), delegation chips
+(`live_delegation`, updated in place by id: sent/done/failed), notice cards (`live_notice`;
+tap opens the terminal or its ask), mode chip (Concierge / Talking to <terminal>, picker
+sends `live_mode`), voice picker (9 voices; applies from the next call), Mute
+(`DD.liveMute`) and End (`DD.liveStop`; native sends `live_stop`). Back closes the view but
+keeps the call; a green "Live m:ss" pill in the top bar returns to it (also after a page
+reload, from the replayed `live_local`). Voice mode cannot be enabled while a call runs.
+
 ### Notifications
 
 While DevDeck is in the background (or you are looking at another terminal), it notifies
@@ -319,6 +362,8 @@ Git access is read-only: DevDeck never stages, commits or takes git's index lock
   subcommand, e.g. `./devdeck.py --port 47499 serve`.
 - `--instance NAME`: a side-by-side install (see Setup). Environment `DEVDECK_INSTANCE`.
 - `--dest DIR` (`serve`, `install-service`): where uploads go. Default `~/Downloads/phone`.
+- `--ctl PATH` (`serve`): the local control socket for `ddctl`. Default
+  `<state dir>/ctl.sock` (`~/.local/state/devdeck-plus/ctl.sock` with `--instance plus`).
 - Environment:
   - `XDG_CONFIG_HOME` / `XDG_STATE_HOME` move the token and state directories.
   - `DEVDECK_OMP_DIR` (default `~/.omp/agent`) is where omp's `terminal-sessions/`
@@ -326,6 +371,10 @@ Git access is read-only: DevDeck never stages, commits or takes git's index lock
     `session-pins.json` are read. Useful for tests that must not touch the real ones.
   - `DEVDECK_TTS_DEVICE` = `auto` (default), `cpu` or `cuda`: where the voice is synthesised
     (see "Engine" under How it works).
+  - `DEVDECK_CONCIERGE_MODEL` = `provider/id[:level]` (default
+    `anthropic/claude-haiku-4-5:low`): the Live concierge's model and thinking level.
+  - `DEVDECK_CONCIERGE_SESSION` (default `devdeck-voice`): the concierge's tmux session, for
+    tests that must not touch the real one.
 
 ## How it works
 
@@ -591,12 +640,156 @@ synthesised on the PC and streamed per sentence (protocol: "Voice messages").
 - Delivered ids (last 2000) are kept in `~/.local/state/devdeck/seen.json`.
 - Partial uploads live in `~/.local/state/devdeck/partial/` until complete.
 - The models list is cached in `~/.local/state/devdeck/models.json`.
+- `ddctl`'s control socket is `~/.local/state/devdeck/ctl.sock` (see "Concierge and `ddctl`").
+
+### Live calls (daemon)
+
+This replicates omp 18.12.6's `/live` (`packages/coding-agent/src/live/`), except that the
+phone holds the WebRTC peer. The daemon does the rest:
+```
+phone (WebRTC, foreground service) <-> OpenAI GPT Live         audio, straight over the internet
+phone <-> daemon (this link)           offer/answer, state, captions, delegations, notices
+daemon <-> OpenAI sideband WebSocket   delegations in; progress, final replies, notices out
+daemon -> concierge pane (or the direct terminal) -> ddctl -> daemon
+```
+- **Login.** omp's ChatGPT OAuth credentials are read from `~/.omp/agent/agent.db`
+  (`auth_credentials`, provider `openai-codex`, enabled, valid for at least another minute),
+  read-only: refreshing rotates the refresh token, which only omp may do. The login that
+  last worked goes first; one that is refused (401/403 expired, 404 for an account without
+  GPT Live, such as a free plan) hands over to the next. When all have expired the daemon
+  runs `omp token openai-codex` once (omp refreshes the login itself; the printed token is
+  discarded), then gives up with "omp's ChatGPT login has expired; open omp once so it
+  refreshes".
+- **Signalling.** `POST https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas`
+  with omp's headers (`Authorization`, `OpenAI-Alpha: quicksilver=v2`, `User-Agent: Codex
+  Desktop/0.159.0`, `originator`, `version`, `session-id`/`thread-id` (one UUID per call),
+  `x-session-id` (another), `chatgpt-account-id`) and `{sdp, session:{model:"gpt-live-1-codex",
+  instructions, audio:{output:{voice}}, delegation:{type:"client"}}}`. The answer is `201`
+  with the SDP answer as the body and `Location: /v1/realtime/calls/rtc_...` (the call id).
+  The instructions are omp's live prompt adapted: the backend is the concierge (or one
+  terminal's agent), everything about terminals is delegated, `Notice:` context is told at
+  the next pause, `Routing:` context is silent.
+- **Sideband.** `wss://api.openai.com/v1/live/<call id>` with the same headers, after the
+  answer went to the phone (5 attempts, 15 s each, backoff from 0.5 s). It is a small stdlib
+  WebSocket client (TLS, masked frames, fragments, ping/pong, close) driven by one I/O thread
+  that also sends everything queued for the call; it pings after 15 s without a frame and
+  gives up after 45 s. An `error` event or a close ends the call (`live {phase:"error"}`).
+  The sideband also carries both audio streams (`session.input_audio.append`,
+  `session.output_audio.delta`), which are ignored. Events used: `session.started`
+  (`listening`), `input_transcript.added` / `output_transcript.added` / `turn.done`
+  (captions, coalesced like omp: cumulative or delta pieces grow a turn, the piece after a
+  final starts the next), `delegation.created`, `error`; acknowledgements
+  (`session.context.appended`, `delegation.context.appended`), `turn.created`/`turn.delta`
+  and `session.usage.updated` are ignored, anything else is logged once per call.
+- **Delegations.** `delegation.created {item:{id, content:[{type:"input_text", text}]}}` is
+  pasted (bracketed paste + Enter, so it steers a working agent) into the concierge pane
+  verbatim, or into the direct terminal as `[voice] <text>`; the concierge's tmux session is
+  created first if missing and the paste waits (up to 30 s) until omp runs in it. A direct
+  terminal that is asking gets the text as its answer instead (the option it names, else a
+  custom answer; one question only). The newest delegation replaces the previous one, as in
+  omp. Every 0.5 s the routed pane's session file is read from where the delegation started:
+  each new assistant message with tool calls and visible text goes back as
+  `delegation.context.append {channel:"commentary"}` (chunks of at most 500 UTF-8 bytes); the
+  turn's last message (any other stop reason) goes back without a channel as `"Agent Final
+  Message":\n\n<text>` (at most 6000 characters); an aborted or failed turn, a direct
+  terminal's question, a pane that disappears, or a paste that fails also end the delegation
+  with a spoken final message. Delegations are routed one at a time, in order.
+- **Notices.** The sessions poller (which also runs while a call is up, even with no phone
+  connected) watches the other agent panes (not the routed one, not the concierge): working
+  → idle with a new final reply (`stop`, with text) gives "`<terminal>` finished: `<first
+  sentence>`", a new question "`<terminal>` is asking: `<question>` Options: ...". The
+  terminal is named by its session when that has one pane. They go to the phone at once
+  (`live_notice`) and to the voice model at most once per 20 s (merged) as
+  `session.context.append {channel:"speakable"}` with `Notice: ...`. Verified on a real call:
+  the server acknowledges it (`session.context.appended`) and the model speaks it at the next
+  pause, even with nobody talking (with or without a channel). The first
+  `session.context.append` of a call (the `Routing:` line plus the agent terminals) is a
+  probe: an `error` within 5 s would mark it unsupported, and notices would then go as
+  commentary on the running delegation, else wait for the next final message.
+- **Mode switches** (`live_mode` from the phone, `ddctl live`) change where the next
+  delegation goes and tell the model with a silent `Routing:` context line.
+- **Lifecycle.** One call per daemon. The phone's link dropping does not end it; when the
+  phone has had no connection for 60 s the call is closed (`session.close`). `live_stop`, a
+  daemon shutdown and a replaced call close it the same way.
+
+### Concierge and `ddctl`
+
+In concierge mode, Live hands each request to a small omp session, the concierge, which
+knows every terminal through `ddctl` and passes coding work on to the right agent.
+
+- **Session**: tmux session `devdeck-voice`, created on the first Live start when missing (no
+  other session is touched). Its working directory is `~/.local/share/devdeck/concierge/`; the
+  daemon copies `concierge/AGENTS.md` from this repo there whenever it creates the session
+  (when the content differs), so edits to the repo file apply to the next concierge.
+- **Command**: `env PATH=<this repo>:$PATH DEVDECK_CTL=<socket> omp --model <model> --thinking
+  <level> --tools bash,read --no-skills --no-title`, passed to tmux as separate arguments (no
+  shell). tmux takes a new pane's `PATH` from the client and fish's startup rewrites it, so
+  `-e PATH=...` alone would leave `ddctl` off the concierge's PATH. The model is
+  `DEVDECK_CONCIERGE_MODEL` (`provider/id[:level]`, default `anthropic/claude-haiku-4-5:low`).
+  Only `bash` and `read` are enabled: the `ask` tool would open a dialog that stalls a voice
+  conversation, and a small tool set keeps the prompt short (3% of Haiku's context at start)
+  and the replies fast (4 to 10 s per typed test turn). If omp exits, the session ends and the
+  next Live start recreates it.
+- **AGENTS.md** tells the concierge: what it is (a fast voice concierge, not a coder); to use
+  `ddctl` for everything about terminals; to answer in one to three plain spoken sentences
+  with no markdown, ids or paths; to write one short sentence before multi-step work (relayed
+  as progress) and to report what it did; routing (the terminal the user names, else the omp
+  terminal whose directory and title match, else a new omp terminal in the project; clear,
+  complete instructions; reply at once instead of waiting, since the daemon announces when an
+  agent finishes or asks); when to answer agents' questions itself (only answers the user
+  already gave, or mechanical choices) versus asking the user; switching Live mode only when
+  asked; safety (never stop or close terminals unless asked, change models only when asked,
+  session `main` only read, plus send/queue/answer when explicitly asked).
+
+**`ddctl`** (repo root, Python stdlib) prints short plain text for an LLM; `--json` (first or
+last argument) prints the daemon's raw reply. A terminal is a tmux target (`main:1.1`); a bare
+session name or `session:window` means its active pane.
+
+| Command | Does |
+|---|---|
+| `terminals` | every pane: target, omp state (idle/working/asking) or shell, session title, model and thinking, context use, cwd; the pane ddctl runs in (`$TMUX_PANE`, i.e. the concierge itself) is named last and left out of the counts |
+| `status <t>` | pane line, last user message, latest assistant text, current turn's tool calls, open question |
+| `last <t> [--full]` | last final reply (cut at 6000 characters without `--full`) |
+| `send <t> <text>` | sends; steers when the agent is working |
+| `queue <t> <text>` | queues for after the current turn (sent at once when idle) |
+| `stop <t>` | stops the current turn |
+| `new [--omp] [--cwd DIR]` | new terminal (in DIR), optionally starting omp |
+| `model <t> <model[:level]>` | exact `provider/id` or words ("sonnet 5:high"): matched against the daemon's model catalog (`models.json` next to the socket, else `omp models --json`), preferring the terminal's current provider, then the providers of omp's `modelRoles`; ties are listed instead of guessed |
+| `effort <t> <level>` | thinking level |
+| `ask <t>` | the open question with numbered options and the recommended one |
+| `answer <t> <answer>` | a label, an option number or own words for a single question; JSON `{qid: label(s)}` or the daemon's answer list for several |
+| `diff <t>` | git branch, changed files (25 shown) and `--shortstat` against HEAD in the pane's cwd, computed by ddctl itself |
+| `live direct <t>` / `live concierge` | switches Live mode |
+
+**Control socket.** `$DEVDECK_CTL`, else `~/.local/state/devdeck-plus/ctl.sock` (the daemon's
+`serve --ctl`, default `<state dir>/ctl.sock`). The socket is mode 600 (its directory is
+created 700 when missing), and the daemon also checks the peer's uid (`SO_PEERCRED`). One JSON line request
+`{"cmd": ..., ...args}`, one JSON line reply `{"ok": true, ...}` or `{"ok": false, "error":
+"..."}`, then the connection closes. ddctl waits up to 150 s (a model switch may wait for the
+catalog). Requests (the daemon's side):
+- `terminals` → `{terminals:[...]}`: the `sessions` pane list, freshly polled.
+- `status {target}` → `{pane, lastUser, lastAssistant, tools:[intent or "name args"] (at
+  most 8, newest last), ask}`; `last {target}` → `{text, id}` (the final reply, or nulls);
+  `ask {target}` → `{ask}`; `answer {target, answers}` (the phone's `answer` list) → `{}`.
+- `send {target, text}` → `{result:"sent"|"steered"}` (refused while the agent asks);
+  `queue {target, text}`, `stop {target}`, `model {target, selector}` (exact catalog
+  selector, `:level` optional), `effort {target, level}` → `{result?}` (the phone's `cmd`
+  commands `queue`, `stop`, `switch`, `effort`).
+- `new {omp?, cwd?}` → `{target}` (a `phone-N` session; `omp` types `omp` + Enter into it;
+  `cwd` must be an existing absolute directory).
+- `live {mode, target?}` → `{mode, target, active}`: routes the running call, or only sets
+  the default for the next one (`active:false`).
+- An unknown terminal is an error that lists the terminals.
 
 ### App (`android/`, `web/`)
 
 - **Shell**: a plain Java shell (no Gradle). A foreground service owns the connection
   (happy-eyeballs dial of all PC addresses), the offline queue, uploads, the wakelock and
   notifications.
+- **LiveService** is a foreground service of type microphone. It runs the WebRTC peer
+  straight to OpenAI with hardware AEC/NS, `MODE_IN_COMMUNICATION`, and routes to Bluetooth,
+  then wired, then the speaker. Its notification has Mute and End. While a call runs,
+  LinkService keeps the link up with 10 s pings, even when hidden.
 - **UI**: a single-page web app (`web/`, built with bun) shown in a WebView. The assets
   are served from `https://appassets.androidplatform.net/web/index.html`; no remote content
   is loaded and links open externally.
@@ -624,6 +817,11 @@ synthesised on the PC and streamed per sentence (protocol: "Voice messages").
     stops everything.
   - Hardware Back closes, in order: the menu, the question sheet, viewers and panels, the
     drawer. Otherwise the app goes to the background.
+  - Live: `liveStart(opts)` with `{voice, mode:"concierge"|"direct", target?}` starts a call
+    (asks for `RECORD_AUDIO` first), `liveStop()` hangs up (and sends `live_stop`),
+    `liveMute(bool)`. The shell reports `live_local {active, phase, muted, route, mode,
+    target?, error?}` on changes and `live_local {mic, spk}` levels (at most 10 a second),
+    and replays the state to a reloaded page.
 
 ## Wire protocol
 
@@ -642,6 +840,7 @@ Client → PC lines stay plain.
 | Live | `watch {target, view}`, `pause`, `resume`, `resync`, `ping {ts}`, `keys {target, keys[]}`, `tap {target, row}`, `type {target, text}`, `new {}` (→ `created {target:"phone-N:W.P"}`) |
 | Queued (carry `id`, always answered by `ack {id, ok, error?}`, deduplicated) | `send {target, text, enter}`, `clip {text}`, `answer {target, toolCallId, answers:[{qid, selected[], custom?, note?}]}` |
 | Voice (live, never queued) | `voice {target, on, opts}`, `say {req, target?, entryId?, text?, voice?, speed?}`, `say_stop {req?}` (see "Voice messages") |
+| Live (never queued) | `live_offer`, `live_mode`, `live_stop` (see "Live messages") |
 | Requests (carry `req`, answered with the same `req`, or `error {req, error}`) | see below |
 
 Requests:
@@ -742,8 +941,36 @@ Voices: `af_heart`, `af_bella`, `af_nicole`, `af_aoede`, `af_kore`, `af_sarah`,
   null for a `say` of a text without a target.
 - **`voice_error {error, req?, target?, entryId?, auto?, ask?, toolCallId?}`**: a reading
   failed or a voice message was malformed; it ends that reading (no `last` chunk follows).
+- **Live** (see "Live messages" below): `live`, `live_answer`, `live_transcript`,
+  `live_delegation`, `live_notice`.
 - **Other replies**: `created`, `ack`, `pong`, `error {error, req?}`, `full`, `ls`, `read`,
   `git`, `models`, `history`, `cmd`.
+
+**Live messages.** One call per daemon.
+- `live_offer {req, sdp, voice, mode:"concierge"|"direct", target?}` → `live_answer {req,
+  sdp, callId}` or `error {req, error}` (plus `live {phase:"error", error}` without a
+  `callId`). `sdp` is the phone's complete offer (ICE gathered: one Opus send track, receive
+  audio, data channel `oai-events`); `voice` is one of `arbor`, `breeze`, `cove`, `ember`,
+  `juniper`, `maple`, `sol` (default), `spruce`, `vale`; `mode` defaults to the last one used;
+  `target` (direct mode) must be an omp pane. A second offer while a call runs is refused
+  unless it comes from the same `client` (or connection), which replaces its own call (the
+  old one ends without an `ended` message).
+- `live_mode {mode, target?}`: routes the call's next delegations (also the default for the
+  next call); refusals come back as `error {error}`.
+- `live_stop {}`: hangs up (`session.close` on the sideband), answered by `live
+  {phase:"ended"}`.
+- `live {phase, mode, target?, callId?, error?}` (PC → client) on every change: `connecting`
+  (before and right after `live_answer`), `listening`, `speaking` (from the voice model's
+  first output transcript to its `turn.done`), `working` (a delegation is in flight),
+  `ended`, `error`. `target` only in direct mode; `callId` once known. Re-sent to a phone
+  that reconnects with the same `client` id.
+- `live_transcript {role:"user"|"assistant", turn, text, final}`: captions; `turn` is an int
+  counted per role, so role+turn identifies a caption; `text` is the whole caption so far.
+- `live_delegation {id, text, routedTo, mode, state:"sent"|"done"|"failed", error?}`: the
+  same `id` again on each state change. `routedTo` is the pane target (the concierge's or
+  the direct terminal's). A newer delegation marks the previous one `done`.
+- `live_notice {text, target, kind:"finished"|"asking"}`: another terminal's agent finished
+  a turn or asks something; sent to the phone at once (the voice model gets them rate-limited).
 
 **Upload** (separate connection):
 1. The client sends `{"t":"upload","token","id","name","size"}`.

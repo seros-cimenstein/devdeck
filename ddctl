@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""ddctl: look at and drive this PC's terminals through the DevDeck+ daemon.
+
+Made for the Live concierge (an omp session that reads the output), so every command prints
+short plain text; --json prints the daemon's raw reply instead. Terminals are tmux targets
+("session:window.pane"); a bare session name ("main") or "session:window" means its active pane.
+
+  ddctl terminals                   every terminal: state, model, context use, cwd, title
+  ddctl status <t>                  last user message, latest assistant text, current tools, open question
+  ddctl last <t> [--full]           the last final reply (long ones cut unless --full)
+  ddctl send <t> <text>             send a message (steers the current turn when it is working)
+  ddctl queue <t> <text>            queue a message for after the current turn
+  ddctl stop <t>                    stop the current turn
+  ddctl new [--omp] [--cwd DIR]     open a new terminal (in DIR), optionally with omp started in it
+  ddctl model <t> <model[:level]>   switch model: exact provider/id or words ("sonnet 5:high")
+  ddctl effort <t> <level>          thinking level: off minimal low medium high xhigh max auto
+  ddctl ask <t>                     the question the agent is waiting on, with its options
+  ddctl answer <t> <answer>         answer it: an option label, free text, or JSON (see `ask`)
+  ddctl diff <t>                    git branch, changed files and diff size in the terminal's cwd
+  ddctl live direct <t>             Live voice talks straight to that terminal's agent
+  ddctl live concierge              Live voice talks to the concierge again
+
+The daemon socket is $DEVDECK_CTL, else ~/.local/state/devdeck-plus/ctl.sock.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+DEFAULT_SOCKET = STATE_HOME / "devdeck-plus" / "ctl.sock"
+TIMEOUT_S = 150.0         # `model` may wait for the daemon's model catalog (up to 90 s), answers ~10 s
+MAX_REPLY = 32 << 20
+HOME = str(Path.home())
+LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "auto")
+
+USER_CAP = 600
+ASSISTANT_CAP = 1500
+LAST_CAP = 6000
+TOOLS_SHOWN = 8
+GIT_FILES_SHOWN = 25
+
+
+class Fail(Exception):
+    pass
+
+
+def call(cmd: str, **args) -> dict:
+    path = os.environ.get("DEVDECK_CTL") or str(DEFAULT_SOCKET)
+    req = json.dumps({"cmd": cmd, **args}, ensure_ascii=False).encode() + b"\n"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(TIMEOUT_S)
+            s.connect(path)
+            s.sendall(req)
+            with s.makefile("rb") as rf:
+                line = rf.readline(MAX_REPLY)
+    except FileNotFoundError:
+        raise Fail(f"the DevDeck+ daemon is not running (no socket at {path})")
+    except ConnectionRefusedError:
+        raise Fail(f"the DevDeck+ daemon is not running (nothing listens on {path})")
+    except socket.timeout:
+        raise Fail(f"the daemon did not answer {cmd} within {TIMEOUT_S:.0f} s")
+    except OSError as ex:
+        raise Fail(f"cannot reach the daemon at {path}: {ex.strerror or ex}")
+    try:
+        reply = json.loads(line)
+    except ValueError:
+        raise Fail("the daemon closed the connection without a reply" if not line else "bad reply from the daemon")
+    if not isinstance(reply, dict):
+        raise Fail("bad reply from the daemon")
+    if not reply.get("ok"):
+        raise Fail(str(reply.get("error") or f"{cmd} failed"))
+    return reply
+
+
+# ---------------------------------------------------------------- formatting
+
+def tilde(path) -> str:
+    if not isinstance(path, str) or not path:
+        return "?"
+    if path == HOME or path.startswith(HOME + "/"):
+        return "~" + path[len(HOME):]
+    return path
+
+
+def clip(text, limit: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + f" ... [cut, {len(text)} chars; `ddctl last` or the phone shows all]"
+
+
+def one_line(text, limit: int = 160) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
+
+
+def pane_cwd(p: dict) -> str | None:
+    omp = p.get("omp") or {}
+    return omp.get("cwd") or p.get("cwd")
+
+
+def model_text(omp: dict) -> str:
+    name = omp.get("modelName") or omp.get("model")
+    if not name:
+        return ""
+    think = omp.get("thinking")
+    out = f"{name} {think}" if think and think != "off" else str(name)
+    if omp.get("fast"):
+        out += " fast"
+    if omp.get("mode") == "plan":
+        out += " (plan mode)"
+    return out
+
+
+def ctx_text(omp: dict) -> str:
+    ctx = omp.get("ctx") or {}
+    used, window = ctx.get("used"), ctx.get("window")
+    if isinstance(used, (int, float)) and isinstance(window, (int, float)) and window > 0:
+        return f"context {round(100 * used / window)}% used"
+    return ""
+
+
+def own_target() -> str | None:
+    """The tmux pane ddctl runs in (the concierge's own), so it is not mistaken for a work terminal."""
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return None
+    try:
+        r = subprocess.run(["tmux", "display-message", "-p", "-t", pane,
+                            "#{session_name}:#{window_index}.#{pane_index}"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def pane_line(p: dict) -> str:
+    target = p.get("target", "?")
+    if not p.get("agent"):
+        what = f"shell ({p.get('cmd')})" if p.get("state") == "shell" else f"running {p.get('cmd')}"
+        return f"{target}: {what}, cwd {tilde(p.get('cwd'))}"
+    omp = p.get("omp") or {}
+    # omp's session title, e.g. "📋 PROC: List running apps": what the session is about
+    title = re.sub(r"^[^\w\"'(]+", "", (p.get("context") or "").strip())
+    head = f"{target}: omp {p.get('state') or 'idle'}" + (f' - "{title}"' if title else "")
+    parts = [x for x in (model_text(omp), ctx_text(omp), f"cwd {tilde(pane_cwd(p))}") if x]
+    todo = omp.get("todo") or {}
+    if todo.get("total"):
+        parts.append(f"todo {todo.get('done', 0)}/{todo['total']} done")
+    return head + " - " + ", ".join(parts)
+
+
+def ask_text(target: str, ask: dict | None) -> str:
+    if not ask or not ask.get("questions"):
+        return f"{target} is not asking anything."
+    qs = ask["questions"]
+    out = [f"{target} is asking {len(qs)} question{'s' if len(qs) > 1 else ''}:"]
+    for q in qs:
+        head = f"[{q.get('id')}] " + (f"{q['header']}: " if q.get("header") else "") + q.get("question", "")
+        out.append(head + (" (pick one or more)" if q.get("multi") else ""))
+        for i, o in enumerate(q.get("options") or []):
+            mark = " (recommended)" if q.get("recommended") == i else ""
+            desc = f" - {one_line(o['description'], 200)}" if o.get("description") else ""
+            out.append(f"  {i + 1}. {o.get('label')}{mark}{desc}")
+    if len(qs) == 1 and not qs[0].get("multi"):
+        out.append(f'Answer with: ddctl answer {target} "<option label or your own words>"')
+    else:
+        out.append(f"Answer with: ddctl answer {target} "
+                   "'[{\"qid\":\"<id>\",\"selected\":[\"<label>\",...],\"custom\":\"<own words, optional>\"},...]'")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------- commands
+
+def c_terminals(args: list[str], raw: bool) -> str:
+    need(args, 0, "terminals")
+    r = call("terminals")
+    if raw:
+        return dump(r)
+    panes = r.get("terminals") or []
+    me = own_target()
+    others = [p for p in panes if p.get("target") != me]
+    if not others:
+        return "No other terminals are open." if panes else "No terminals are open."
+    agents = sum(1 for p in others if p.get("agent"))
+    busy = [p["target"] for p in others if p.get("state") in ("working", "asking")]
+    head = (f"{len(others)} terminals, {agents} running omp; "
+            + (f"busy: {', '.join(busy)}" if busy else "none busy") + ".")
+    lines = [head] + [pane_line(p) for p in others]
+    if len(others) < len(panes):
+        lines.append(f"Not counted above: {me}, the terminal you are running in (yourself).")
+    return "\n".join(lines)
+
+
+def c_status(args: list[str], raw: bool) -> str:
+    (target,) = need(args, 1, "status <terminal>")
+    r = call("status", target=target)
+    if raw:
+        return dump(r)
+    p = r.get("pane") or {"target": target}
+    out = [pane_line(p)]
+    if not p.get("agent"):
+        return out[0]
+    out.append("Last user message: " + (clip(r.get("lastUser"), USER_CAP) or "(none)"))
+    out.append("Latest assistant text: " + (clip(r.get("lastAssistant"), ASSISTANT_CAP) or "(none)"))
+    tools = [t for t in r.get("tools") or [] if t]
+    if tools and p.get("state") != "idle":
+        out.append("Current turn's tool calls, newest last:")
+        out += [f"  - {one_line(t)}" for t in tools[-TOOLS_SHOWN:]]
+    ask = r.get("ask")
+    if ask:
+        out.append(ask_text(p.get("target", target), ask))
+    return "\n".join(out)
+
+
+def c_last(args: list[str], raw: bool) -> str:
+    full = "--full" in args
+    (target,) = need([a for a in args if a != "--full"], 1, "last <terminal> [--full]")
+    r = call("last", target=target)
+    if raw:
+        return dump(r)
+    text = (r.get("text") or "").strip()
+    if not text:
+        return f"{target} has no final reply yet."
+    return text if full else clip(text, LAST_CAP)
+
+
+def c_send(args: list[str], raw: bool) -> str:
+    target, text = target_text(args, "send <terminal> <text>")
+    r = call("send", target=target, text=text)
+    if raw:
+        return dump(r)
+    if r.get("result") == "steered":
+        return f"Sent to {target}; it was working, so the message steers its current turn."
+    return f"Sent to {target}."
+
+
+def c_queue(args: list[str], raw: bool) -> str:
+    target, text = target_text(args, "queue <terminal> <text>")
+    r = call("queue", target=target, text=text)
+    if raw:
+        return dump(r)
+    if r.get("result") == "sent":
+        return f"{target} was idle, so the message was sent right away."
+    return f"Queued for {target}; it runs after the current turn."
+
+
+def c_stop(args: list[str], raw: bool) -> str:
+    (target,) = need(args, 1, "stop <terminal>")
+    r = call("stop", target=target)
+    return dump(r) if raw else f"Stopped {target}. {result_of(r)}".strip()
+
+
+def c_new(args: list[str], raw: bool) -> str:
+    omp = "--omp" in args
+    rest = [a for a in args if a != "--omp"]
+    req: dict = {"omp": omp}
+    if rest[:1] == ["--cwd"] and len(rest) == 2:
+        cwd = os.path.abspath(os.path.expanduser(rest[1]))
+        if not os.path.isdir(cwd):
+            raise Fail(f"{tilde(cwd)} is not a directory")
+        req["cwd"], rest = cwd, []
+    need(rest, 0, "new [--omp] [--cwd DIR]")
+    r = call("new", **req)
+    if raw:
+        return dump(r)
+    target = r.get("target", "?")
+    where = f" in {tilde(req['cwd'])}" if "cwd" in req else ""
+    if omp:
+        return f"Opened {target}{where} with omp starting in it. Give it a few seconds, then `ddctl send {target} ...`."
+    return f"Opened {target}{where} (a shell)."
+
+
+def words(text: str) -> list[str]:
+    return [w for w in re.split(r"[^a-z0-9]+", text.casefold()) if w]
+
+
+def catalog() -> list[dict]:
+    """The model catalog: the daemon's cache of `omp models --json` (next to its socket), else
+    `omp models --json` itself (omp's own catalog cache; no model calls)."""
+    for sock in (os.environ.get("DEVDECK_CTL"), str(DEFAULT_SOCKET)):
+        try:
+            models = json.loads((Path(sock).parent / "models.json").read_text())["models"] if sock else None
+        except (OSError, ValueError, KeyError, TypeError):
+            models = None
+        if isinstance(models, list):
+            return [m for m in models if isinstance(m, dict) and isinstance(m.get("selector"), str)]
+    try:
+        r = subprocess.run(["omp", "models", "--json"], capture_output=True, text=True, timeout=90,
+                           stdin=subprocess.DEVNULL, cwd=HOME)
+        line = next(ln for ln in r.stdout.splitlines() if ln.startswith("{"))
+        return [{**m, "selector": f"{m['provider']}/{m['id']}"} for m in json.loads(line)["models"]
+                if isinstance(m, dict) and isinstance(m.get("provider"), str) and isinstance(m.get("id"), str)
+                and m.get("kind", "chat") in ("chat", "llm")]
+    except (OSError, subprocess.TimeoutExpired, StopIteration, ValueError, KeyError, TypeError):
+        raise Fail("cannot read the model list; give the exact provider/model id") from None
+
+
+def role_providers() -> list[str]:
+    """Providers of omp's configured model roles, in config order: the user's usual providers."""
+    try:
+        text = (Path.home() / ".omp" / "agent" / "config.yml").read_text()
+    except OSError:
+        return []
+    return list(dict.fromkeys(re.findall(r"^\s+\w+:\s*['\"]?([\w.-]+)/", text, re.M)))
+
+
+def resolve_model(query: str, current: str | None) -> str:
+    """An exact catalog selector for what was said ("sonnet 5", "gpt-5.6-sol", "anthropic/claude-opus-5").
+    Prefers the terminal's current provider, then the user's configured ones; the closest id wins
+    and a tie is an error listing the candidates."""
+    try:
+        models = catalog()
+    except Fail:
+        if "/" in query:  # looks exact: let the daemon judge it
+            return query
+        raise
+    if any(m["selector"] == query for m in models):
+        return query
+    want = words(query)
+    hits = []
+    for m in models:
+        have = words(m["selector"]) + words(str(m.get("name") or ""))
+        if want and all(w in have for w in want):
+            hits.append(m)
+    if not hits:
+        raise Fail(f"no model matches {query!r}")
+    prefer = ([current.split("/", 1)[0]] if current and "/" in current else []) + role_providers()
+
+    def rank(m: dict) -> tuple:
+        p = prefer.index(m["provider"]) if m.get("provider") in prefer else len(prefer)
+        return p, len(words(str(m.get("id") or m["selector"]))) - len(want)
+    hits.sort(key=lambda m: (rank(m), len(m["selector"])))
+    best = [m for m in hits if rank(m) == rank(hits[0])]
+    if len(best) > 1:
+        names = ", ".join(m["selector"] for m in best[:8])
+        raise Fail(f"{query!r} matches several models: {names}; say which one")
+    return best[0]["selector"]
+
+
+def c_model(args: list[str], raw: bool) -> str:
+    target, spec = target_text(args, "model <terminal> <model[:level]>")
+    query, _, level = spec.rpartition(":") if spec.rpartition(":")[2] in LEVELS else (spec, "", "")
+    p = call("status", target=target).get("pane") or {}
+    if not p.get("agent"):
+        raise Fail(f"{target} is not running omp")
+    selector = resolve_model(query, (p.get("omp") or {}).get("model"))
+    r = call("model", target=target, selector=selector + (f":{level}" if level else ""))
+    if raw:
+        return dump(r)
+    return f"{target} now uses {selector}" + (f" with {level} thinking." if level else ".")
+
+
+def c_effort(args: list[str], raw: bool) -> str:
+    target, level = need(args, 2, "effort <terminal> <level>")
+    if level not in LEVELS:
+        raise Fail(f"level must be one of: {' '.join(LEVELS)}")
+    r = call("effort", target=target, level=level)
+    return dump(r) if raw else result_of(r) or f"{target} thinking level is now {level}."
+
+
+def c_ask(args: list[str], raw: bool) -> str:
+    (target,) = need(args, 1, "ask <terminal>")
+    r = call("ask", target=target)
+    return dump(r) if raw else ask_text(target, r.get("ask"))
+
+
+def parse_answers(text: str, questions: list[dict]) -> list[dict]:
+    """The daemon's answer list from what the concierge typed: a JSON list as is, a JSON object
+    {qid: label(s) or own words}, or plain text for a single question (an option label, matched
+    without case, else taken as the custom answer)."""
+    try:
+        val = json.loads(text)
+    except ValueError:
+        val = text
+    if isinstance(val, list):
+        return val
+    if isinstance(val, dict):
+        return [one_answer(q, val[q["id"]]) for q in questions if q["id"] in val]
+    if len(questions) != 1:
+        raise Fail(f"there are {len(questions)} questions; answer with JSON (see `ddctl ask`)")
+    return [one_answer(questions[0], str(val))]
+
+
+def one_answer(q: dict, value) -> dict:
+    labels = {o["label"].casefold(): o["label"] for o in q.get("options") or []}
+    picks = value if isinstance(value, list) else [value]
+    selected, custom = [], []
+    for v in picks:
+        v = str(v).strip()
+        if v.isdigit() and 1 <= int(v) <= len(q.get("options") or []):
+            selected.append(q["options"][int(v) - 1]["label"])
+        elif v.casefold() in labels:
+            selected.append(labels[v.casefold()])
+        elif v:
+            custom.append(v)
+    custom_text = "; ".join(custom)
+    if not q.get("multi"):
+        selected = [] if custom_text else selected[:1]
+    ans: dict = {"qid": q["id"], "selected": selected}
+    if custom_text:
+        ans["custom"] = custom_text
+    return ans
+
+
+def c_answer(args: list[str], raw: bool) -> str:
+    target, text = target_text(args, "answer <terminal> <answer>")
+    ask = call("ask", target=target).get("ask")
+    if not ask or not ask.get("questions"):
+        raise Fail(f"{target} is not asking anything")
+    answers = parse_answers(text, ask["questions"])
+    r = call("answer", target=target, toolCallId=ask.get("toolCallId"), answers=answers)
+    if raw:
+        return dump(r)
+    picked = "; ".join(", ".join(a.get("selected") or []) + (f" {a['custom']}" if a.get("custom") else "")
+                       for a in answers)
+    return f"Answered {target}: {picked.strip()}."
+
+
+def git(cwd: str, *args: str) -> tuple[int, str]:
+    try:
+        r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=20,
+                           env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        raise Fail(f"git failed: {ex}")
+    return r.returncode, (r.stdout if r.returncode == 0 else r.stderr).strip()
+
+
+def c_diff(args: list[str], raw: bool) -> str:
+    (target,) = need(args, 1, "diff <terminal>")
+    p = call("status", target=target).get("pane") or {}
+    cwd = pane_cwd(p)
+    if not cwd:
+        raise Fail(f"the working directory of {target} is unknown")
+    code, top = git(cwd, "rev-parse", "--show-toplevel")
+    if code != 0:
+        return f"{target} is in {tilde(cwd)}, which is not a git repository."
+    _, status = git(cwd, "status", "--short", "--branch", "--untracked-files=normal")
+    _, stat = git(cwd, "diff", "HEAD", "--shortstat")
+    lines = status.splitlines()
+    branch = lines[0][3:] if lines and lines[0].startswith("## ") else "?"
+    files = lines[1:] if lines and lines[0].startswith("## ") else lines
+    if raw:
+        return dump({"target": target, "repo": top, "branch": branch, "files": files, "shortstat": stat})
+    out = [f"{target}: repo {tilde(top)}, branch {branch}"]
+    if not files:
+        out.append("Working tree clean.")
+        return "\n".join(out)
+    untracked = sum(1 for f in files if f.startswith("??"))
+    out.append(f"{len(files)} changed files ({untracked} untracked); vs HEAD: {stat or 'no tracked changes'}")
+    out += [f"  {f}" for f in files[:GIT_FILES_SHOWN]]
+    if len(files) > GIT_FILES_SHOWN:
+        out.append(f"  ... and {len(files) - GIT_FILES_SHOWN} more")
+    return "\n".join(out)
+
+
+def c_live(args: list[str], raw: bool) -> str:
+    if args[:1] == ["concierge"] and len(args) == 1:
+        r = call("live", mode="concierge")
+    elif args[:1] == ["direct"] and len(args) == 2:
+        r = call("live", mode="direct", target=args[1])
+    else:
+        raise Fail("usage: ddctl live direct <terminal> | ddctl live concierge")
+    if raw:
+        return dump(r)
+    who = f"the agent in {r.get('target') or args[-1]}" if r.get("mode") == "direct" else "the concierge"
+    if not r.get("active"):
+        return f"No Live call is running; the next one starts talking to {who}."
+    if r.get("mode") == "direct":
+        return f"Live voice now talks straight to {who}. `ddctl live concierge` switches back."
+    return "Live voice talks to the concierge again."
+
+
+COMMANDS = {
+    "terminals": c_terminals, "status": c_status, "last": c_last, "send": c_send, "queue": c_queue,
+    "stop": c_stop, "new": c_new, "model": c_model, "effort": c_effort, "ask": c_ask,
+    "answer": c_answer, "diff": c_diff, "live": c_live,
+}
+
+
+def need(args: list[str], n: int, usage: str) -> list[str]:
+    if len(args) != n:
+        raise Fail(f"usage: ddctl {usage}")
+    return args
+
+
+def target_text(args: list[str], usage: str) -> tuple[str, str]:
+    if len(args) < 2 or not " ".join(args[1:]).strip():
+        raise Fail(f"usage: ddctl {usage}")
+    return args[0], " ".join(args[1:])
+
+
+def result_of(r: dict) -> str:
+    res = r.get("result")
+    return str(res).strip() if isinstance(res, str) else ""
+
+
+def dump(r: dict) -> str:
+    return json.dumps({k: v for k, v in r.items() if k != "ok"}, ensure_ascii=False, indent=1)
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    raw = False
+    while argv and argv[0] == "--json":  # only around the command, so message text keeps a literal --json
+        raw, argv = True, argv[1:]
+    if len(argv) > 1 and argv[-1] == "--json":
+        raw, argv = True, argv[:-1]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    fn = COMMANDS.get(argv[0])
+    if fn is None:
+        print(f"ddctl: unknown command {argv[0]!r}; commands: {' '.join(COMMANDS)}", file=sys.stderr)
+        return 2
+    try:
+        print(fn(argv[1:], raw))
+    except Fail as ex:
+        print(f"ddctl {argv[0]}: {ex}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

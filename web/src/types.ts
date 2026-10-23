@@ -292,6 +292,56 @@ export interface VoiceErrorMsg {
   error: string;
 }
 
+// ---- Live (GPT Live realtime voice; audio is native, the daemon streams state and transcripts)
+export type LivePhase = "connecting" | "listening" | "working" | "speaking" | "ended" | "error";
+export type LiveMode = "concierge" | "direct";
+/** Server call state; `target` is the pane talked to directly in direct mode. */
+export interface LiveMsg {
+  t: "live";
+  phase: LivePhase;
+  mode?: LiveMode;
+  target?: string;
+  error?: string;
+  callId?: string;
+}
+/** Native call state (replayed on page load while a call runs), or levels when `mic` is present. */
+export interface LiveLocalMsg {
+  t: "live_local";
+  active?: boolean;
+  phase?: "connecting" | "connected" | "ended" | "error";
+  muted?: boolean;
+  route?: "speaker" | "earpiece" | "bluetooth" | "wired";
+  error?: string;
+  callId?: string;
+  mic?: number;
+  spk?: number;
+}
+/** Live caption; `role`+`turn` identify a bubble, `text` is its whole current text, `final` closes it. */
+export interface LiveTranscriptMsg {
+  t: "live_transcript";
+  role: "user" | "assistant";
+  turn: number;
+  text: string;
+  final: boolean;
+}
+/** A delegation from the voice model; re-sent with the same id when its state changes. */
+export interface LiveDelegationMsg {
+  t: "live_delegation";
+  id: string;
+  text: string;
+  routedTo: string;
+  mode?: LiveMode;
+  state?: "sent" | "done" | "failed";
+  error?: string;
+}
+/** Another terminal finished or started asking while live. */
+export interface LiveNoticeMsg {
+  t: "live_notice";
+  text: string;
+  target: string;
+  kind: "finished" | "asking";
+}
+
 /** Any message crossing the bridge; `t` discriminates, the rest is checked by the consumer. */
 export interface Msg {
   t: string;

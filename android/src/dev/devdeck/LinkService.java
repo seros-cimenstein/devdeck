@@ -154,6 +154,8 @@ public class LinkService extends Service {
     private volatile boolean visible;
     private volatile long hiddenAt = Long.MIN_VALUE / 2;
     private final Runnable lingerCheck = this::idleIfUnwanted;
+    // A GPT Live call is up (LiveService): keep the link and its fast pings even when hidden.
+    private volatile boolean inCall;
 
     // Screen the server last sent on the watched pane: offered as `have` on reconnect.
     private volatile String haveTarget;
@@ -381,7 +383,7 @@ public class LinkService extends Service {
             if (vis) {
                 startPings(c);
                 if (away > PROBE_AFTER_MS) probe(c, now);
-            } else {
+            } else if (!inCall) {
                 writer.removeCallbacksAndMessages(pingToken);
             }
         } else if (vis) {
@@ -450,10 +452,12 @@ public class LinkService extends Service {
     /** New UI page instance: it holds no screen, so stop offering one in hello. */
     List<String> replay() {
         haveTarget = null;
-        List<String> out = new ArrayList<>(2);
+        List<String> out = new ArrayList<>(3);
         out.add(linkJson());
         String s = lastSessions;
         if (s != null) out.add(s);
+        String call = LiveService.activeState();
+        if (call != null) out.add(call);
         return out;
     }
 
@@ -528,11 +532,42 @@ public class LinkService extends Service {
         }
     }
 
+    boolean online() {
+        return conn != null;
+    }
+
+    boolean isVisible() {
+        return visible;
+    }
+
+    /** Local message for the UI (any thread), delivered in order with the server's. */
+    void local(String json) {
+        toUi(json);
+    }
+
+    /** Main thread. LiveService call started/ended: the link stays up and pinged while it runs. */
+    void setInCall(boolean on) {
+        if (on == inCall) return;
+        inCall = on;
+        writer.removeCallbacks(lingerCheck);
+        if (!visible) writer.postDelayed(lingerCheck, Math.max(0, BG_LINGER_MS + 100
+                - (SystemClock.elapsedRealtime() - hiddenAt)));
+        Conn c = conn;
+        if (c != null) {
+            if (on) startPings(c);
+            else if (!visible) writer.removeCallbacksAndMessages(pingToken);
+        } else if (on) {
+            signal();
+        }
+        scheduleAlarm();
+        applyWakelock();
+    }
+
     // ---- battery policy ----
 
     /** Whether a connection is worth its battery cost right now. */
     private boolean wantLink() {
-        return visible || notifyOn() || queued() > 0 || uploadName != null
+        return visible || inCall || notifyOn() || queued() > 0 || uploadName != null
                 || SystemClock.elapsedRealtime() - hiddenAt < BG_LINGER_MS;
     }
 
@@ -548,7 +583,7 @@ public class LinkService extends Service {
     /** Link wakelock + Wi-Fi lock: while visible, uploading or the queue is non-empty. */
     private synchronized void applyWakelock() {
         if (wakelock() && running && state != ST_UNPAIRED
-                && (visible || queued() > 0 || uploadName != null)) {
+                && (visible || inCall || queued() > 0 || uploadName != null)) {
             if (!linkWake.isHeld()) linkWake.acquire();
             if (!wifiLock.isHeld()) wifiLock.acquire();
         } else {
@@ -590,7 +625,7 @@ public class LinkService extends Service {
     }
 
     private void pingLoop(Conn c) {
-        if (conn != c || !visible) return;
+        if (conn != c || !(visible || inCall)) return;
         ping(c);
         writer.postAtTime(() -> pingLoop(c), pingToken, SystemClock.uptimeMillis() + PING_MS);
     }
@@ -704,7 +739,7 @@ public class LinkService extends Service {
                 if (!visible && alarmWake.isHeld()) alarmWake.release();
                 if (await(backoff)) backoff = BACKOFF_MIN;
                 // Hidden: retry rarely; a network change or the next alarm still retries at once.
-                else backoff = Math.min(backoff * 2, visible ? BACKOFF_MAX : BACKOFF_BG_MAX);
+                else backoff = Math.min(backoff * 2, visible || inCall ? BACKOFF_MAX : BACKOFF_BG_MAX);
                 continue;
             }
             backoff = BACKOFF_MIN;
@@ -720,7 +755,7 @@ public class LinkService extends Service {
                     for (String v : voices.values()) writeLine(c, v);
                 }
                 setState(ST_ONLINE, c.host);
-                if (visible) startPings(c);
+                if (visible || inCall) startPings(c);
                 else ping(c);
                 signalUploads();
                 readLoop(c, inflater);
@@ -824,7 +859,7 @@ public class LinkService extends Service {
             } catch (SocketTimeoutException e) {
                 long now = SystemClock.elapsedRealtime();
                 long since = Math.max(lastRx, visible ? resumedAt : 0);
-                if (now - since > (visible ? DEAD_MS : DEAD_BG_MS)) throw new IOException("link dead");
+                if (now - since > (visible || inCall ? DEAD_MS : DEAD_BG_MS)) throw new IOException("link dead");
                 continue;
             }
             if (n < 0) throw new EOFException("server closed");
@@ -878,6 +913,11 @@ public class LinkService extends Service {
                     break;
                 case "voice_error":
                     speaker.voiceError(line);
+                    break;
+                case "live_answer":
+                case "live":
+                case "error":
+                    LiveService.onLink(t, line);
                     break;
                 default:
                     break;

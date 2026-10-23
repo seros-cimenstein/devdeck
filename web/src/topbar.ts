@@ -1,4 +1,4 @@
-// Top bar: drawer button with attention dot, current terminal, view toggle, link indicator, overflow.
+// Top bar: drawer button with attention dot, current terminal, view toggle, Live entry / pill, link indicator, overflow.
 import { badgeEl, badgeKind, currentPane, paneTitle, setBadge, state } from "./state";
 import type { LinkMsg } from "./types";
 import { fmtRtt, h, icon } from "./util";
@@ -10,6 +10,8 @@ export interface TopBarHandlers {
   linkInfo(): void;
   /** Long-press on the terminal name (agent panes). */
   sessionMenu(anchor: HTMLElement): void;
+  /** Live entry: starts a call, or returns to the running one. */
+  live(): void;
 }
 
 export class TopBar {
@@ -25,6 +27,8 @@ export class TopBar {
   private readonly upload: HTMLElement;
   private readonly uploadFill: HTMLElement;
   private readonly uploadText: HTMLElement;
+  private readonly liveBtn: HTMLButtonElement;
+  private readonly liveText: HTMLElement;
 
   constructor(hd: TopBarHandlers) {
     this.dot = h("span.att-dot");
@@ -59,7 +63,9 @@ export class TopBar {
     this.uploadFill = h("div.up-fill");
     this.uploadText = h("span.up-text");
     this.upload = h("div.upload", { hidden: true }, this.uploadFill, this.uploadText);
-    this.el = h("header.topbar", null, h("div.tb-row", null, menu, titles, this.viewBtn, link, more), this.upload);
+    this.liveText = h("span.tb-live-t");
+    this.liveBtn = h("button.tb-live", { "aria-label": "Start Live voice chat", onclick: hd.live }, h("span.tb-orb"), this.liveText) as HTMLButtonElement;
+    this.el = h("header.topbar", null, h("div.tb-row", null, menu, titles, this.viewBtn, this.liveBtn, link, more), this.upload);
   }
 
   update() {
@@ -79,6 +85,14 @@ export class TopBar {
 
   setAttention(on: boolean) {
     this.dot.classList.toggle("on", on);
+  }
+
+  /** Idle: an orb button that starts Live; during a call: a "Live" pill (with elapsed time) that returns to it. */
+  setLive(s: { active: boolean; elapsed: string; muted: boolean }) {
+    this.liveBtn.classList.toggle("on", s.active);
+    this.liveBtn.classList.toggle("muted", s.active && s.muted);
+    this.liveText.textContent = s.active ? (s.elapsed ? `Live ${s.elapsed}` : "Live") : "";
+    this.liveBtn.setAttribute("aria-label", s.active ? "Return to the Live call" : "Start Live voice chat");
   }
 
   setLink(l: LinkMsg) {

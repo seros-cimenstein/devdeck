@@ -3,6 +3,7 @@
 import { bridge } from "./bridge";
 import { actions, PAGE_CMDS } from "./controls";
 import { QuickKeys } from "./keys";
+import { liveStatus } from "./live";
 import { isOnline, isPending, onPending } from "./omp";
 import { onOutboxChange, outboxFor, retrySend } from "./outbox";
 import { state } from "./state";
@@ -66,7 +67,13 @@ export class Compose {
     this.keys.el.classList.add("c-qkeys");
     this.slash = h("div.slash", { role: "listbox", hidden: true });
     this.status = h("div.c-status", { hidden: true });
-    this.voiceBtn = h("button.ib.c-attach.c-voice", { "aria-label": "Voice mode", title: "Voice mode", html: icon("headset"), onclick: () => setEnabled(!voiceEnabled()) }) as HTMLButtonElement;
+    this.voiceBtn = h("button.ib.c-attach.c-voice", {
+      "aria-label": "Voice mode",
+      title: "Voice mode",
+      html: icon("headset"),
+      // Both use the microphone; Live owns it while a call runs.
+      onclick: () => (!voiceEnabled() && liveStatus().active ? toast("End the Live call to use voice mode") : setEnabled(!voiceEnabled())),
+    }) as HTMLButtonElement;
     this.el = h("div.compose", null, this.slash, this.status, this.keys.el, h("div.c-row", null, attach, this.keysBtn, this.ta, this.voiceBtn, this.sendBtn));
 
     const saveDraft = debounce(() => {

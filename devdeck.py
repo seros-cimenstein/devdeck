@@ -19,24 +19,32 @@ import base64
 import bisect
 import collections
 import datetime
+import hashlib
 import hmac
+import http.client
 import json
 import mimetypes
 import mmap
 import os
+import pwd
 import re
 import secrets
 import select
+import shlex
 import shutil
 import signal
 import socket
 import sqlite3
+import ssl
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
+import uuid
 import wave
 import zlib
 from pathlib import Path
@@ -50,6 +58,7 @@ TOKEN_FILE = CONFIG_DIR / "token"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "devdeck"
 SEEN_FILE = STATE_DIR / "seen.json"
 PARTIAL_DIR = STATE_DIR / "partial"
+CTL_SOCK = STATE_DIR / "ctl.sock"  # local control socket for ddctl (serve --ctl overrides)
 DEFAULT_DEST = Path.home() / "Downloads" / "phone"
 UNIT_NAME = "devdeck.service"
 DEFAULT_PORT = 47490
@@ -159,7 +168,7 @@ def apply_instance(name: str) -> None:
     """Point every per-install path and name at a side-by-side instance `name` (e.g. "plus":
     app dev.devdeckplus, ~/.config/devdeck-plus, devdeck-plus.service, port 47491)."""
     global INSTANCE, LABEL, APK, APP_PACKAGE, APP_ACTIVITY, CONFIG_DIR, TOKEN_FILE, STATE_DIR, SEEN_FILE
-    global PARTIAL_DIR, MODELS_FILE, UNIT_NAME, DEFAULT_PORT
+    global PARTIAL_DIR, MODELS_FILE, UNIT_NAME, DEFAULT_PORT, CTL_SOCK
     if not INSTANCE_RE.match(name):
         sys.exit(f"bad instance name {name!r}: lowercase letters and digits, starting with a letter")
     INSTANCE = name
@@ -173,6 +182,7 @@ def apply_instance(name: str) -> None:
     SEEN_FILE = STATE_DIR / "seen.json"
     PARTIAL_DIR = STATE_DIR / "partial"
     MODELS_FILE = STATE_DIR / "models.json"
+    CTL_SOCK = STATE_DIR / "ctl.sock"
     UNIT_NAME = f"devdeck-{name}.service"
     DEFAULT_PORT = 47491
 
@@ -465,6 +475,18 @@ def deliver_text(ident: str, target: str, text: str, enter: bool) -> str | None:
         if r.returncode != 0:
             return tmux_error(r)
     return None
+
+
+def send_rewrite(text: str) -> str:
+    """Text for an omp prompt: omp sends commands with arguments they do not take to the model
+    as a prompt, so `/model x`, `/models x` and `/thinking x` become `/switch x` and `/effort x`."""
+    line = text.strip()
+    if "\n" not in line:
+        for rx, repl in SEND_REWRITES:
+            m = rx.match(line)
+            if m:
+                return repl + m.group(1)
+    return text
 
 
 def set_clipboard(text: str) -> str | None:
@@ -1105,6 +1127,64 @@ class Transcript:
                 questions = normalize_questions(args.get("questions") if isinstance(args, dict) else None)
                 self.ask_cache[call] = {"toolCallId": call, "questions": questions} if questions else None
             return self.ask_cache[call]
+
+    def branch_end(self) -> str | None:
+        """Id of the current branch's last entry (where a live delegation starts reading)."""
+        with self.lock:
+            return self.path_ids[-1] if self.path_ids else None
+
+    def assistant_since(self, after: str | None) -> tuple[str | None, list[dict]]:
+        """(branch end, assistant messages on the current branch after entry `after`) as
+        [{id, stopReason, text, tools (count), error}]. From the start when `after` is None (a new
+        session file), nothing when `after` left the branch (rewind, branch switch)."""
+        with self.lock:
+            if after is None:
+                start = self.vis_start
+            else:
+                start = self.path_index.get(after, len(self.path_ids) - 1) + 1
+            ids = [i for i in self.path_ids[start:] if self.nodes[i].kind == K_ASSISTANT]
+            out = []
+            if ids:
+                with self._open() as f:
+                    for ident in ids:
+                        m = self._load(f, ident).get("message") or {}
+                        blocks = [b for b in m.get("content") or [] if isinstance(b, dict)]
+                        out.append({"id": ident, "stopReason": str(m.get("stopReason") or ""),
+                                    "text": "\n\n".join(b["text"] for b in blocks if b.get("type") == "text"
+                                                        and isinstance(b.get("text"), str)).strip(),
+                                    "tools": sum(1 for b in blocks if b.get("type") == "toolCall"),
+                                    "error": str(m.get("errorMessage") or "")})
+            return (self.path_ids[-1] if self.path_ids else after), out
+
+    def status_info(self) -> dict:
+        """{lastUser, lastAssistant, tools} of the current (or last) turn: the newest user message,
+        the newest assistant text and the tool calls since that user message (intent, else name
+        and short arguments; newest last, at most 8)."""
+        last_user = last_text = None
+        tools: list[str] = []
+        with self.lock:
+            with self._open() as f:
+                seen = 0
+                for idx in range(len(self.path_ids) - 1, self.vis_start - 1, -1):
+                    node = self.nodes[self.path_ids[idx]]
+                    if node.kind == K_USER:
+                        last_user = content_text((self._load(f, node.id).get("message") or {}).get("content"))
+                        break
+                    if node.kind != K_ASSISTANT or seen >= 200:
+                        continue
+                    seen += 1
+                    for b in reversed((self._load(f, node.id).get("message") or {}).get("content") or []):
+                        if not isinstance(b, dict):
+                            continue
+                        if b.get("type") == "text" and isinstance(b.get("text"), str) and b["text"].strip():
+                            last_text = last_text or b["text"].strip()
+                        elif b.get("type") == "toolCall" and len(tools) < 8:
+                            args = b.get("arguments")
+                            intent = b.get("intent") or (args.get("i") if isinstance(args, dict) else None)
+                            tools.append(intent if isinstance(intent, str) and intent
+                                         else f"{b.get('name') or '?'} {cap(tool_args_text(args), 120)[0]}")
+        tools.reverse()
+        return {"lastUser": last_user, "lastAssistant": last_text, "tools": tools}
 
     def omp_state(self) -> dict:
         """omp settings along the current branch: {model, thinking, fast, mode, used, todo, cwd}
@@ -2367,6 +2447,957 @@ class Speech:
                 self.cache_bytes -= len(data)
 
 
+# ---------------------------------------------------------------- live: GPT Live voice calls
+
+# Replicates omp 18.12.6's /live (packages/coding-agent/src/live/): the phone holds the WebRTC
+# call, the daemon signals it with omp's ChatGPT login and drives the sideband WebSocket.
+LIVE_MODEL = "gpt-live-1-codex"
+LIVE_VOICES = ("arbor", "breeze", "cove", "ember", "juniper", "maple", "sol", "spruce", "vale")
+LIVE_VOICE = "sol"
+LIVE_MODES = ("concierge", "direct")
+LIVE_SIGNAL_HOST = "chatgpt.com"
+LIVE_SIGNAL_PATH = "/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas"
+LIVE_SIDEBAND_HOST = "api.openai.com"
+CODEX_VERSION = "0.159.0"     # the Codex Desktop version omp presents
+CODEX_ORIGINATOR = "Codex Desktop"
+CODEX_DB = Path.home() / ".omp" / "agent" / "agent.db"  # omp's credential store; only ever read
+LIVE_CALL_RE = re.compile(r"^rtc_[\w-]+$")
+LIVE_SIGNAL_S = 30.0
+LIVE_CONNECT_TRIES = 5
+LIVE_CONNECT_S = 15.0
+LIVE_PING_S = 15.0           # sideband ping after this long without a frame ...
+LIVE_SILENT_S = 45.0         # ... and the call is taken as dead after this long
+LIVE_CHUNK_BYTES = 500       # per context append
+LIVE_FINAL_CAP = 6000        # characters of a final reply handed to the voice model
+LIVE_GONE_S = 60.0           # the call ends this long after the phone's link is gone
+LIVE_TICK_S = 0.5            # delegation progress is read this often
+LIVE_NOTICE_GAP_S = 20.0     # at most one proactive notice per this long (merged)
+LIVE_REJECT_S = 5.0          # an error this soon after the first session.context.append rejects it
+LIVE_NOTICE_CHANNEL = "speakable"  # notices are spoken at the next pause (verified: with or without a channel)
+WS_MAX = 16 << 20
+# Sideband events the daemon has no use for (audio both ways, user-turn deltas that
+# input_transcript.added repeats, acknowledgements, usage); others are logged once per call.
+LIVE_QUIET_EVENTS = {"session.updated", "output_audio.delta", "session.input_audio.append",
+                     "session.output_audio.delta", "turn.created", "turn.delta", "session.context.appended",
+                     "delegation.context.appended", "session.usage.updated"}
+CONCIERGE_SESSION = os.environ.get("DEVDECK_CONCIERGE_SESSION") or "devdeck-voice"
+CONCIERGE_DIR = Path.home() / ".local" / "share" / "devdeck" / "concierge"
+CONCIERGE_AGENTS = HERE / "concierge" / "AGENTS.md"
+CONCIERGE_MODEL = "anthropic/claude-haiku-4-5:low"  # DEVDECK_CONCIERGE_MODEL: provider/id[:level]
+CONCIERGE_READY_S = 30.0
+
+LIVE_INSTRUCTIONS = """You: DevDeck Live, realtime voice surface of one assistant for {firstName} (OS account: {username}) that runs the coding agents and terminals on their laptop.
+
+<conventions>
+RFC 2119 keywords: MUST, REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL. `NEVER` = `MUST NOT`.
+</conventions>
+
+<critical>
+- You + client backend: one assistant, not separate agents.
+- MUST delegate everything about the user's terminals, coding agents, repositories, files, commands, status, progress and verification to client backend; NEVER guess what a terminal is doing.
+- MUST keep conversation natural while client backend works.
+</critical>
+
+User speaks to you from their phone, often on the move with earbuds. MUST respond directly, briefly, conversationally, with speech-friendly phrasing. NEVER use markdown, code blocks, long lists, file paths, or read implementation detail aloud unless requested.
+
+Client backend: same assistant's execution surface on the laptop. Usually a fast concierge that sees every terminal: lists them, reads their status and last replies, gives them tasks, stops them, switches their models, answers their questions, opens new ones, and switches who you talk to. In direct mode it is the coding agent in one terminal. Status questions, coding tasks, terminal control, answers to an agent's question → MUST promptly create client delegation with complete plain-language request and all relevant conversational context (which terminal or project, what exactly); NEVER attempt tool work. New request during active work MUST create new delegation.
+
+Treat delegation context as own internal progress/results. NEVER describe backend as another assistant. MAY briefly acknowledge active work; NEVER claim changes, findings, or verification before backend reports. Commentary context: silent progress for conversational continuity; NEVER recite. Context beginning with `"Agent Final Message":`: backend's final visible answer; MUST present useful result naturally and briefly as own, NEVER mention label, protocol, delegation, or backend. Context beginning with `Notice:`: news from the user's other terminals (an agent finished or is asking something); tell the user briefly at the next natural pause, without interrupting them. Context beginning with `Routing:`: who your delegations now reach; NEVER recite.
+
+Greetings, clarification, thinking out loud, design discussion, ordinary conversation needing no terminals: MUST answer directly without delegation. MUST ask concise clarifying question only when execution request genuinely underspecified.
+
+<critical>
+MUST preserve one-assistant continuity: converse here, delegate execution, communicate returned result as own.
+</critical>
+"""
+
+
+class LiveError(Exception):
+    """A live call failed or could not start; the message is shown (and may be spoken)."""
+
+
+def codex_credentials() -> list[dict]:
+    """omp's enabled ChatGPT (openai-codex) OAuth logins valid for at least another minute, most
+    recently updated first: [{access, accountId}]. Read-only: refreshing rotates the refresh
+    token, which only omp may do."""
+    try:
+        db = sqlite3.connect(f"file:{CODEX_DB}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error as ex:
+        log(f"live: {CODEX_DB}: {ex}")
+        return []
+    try:
+        rows = db.execute("SELECT data FROM auth_credentials WHERE provider = 'openai-codex' AND "
+                          "credential_type = 'oauth' AND disabled_cause IS NULL "
+                          "ORDER BY updated_at DESC, id DESC").fetchall()
+    except sqlite3.Error as ex:
+        log(f"live: {CODEX_DB}: {ex}")
+        rows = []
+    finally:
+        db.close()
+    fresh = time.time() * 1000 + 60_000
+    out = []
+    for (data,) in rows:
+        try:
+            d = json.loads(data)
+        except (TypeError, ValueError):
+            continue
+        if (isinstance(d, dict) and isinstance(d.get("access"), str) and d["access"]
+                and isinstance(d.get("expires"), (int, float)) and d["expires"] > fresh):
+            out.append({"access": d["access"], "accountId": d["accountId"] if isinstance(d.get("accountId"), str) else None})
+    return out
+
+
+def codex_logins() -> list[dict]:
+    """codex_credentials(); when all have expired, `omp token openai-codex` (which refreshes an
+    expired login the way omp itself does; the token it prints is discarded) runs once first."""
+    creds = codex_credentials()
+    if creds:
+        return creds
+    try:
+        subprocess.run([omp_binary(), "token", "openai-codex"], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        log(f"live: omp token: {ex}")
+    creds = codex_credentials()
+    if not creds:
+        raise LiveError("omp's ChatGPT login has expired; open omp once so it refreshes")
+    return creds
+
+
+def live_headers(cred: dict, session_id: str, call_session: str) -> dict[str, str]:
+    headers = {"Authorization": f"Bearer {cred['access']}", "OpenAI-Alpha": "quicksilver=v2",
+               "User-Agent": f"{CODEX_ORIGINATOR}/{CODEX_VERSION}", "x-session-id": call_session,
+               "originator": CODEX_ORIGINATOR, "version": CODEX_VERSION, "session-id": session_id,
+               "thread-id": session_id}
+    if cred["accountId"]:
+        headers["chatgpt-account-id"] = cred["accountId"]
+    return headers
+
+
+def live_instructions() -> str:
+    try:
+        username = pwd.getpwuid(os.getuid()).pw_name.strip() or "user"
+    except KeyError:
+        username = "user"
+    first = next((p for p in re.split(r"[._\-\s]+", username) if p), "there")
+    return LIVE_INSTRUCTIONS.replace("{firstName}", first).replace("{username}", username)
+
+
+def live_signal(sdp: str, voice: str, headers: dict[str, str]) -> tuple[int, str, str]:
+    """POST the phone's SDP offer: (HTTP status, body = the SDP answer, Location header)."""
+    body = json.dumps({"sdp": sdp, "session": {"model": LIVE_MODEL, "instructions": live_instructions(),
+                                               "audio": {"output": {"voice": voice}},
+                                               "delegation": {"type": "client"}}}).encode()
+    conn = http.client.HTTPSConnection(LIVE_SIGNAL_HOST, timeout=LIVE_SIGNAL_S, context=ssl.create_default_context())
+    try:
+        conn.request("POST", LIVE_SIGNAL_PATH, body=body,
+                     headers={**headers, "Accept": "*/*", "Content-Type": "application/json"})
+        r = conn.getresponse()
+        return r.status, r.read(1 << 20).decode(errors="replace"), r.getheader("Location") or ""
+    finally:
+        conn.close()
+
+
+def live_call_id(location: str) -> str | None:
+    return next((s for s in location.split("?", 1)[0].split("/") if LIVE_CALL_RE.match(s)), None)
+
+
+def live_chunks(text: str) -> list[str]:
+    """`text` split at character boundaries into pieces of at most LIVE_CHUNK_BYTES UTF-8 bytes."""
+    out, cur, size = [], [], 0
+    for ch in text:
+        n = len(ch.encode("utf-8", "surrogatepass"))
+        if size + n > LIVE_CHUNK_BYTES:
+            out.append("".join(cur))
+            cur, size = [], 0
+        cur.append(ch)
+        size += n
+    out.append("".join(cur))
+    return out
+
+
+def first_sentence(md: str, limit: int = 200) -> str:
+    spoken = spoken_text(md, 1000)
+    m = re.match(r"(.+?[.!?])(?:\s|$)", spoken, re.S)
+    s = (m.group(1) if m else spoken).strip()
+    return s if len(s) <= limit else s[:limit].rsplit(" ", 1)[0] + "..."
+
+
+def ask_summary(ask: dict) -> str:
+    qs = ask["questions"]
+    q = qs[0]
+    s = q["question"].strip()
+    if q["options"]:
+        s += " Options: " + ", ".join(o["label"] for o in q["options"]) + "."
+    if len(qs) > 1:
+        s += f" (and {len(qs) - 1} more question{'s' if len(qs) > 2 else ''})"
+    return s
+
+
+def match_option(text: str, labels: list[str]) -> str | None:
+    """The option label a spoken answer names: exact, else the only one contained in it (or
+    containing it); None means a custom answer."""
+    def norm(s: str) -> str:
+        return " ".join(re.sub(r"[^\w]+", " ", s.lower()).split())
+    t = norm(text)
+    exact = [lb for lb in labels if norm(lb) == t]
+    if exact:
+        return exact[0]
+    hits = [lb for lb in labels if norm(lb) and (f" {norm(lb)} " in f" {t} " or f" {t} " in f" {norm(lb)} ")]
+    return hits[0] if len(hits) == 1 else None
+
+
+def concierge_model() -> tuple[str, str]:
+    raw = (os.environ.get("DEVDECK_CONCIERGE_MODEL") or CONCIERGE_MODEL).strip()
+    sel, sep, level = raw.rpartition(":")
+    return (sel, level) if sep and level in THINKING_LEVELS else (raw, "low")
+
+
+def start_concierge(ctl_path: Path) -> str | None:
+    """Create the concierge's tmux session (omp with a fast model in CONCIERGE_DIR, which gets the
+    repo's concierge/AGENTS.md); None on success, else the error."""
+    CONCIERGE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        want = CONCIERGE_AGENTS.read_bytes()
+        dest = CONCIERGE_DIR / "AGENTS.md"
+        if not dest.exists() or dest.read_bytes() != want:
+            dest.write_bytes(want)
+    except OSError as ex:
+        log(f"concierge: AGENTS.md: {ex}")
+    model, level = concierge_model()
+    # Separate argv, no shell; tmux takes PATH from its client rather than from -e, so `env`
+    # puts the repo (ddctl) on omp's PATH.
+    r = tmux("new-session", "-d", "-s", CONCIERGE_SESSION, "-c", str(CONCIERGE_DIR), "-e", f"DEVDECK_CTL={ctl_path}",
+             "env", f"PATH={HERE}{os.pathsep}{os.environ.get('PATH', '')}", f"DEVDECK_CTL={ctl_path}",
+             omp_binary(), "--model", model, "--thinking", level, "--tools", "bash,read", "--no-skills", "--no-title")
+    if r.returncode != 0:
+        return tmux_error(r)
+    log(f"concierge: started {CONCIERGE_SESSION} ({model}, thinking {level})")
+    return None
+
+
+class WebSocketRefused(ConnectionError):
+    def __init__(self, status: int, detail: str):
+        super().__init__(f"HTTP {status}" + (f": {detail}" if detail else ""))
+        self.status = status
+
+
+class WebSocket:
+    """Minimal RFC 6455 client over TLS (stdlib only) for one thread: masked frames out, text,
+    binary, fragmented and control frames in, no extensions. read() waits at most 1 s."""
+
+    GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def __init__(self, host: str, path: str, headers: dict[str, str], timeout: float):
+        raw = socket.create_connection((host, 443), timeout=timeout)
+        try:
+            self.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+        except BaseException:
+            raw.close()
+            raise
+        self.buf = bytearray()
+        self.frag_op: int | None = None
+        self.frag: list[bytes] = []
+        self.close_sent = False
+        try:
+            self._handshake(host, path, headers)
+        except BaseException:
+            self.sock.close()
+            raise
+        self.sock.settimeout(1.0)
+
+    def _handshake(self, host: str, path: str, headers: dict[str, str]) -> None:
+        key = base64.b64encode(secrets.token_bytes(16)).decode()
+        head = [f"GET {path} HTTP/1.1", f"Host: {host}", "Upgrade: websocket", "Connection: Upgrade",
+                f"Sec-WebSocket-Key: {key}", "Sec-WebSocket-Version: 13", *(f"{k}: {v}" for k, v in headers.items())]
+        self.sock.sendall(("\r\n".join(head) + "\r\n\r\n").encode())
+        while (end := self.buf.find(b"\r\n\r\n")) < 0:
+            if len(self.buf) > 65536:
+                raise ConnectionError("oversized handshake response")
+            self._recv()
+        lines = bytes(self.buf[:end]).decode("latin-1").split("\r\n")
+        del self.buf[:end + 4]
+        fields = {}
+        for ln in lines[1:]:
+            k, _, v = ln.partition(":")
+            fields[k.strip().lower()] = v.strip()
+        status = lines[0].split(" ", 2)
+        code = int(status[1]) if len(status) > 1 and status[1].isdigit() else 0
+        if code != 101:
+            length = fields.get("content-length", "")
+            want = min(int(length), 2048) if length.isdigit() else 0
+            try:
+                while len(self.buf) < want:
+                    self._recv()
+            except OSError:
+                pass
+            raise WebSocketRefused(code, " ".join(bytes(self.buf[:2048]).decode(errors="replace").split()))
+        accept = base64.b64encode(hashlib.sha1((key + self.GUID).encode()).digest()).decode()
+        if fields.get("sec-websocket-accept") != accept:
+            raise ConnectionError("bad Sec-WebSocket-Accept")
+
+    def _recv(self) -> None:
+        data = self.sock.recv(1 << 16)
+        if not data:
+            raise ConnectionError("connection closed by the server")
+        self.buf += data
+
+    def fileno(self) -> int:
+        return self.sock.fileno()
+
+    def pending(self) -> int:
+        """Decrypted bytes the TLS layer holds (select() does not see them)."""
+        return self.sock.pending()
+
+    def read(self) -> None:
+        try:
+            self._recv()
+        except TimeoutError:  # a partial TLS record; the rest comes with the next read
+            pass
+
+    def send(self, op: int, payload: bytes = b"") -> None:
+        n = len(payload)
+        head = bytearray([0x80 | op])
+        if n < 126:
+            head.append(0x80 | n)
+        elif n < 1 << 16:
+            head.append(0x80 | 126)
+            head += n.to_bytes(2, "big")
+        else:
+            head.append(0x80 | 127)
+            head += n.to_bytes(8, "big")
+        mask = secrets.token_bytes(4)
+        self.sock.sendall(bytes(head) + mask + ws_mask(payload, mask))
+        if op == 8:
+            self.close_sent = True
+
+    def messages(self) -> list[tuple[int, bytes]]:
+        """Complete messages (op, payload) in the buffer: text/binary (fragments joined) and
+        control frames (ping 9, pong 10, close 8)."""
+        out = []
+        b = self.buf
+        while len(b) >= 2:
+            op, fin, masked, n, i = b[0] & 0x0F, b[0] & 0x80, b[1] & 0x80, b[1] & 0x7F, 2
+            if n == 126:
+                if len(b) < 4:
+                    break
+                n, i = int.from_bytes(b[2:4], "big"), 4
+            elif n == 127:
+                if len(b) < 10:
+                    break
+                n, i = int.from_bytes(b[2:10], "big"), 10
+            if n > WS_MAX:
+                raise ConnectionError(f"oversized frame ({n} bytes)")
+            key = b""
+            if masked:
+                key, i = bytes(b[i:i + 4]), i + 4
+            if len(b) < i + n:
+                break
+            payload = bytes(b[i:i + n])
+            del b[:i + n]
+            if masked:
+                payload = ws_mask(payload, key)
+            if op >= 8:
+                out.append((op, payload))
+                continue
+            if op:
+                self.frag_op, self.frag = op, [payload]
+            elif self.frag_op is None:
+                raise ConnectionError("continuation frame without a message")
+            else:
+                self.frag.append(payload)
+            if fin:
+                out.append((self.frag_op, b"".join(self.frag)))
+                self.frag_op, self.frag = None, []
+        return out
+
+    def close(self) -> None:
+        if not self.close_sent:
+            try:
+                self.send(8, (1000).to_bytes(2, "big"))
+            except OSError:
+                pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def ws_mask(data: bytes, mask: bytes) -> bytes:
+    n = len(data)
+    if not n:
+        return b""
+    return (int.from_bytes(data, "big") ^ int.from_bytes((mask * (n // 4 + 1))[:n], "big")).to_bytes(n, "big")
+
+
+class LiveSession:
+    """The daemon's one GPT Live call (README "Live"). The phone holds the WebRTC call (audio
+    goes straight to OpenAI); this side signals it with omp's ChatGPT login, drives the sideband
+    WebSocket on one I/O thread, routes the voice model's delegations into a terminal and feeds
+    their progress, final replies and the other terminals' news back into the call. A tick
+    thread reads the routed pane's session file and ends the call when the phone stays away."""
+
+    def __init__(self, server: Server, ctl: Control, req: str, sdp: str, voice: str, mode: str, target: str | None):
+        self.server, self.ctl, self.client = server, ctl, ctl.client
+        self.req, self.offer, self.voice = req, sdp, voice
+        self.mode, self.target = mode, target
+        self.lock = threading.RLock()
+        self.route_lock = threading.Lock()
+        self.session_id, self.call_session = str(uuid.uuid4()), str(uuid.uuid4())
+        self.call_id: str | None = None
+        self.phase = "connecting"
+        self.answered = False      # the phone got the SDP answer
+        self.started = False       # session.started came
+        self.speaking = False
+        self.ended = False
+        self.ws: WebSocket | None = None
+        self.out: collections.deque[dict] = collections.deque()  # sideband messages to send
+        self.wake_r, self.wake_w = socket.socketpair()
+        self.deleg: dict | None = None  # {id, text, target, mode, path, after, ask}
+        self.turns = {"user": [0, "", False], "assistant": [0, "", False]}  # turn, text, final
+        self.gone_at: float | None = None
+        self.ctx_ok: bool | None = None       # whether session.context.append is accepted
+        self.ctx_probe: float | None = None   # when the first one was sent
+        self.ctx_pending: list[str] = []      # notices in that first one, re-routed if it is rejected
+        self.notices: list[str] = []
+        self.notice_at = 0.0
+        self.held: list[str] = []             # notices for the next final reply
+        self.seen: dict[str, tuple] = {}      # pane target -> (state, final reply id, ask id)
+        self.unknown: set[str] = set()
+
+    # ------------------------------------------------------------ phone side
+
+    def push(self, msg: dict) -> None:
+        """To every connection of the phone that started the call."""
+        with self.server.ctl_cond:
+            ctls = {c for c in self.server.controls if self.client and c.client == self.client}
+        ctls.add(self.ctl)
+        for c in ctls:
+            c.push(msg)
+
+    def state(self, error: str | None = None) -> dict:
+        with self.lock:
+            msg = {"t": "live", "phase": self.phase, "mode": self.mode}
+            if self.mode == "direct" and self.target:
+                msg["target"] = self.target
+            if self.call_id:
+                msg["callId"] = self.call_id
+        if error:
+            msg["error"] = error
+        return msg
+
+    def set_phase(self) -> None:
+        with self.lock:
+            if self.ended or not self.started:
+                return
+            phase = "working" if self.deleg else "speaking" if self.speaking else "listening"
+            if phase == self.phase:
+                return
+            self.phase = phase
+        self.push(self.state())
+
+    def end(self, error: str | None = None, notify: bool = True) -> None:
+        """End the call: session.close goes out on the sideband (the I/O thread then closes it),
+        and the phone is told (`ended`, or `error`)."""
+        with self.lock:
+            if self.ended:
+                return
+            self.ended = True
+            self.phase = "error" if error else "ended"
+            self.out.append({"type": "session.close"})
+        self.wake()
+        with self.server.live_lock:
+            if self.server.live is self:
+                self.server.live = None
+        log(f"live: call {self.call_id or '-'} ended" + (f": {error}" if error else ""))
+        if notify:
+            self.push(self.state(error))
+
+    # ------------------------------------------------------------ connection
+
+    def run(self) -> None:
+        try:
+            self.connect()
+        except LiveError as ex:
+            log(f"live: {ex}")
+            if not self.answered:
+                self.push({"t": "error", "req": self.req, "error": str(ex)})
+            self.end(str(ex))
+            self.close_wake()
+            return
+        threading.Thread(target=self.tick_loop, daemon=True).start()
+        self.io_loop()
+
+    def connect(self) -> None:
+        if self.mode == "concierge":
+            self.server.concierge(start=True)
+        # the login that worked last goes first; a refused one (expired: 401/403, an account
+        # without GPT Live such as a free plan: 404) hands over to the next
+        creds = sorted(codex_logins(), key=lambda c: c["accountId"] != self.server.live_account)
+        status, body, location, cred, refused = 0, "", "", creds[0], []
+        for cred in creds:
+            try:
+                status, body, location = live_signal(self.offer, self.voice,
+                                                     live_headers(cred, self.session_id, self.call_session))
+            except (OSError, http.client.HTTPException) as ex:
+                raise LiveError(f"cannot reach ChatGPT: {ex}") from None
+            if status not in (401, 403, 404):
+                break
+            refused.append(status)
+            log(f"live: ChatGPT account {(cred['accountId'] or '?')[:8]} refused the call (HTTP {status})")
+        detail = " ".join(body.split())[:300]
+        if status in (401, 403):
+            raise LiveError(f"ChatGPT refused omp's login (HTTP {status}); open omp once so it refreshes")
+        if status == 404 and len(refused) == len(creds):
+            raise LiveError("none of omp's ChatGPT logins can use GPT Live (HTTP 404); it needs a paid plan")
+        if not 200 <= status < 300:
+            raise LiveError(f"GPT Live refused the call (HTTP {status}): {detail}")
+        self.server.live_account = cred["accountId"]
+        call = live_call_id(location)
+        if not call or not body.strip():
+            raise LiveError(f"GPT Live answered without {'a call id' if not call else 'an SDP answer'} (HTTP {status})")
+        with self.lock:
+            if self.ended:
+                raise LiveError("stopped")
+            self.call_id = call
+        log(f"live: signalled call {call} (HTTP {status}, Location {location})")
+        self.push({"t": "live_answer", "req": self.req, "sdp": body, "callId": call})
+        self.answered = True
+        self.push(self.state())
+        headers = live_headers(cred, self.session_id, self.call_session)
+        path = "/v1/live/" + urllib.parse.quote(call, safe="")
+        last: Exception | None = None
+        for attempt in range(LIVE_CONNECT_TRIES):
+            if self.ended:
+                raise LiveError("stopped")
+            try:
+                ws = WebSocket(LIVE_SIDEBAND_HOST, path, headers, LIVE_CONNECT_S)
+                break
+            except (OSError, ConnectionError) as ex:
+                last = ex
+                log(f"live: sideband attempt {attempt + 1} failed: {ex}")
+            if attempt + 1 < LIVE_CONNECT_TRIES:
+                time.sleep(0.5 * 2 ** attempt)
+        else:
+            raise LiveError(f"GPT Live control channel failed: {last}")
+        with self.lock:
+            if self.ended:
+                ws.close()
+                raise LiveError("stopped")
+            self.ws = ws
+        log(f"live: sideband connected ({call})")
+
+    def send(self, msg: dict) -> None:
+        with self.lock:
+            if self.ended:
+                return
+            self.out.append(msg)
+        self.wake()
+
+    def wake(self) -> None:
+        try:
+            self.wake_w.send(b"x")
+        except OSError:
+            pass
+
+    def close_wake(self) -> None:
+        for s in (self.wake_r, self.wake_w):
+            s.close()
+
+    def io_loop(self) -> None:
+        ws, error = self.ws, None
+        rx, pinged = time.monotonic(), False
+        try:
+            while True:
+                while True:
+                    with self.lock:
+                        msg = self.out.popleft() if self.out else None
+                    if msg is None:
+                        break
+                    ws.send(1, json.dumps(msg, ensure_ascii=False, separators=(",", ":")).encode())
+                    if msg["type"] == "session.close":
+                        return
+                for op, data in ws.messages():
+                    rx, pinged = time.monotonic(), False
+                    if op == 1:
+                        self.on_event(data)
+                    elif op == 9:
+                        ws.send(10, data)
+                    elif op == 8:
+                        code = int.from_bytes(data[:2], "big") if len(data) >= 2 else 1005
+                        reason = data[2:].decode(errors="replace")
+                        raise ConnectionError(f"GPT Live closed the call ({code}{': ' + reason if reason else ''})")
+                if self.out:
+                    continue
+                if ws.pending():
+                    ws.read()
+                    continue
+                r, _, _ = select.select([ws, self.wake_r], [], [], LIVE_PING_S / 3)
+                if self.wake_r in r:
+                    self.wake_r.recv(4096)
+                if ws in r:
+                    ws.read()
+                    continue
+                idle = time.monotonic() - rx
+                if idle > LIVE_SILENT_S:
+                    raise ConnectionError("GPT Live stopped answering")
+                if idle > LIVE_PING_S and not pinged:
+                    ws.send(9, b"devdeck")
+                    pinged = True
+        except (OSError, ConnectionError) as ex:
+            error = str(ex) or type(ex).__name__
+        finally:
+            ws.close()
+            if error:
+                self.end(error)
+            self.close_wake()
+
+    # ------------------------------------------------------------ voice model events
+
+    def on_event(self, data: bytes) -> None:
+        try:
+            ev = json.loads(data)
+        except ValueError:
+            return
+        if not isinstance(ev, dict):
+            return
+        t = ev.get("type")
+        if t == "session.started":
+            with self.lock:
+                self.started = True
+            log(f"live: session.started {((ev.get('session') or {}).get('id'))}")
+            self.set_phase()
+            self.hello()
+        elif t in ("input_transcript.added", "output_transcript.added"):
+            item = ev.get("item") if isinstance(ev.get("item"), dict) else {}
+            role = "user" if t[0] == "i" else "assistant"
+            if role == "assistant":
+                with self.lock:
+                    self.speaking = True
+            self.transcript(role, item.get("text"), False)
+            self.set_phase()
+        elif t == "turn.done":
+            turn = ev.get("turn") if isinstance(ev.get("turn"), dict) else {}
+            role = turn.get("role")
+            if role in ("user", "assistant"):
+                self.transcript(role, turn.get("transcript"), True)
+                if role == "assistant":
+                    with self.lock:
+                        self.speaking = False
+                    self.set_phase()
+        elif t == "delegation.created":
+            self.on_delegation(ev.get("item"))
+        elif t == "error":
+            err = ev.get("error")
+            msg = ev.get("message") if isinstance(ev.get("message"), str) else \
+                err.get("message") if isinstance(err, dict) and isinstance(err.get("message"), str) else \
+                json.dumps(err) if err is not None else "unknown error"
+            self.on_error(msg)
+        elif t not in LIVE_QUIET_EVENTS and t not in self.unknown:
+            self.unknown.add(t)
+            log(f"live: event {t}: {data[:300].decode(errors='replace')}")
+
+    def transcript(self, role: str, text, final: bool) -> None:
+        """omp's transcript coalescing: incremental pieces (cumulative or deltas) grow a role's
+        current turn; one after its final (turn.done) starts the next turn."""
+        if not isinstance(text, str) or not text:
+            return
+        with self.lock:
+            turn, cur, was = self.turns[role]
+            if not final:
+                if not cur:
+                    turn, nxt = turn + 1, text
+                elif was:
+                    if text == cur or cur.endswith(text):
+                        return
+                    turn, nxt = turn + 1, text
+                elif text.startswith(cur):
+                    nxt = text
+                elif cur.endswith(text):
+                    nxt = cur
+                else:
+                    nxt = cur + text
+            else:
+                if not cur:
+                    turn += 1
+                elif was:
+                    if text == cur:
+                        return
+                    turn += 1
+                nxt = cur if not was and cur.startswith(text) and len(cur) > len(text) else text
+            if [turn, nxt, final] == self.turns[role]:
+                return
+            self.turns[role] = [turn, nxt, final]
+        if nxt.strip():
+            self.push({"t": "live_transcript", "role": role, "turn": turn, "text": nxt.strip(), "final": final})
+
+    def on_error(self, message: str) -> None:
+        with self.lock:
+            probe = self.ctx_probe is not None and time.monotonic() - self.ctx_probe < LIVE_REJECT_S
+            if probe:
+                self.ctx_ok, self.ctx_probe = False, None
+                pending, self.ctx_pending = self.ctx_pending, []
+        if probe:
+            log(f"live: session.context.append rejected: {message}")
+            for text in pending:
+                self.notice_fallback(text)
+            return
+        log(f"live: error event: {message}")
+        self.end(message)
+
+    # ------------------------------------------------------------ context into the call
+
+    def append(self, did: str, text: str, channel: str | None = None) -> None:
+        for chunk in live_chunks(text):
+            self.send({"type": "delegation.context.append", "delegation_item_id": did,
+                       **({"channel": channel} if channel else {}), "content": [{"type": "input_text", "text": chunk}]})
+
+    def final(self, did: str, text: str) -> None:
+        with self.lock:
+            held, self.held = self.held, []
+        text = text.strip()
+        if len(text) > LIVE_FINAL_CAP:
+            text = text[:LIVE_FINAL_CAP].rstrip() + "\n\n(The rest is on screen.)"
+        if held:
+            text += "\n\n" + "\n".join(held)
+        self.append(did, '"Agent Final Message":\n\n' + text)
+
+    def context(self, text: str, channel: str | None = None, notice: bool = False) -> bool:
+        """session.context.append unless known to be rejected (False then). The first one is a
+        probe: an error within LIVE_REJECT_S marks the message type unsupported, and its notices
+        are re-routed."""
+        with self.lock:
+            if self.ctx_ok is False:
+                return False
+            if self.ctx_ok is None:
+                if self.ctx_probe is None:
+                    self.ctx_probe = time.monotonic()
+                if notice:
+                    self.ctx_pending.append(text)
+        for chunk in live_chunks(text):
+            self.send({"type": "session.context.append", **({"channel": channel} if channel else {}),
+                       "content": [{"type": "input_text", "text": chunk}]})
+        return True
+
+    def routing_text(self) -> str:
+        with self.lock:
+            mode, target = self.mode, self.target
+        if mode == "direct":
+            return (f"Routing: your delegations now go straight to the coding agent in terminal {target}; "
+                    "it only knows its own project.")
+        return "Routing: your delegations go to the concierge, which sees and controls all terminals."
+
+    def hello(self) -> None:
+        """First context of the call (and the session.context.append probe): routing and the
+        terminals that run agents."""
+        with self.server.ctl_cond:
+            panes = list(self.server.panes or [])
+        agents = [f"{p['target']} ({p['state']}{', ' + p['cwd'].replace(HOME, '~') if p.get('cwd') else ''})"
+                  for p in panes if p["agent"] and p["session"] != CONCIERGE_SESSION]
+        self.context(self.routing_text() + (" Agent terminals: " + "; ".join(agents) + "." if agents else ""))
+
+    def notice(self, target: str, kind: str, text: str) -> None:
+        self.push({"t": "live_notice", "text": text, "target": target, "kind": kind})
+        log(f"live: notice {text[:120]}")
+        with self.lock:
+            self.notices.append(text)
+
+    def flush_notices(self) -> None:
+        now = time.monotonic()
+        with self.lock:
+            if not self.notices or not self.started or now - self.notice_at < LIVE_NOTICE_GAP_S:
+                return
+            text = "Notice: " + " ".join(n if n.endswith((".", "?", "!", ")")) else n + "." for n in self.notices)
+            self.notices, self.notice_at = [], now
+        if not self.context(text, LIVE_NOTICE_CHANNEL, notice=True):
+            self.notice_fallback(text)
+
+    def notice_fallback(self, text: str) -> None:
+        """Commentary on the running delegation, else held for the next final reply."""
+        with self.lock:
+            d = self.deleg
+            if d is None:
+                self.held.append(text)
+                return
+        self.append(d["id"], text, "commentary")
+
+    def set_mode(self, mode: str, target: str | None) -> None:
+        with self.lock:
+            if (mode, target) == (self.mode, self.target):
+                return
+            self.mode, self.target = mode, target
+            started = self.started
+        self.push(self.state())
+        if started and not self.context(self.routing_text()):
+            with self.lock:
+                self.held.append(self.routing_text())
+
+    # ------------------------------------------------------------ delegations
+
+    def on_delegation(self, item) -> None:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            return
+        text = "\n".join(c["text"] for c in item.get("content") or [] if isinstance(c, dict)
+                         and c.get("type") == "input_text" and isinstance(c.get("text"), str)).strip()
+        if not text:
+            return
+        with self.lock:
+            mode, target = self.mode, self.target
+        log(f"live: delegation {item['id']} ({mode}): {text[:200]!r}")
+        threading.Thread(target=self.route, args=(item["id"], text, mode, target), daemon=True).start()
+
+    def route(self, did: str, text: str, mode: str, target: str | None) -> None:
+        """Paste the delegation into the concierge (verbatim) or the direct terminal ("[voice] "
+        prefix; a spoken answer when it asks), then follow that pane for this delegation."""
+        with self.route_lock:
+            try:
+                if mode == "concierge":
+                    target = self.server.concierge(start=True, wait=True)
+                info = pane_info(target or "")
+                if isinstance(info, str):
+                    raise LiveError(f"terminal {target}: {info}")
+                target = info["target"]
+                if not info["agent"]:
+                    raise LiveError(f"terminal {target} is not running omp")
+                tr = self.server.pane_transcript(info)
+                if tr is not None:
+                    tr.refresh(force=True)
+                ask = tr.pending_ask() if tr is not None else None
+                path, after = (tr.path, tr.branch_end()) if tr is not None else (None, None)
+                if ask is not None:
+                    if mode == "concierge":
+                        raise LiveError("the concierge waits on a question on the PC; answer it there")
+                    self.answer(target, ask, text)
+                else:
+                    err = deliver_text("live-" + did, target, text if mode == "concierge" else f"[voice] {text}", True)
+                    if err:
+                        raise LiveError(f"could not type into terminal {target}: {err}")
+            except (LiveError, RequestError) as ex:
+                log(f"live: delegation {did} failed: {ex}")
+                self.final(did, f"That did not reach the terminal: {ex}")
+                self.push({"t": "live_delegation", "id": did, "text": text, "routedTo": target, "mode": mode,
+                           "state": "failed", "error": str(ex)})
+                return
+            d = {"id": did, "text": text, "target": target, "mode": mode, "path": path, "after": after,
+                 "ask": ask["toolCallId"] if ask else None}
+            with self.lock:
+                old, self.deleg = self.deleg, d
+            if old is not None:
+                self.push({"t": "live_delegation", "id": old["id"], "text": old["text"], "routedTo": old["target"],
+                           "mode": old["mode"], "state": "done"})
+            self.push({"t": "live_delegation", "id": did, "text": text, "routedTo": target, "mode": mode, "state": "sent"})
+            self.server.poll_now.set()
+            self.set_phase()
+
+    def answer(self, target: str, ask: dict, text: str) -> None:
+        """A spoken answer to the direct terminal's open question: the option it names, else a
+        custom answer."""
+        qs = ask["questions"]
+        if len(qs) != 1:
+            raise LiveError("it asks several questions at once; answer them on the phone screen or the PC")
+        q = qs[0]
+        pick = match_option(text, [o["label"] for o in q["options"]])
+        err = self.server.answer_ask(target, ask["toolCallId"],
+                                     [{"qid": q["id"], **({"selected": [pick]} if pick else {"custom": text})}])
+        if err:
+            raise LiveError(err)
+        log(f"live: answered {target}'s question with {pick or 'a custom answer'}")
+
+    def track(self) -> None:
+        """Progress of the running delegation from its pane's session file: commentary for each
+        new assistant message that calls tools and says something, the final reply when the
+        turn stops (or fails), and the agent's question (direct mode) as a final reply."""
+        with self.lock:
+            d = self.deleg
+        if d is None:
+            return
+        info = pane_info(d["target"])
+        if isinstance(info, str):
+            self.finish(d, f"Terminal {d['target']} is gone ({info}).", "failed")
+            return
+        path = breadcrumb_session(info["tty"], info["pid"])
+        if path is None:
+            return
+        if path != d["path"]:  # omp started, /new, /resume: read the new file from its start
+            d["path"], d["after"] = path, None
+        tr = self.server.transcript(path)
+        try:
+            tr.refresh()
+            d["after"], msgs = tr.assistant_since(d["after"])
+            ask = tr.pending_ask()
+        except (StaleFile, OSError, ValueError) as ex:
+            log(f"live: cannot read {path}: {ex!r}")
+            return
+        for m in msgs:
+            if m["stopReason"] == "toolUse":
+                if m["text"]:
+                    self.append(d["id"], m["text"], "commentary")
+                continue
+            if m["stopReason"] == "aborted":
+                self.finish(d, "The agent was stopped before it finished.", "done")
+            elif m["stopReason"] == "error":
+                self.finish(d, f"The agent failed: {m['error'] or 'unknown error'}.", "failed")
+            elif m["text"]:
+                self.finish(d, m["text"], "done")
+            else:
+                continue
+            return
+        if ask is not None and ask["toolCallId"] != d["ask"] and d["mode"] == "direct":
+            self.finish(d, f"The agent in {d['target']} asks: {ask_summary(ask)}", "done")
+
+    def finish(self, d: dict, text: str, state: str) -> None:
+        with self.lock:
+            if self.deleg is d:
+                self.deleg = None
+        log(f"live: delegation {d['id']} {state}: {text[:120]!r}")
+        self.final(d["id"], text)
+        self.push({"t": "live_delegation", "id": d["id"], "text": d["text"], "routedTo": d["target"],
+                   "mode": d["mode"], "state": state})
+        self.set_phase()
+
+    # ------------------------------------------------------------ other terminals, lifecycle
+
+    def on_panes(self, panes: list[dict], trs: dict[str, Transcript]) -> None:
+        """Proactive notices (from the sessions poller): another agent finished a turn (working ->
+        idle with a new final reply) or started asking. Not for the routed or concierge panes."""
+        with self.lock:
+            skip = {self.deleg["target"] if self.deleg else None, self.target if self.mode == "direct" else None}
+        per_session = collections.Counter(p["session"] for p in panes)
+        for p in panes:
+            if not p["agent"] or p["session"] == CONCIERGE_SESSION:
+                continue
+            t, tr, ask = p["target"], trs.get(p["target"]), p.get("ask")
+            reply = tr.final_reply() if tr is not None else None
+            cur = (p["state"], reply[0] if reply else None, ask["toolCallId"] if ask else None)
+            prev, self.seen[t] = self.seen.get(t), cur
+            if prev is None or t in skip:
+                continue
+            name = p["session"] if per_session[p["session"]] == 1 else t
+            if cur[2] and cur[2] != prev[2]:
+                self.notice(t, "asking", f"{name} is asking: {ask_summary(ask)}")
+            elif (cur[0] == "idle" and prev[0] == "working" and cur[1] and cur[1] != prev[1]
+                  and reply[1] == "stop" and reply[2].strip()):
+                self.notice(t, "finished", f"{name} finished: {first_sentence(reply[2])}")
+
+    def tick_loop(self) -> None:
+        while not self.ended:
+            time.sleep(LIVE_TICK_S)
+            try:
+                now = time.monotonic()
+                with self.lock:
+                    gone = self.gone_at
+                    if self.ctx_probe is not None and now - self.ctx_probe >= LIVE_REJECT_S:
+                        self.ctx_ok, self.ctx_probe, self.ctx_pending = True, None, []
+                        log("live: session.context.append accepted")
+                if gone is not None and now - gone > LIVE_GONE_S:
+                    self.end(f"the phone was away for {LIVE_GONE_S:.0f} s")
+                    return
+                self.track()
+                self.flush_notices()
+            except Exception as ex:  # the call must survive anything a pane or file throws at it
+                log(f"live tick failed: {ex!r}")
+
+
 # ---------------------------------------------------------------- server
 
 def encode(msg: dict) -> bytes:
@@ -2399,7 +3430,7 @@ class Server:
         self.dest = dest
         self.seen = Seen(SEEN_FILE)
         self.deliver_lock = threading.Lock()
-        self.answer_lock = threading.Lock()
+        self.answer_lock = threading.RLock()  # queued phone answers hold it around answer_ask, which takes it too
         self.rev_lock = threading.Lock()
         self.rev = 0
         # client id -> last screen written to it {target, rev, lines, ...}, for `have` resume
@@ -2429,6 +3460,14 @@ class Server:
         # (client id, target) -> (session path, last reply id) of a voice subscription whose
         # connection ended, so a reconnecting phone still hears a reply it missed
         self.voice_left: dict[tuple[str, str], tuple[str | None, str | None, float]] = {}
+        # the one GPT Live call, and the routing a new call (or ddctl without a call) uses
+        self.live_lock = threading.Lock()
+        self.live: LiveSession | None = None
+        self.live_pref: dict = {"mode": "concierge", "target": None}
+        self.live_account: str | None = None  # ChatGPT account of the last accepted call
+        self.concierge_lock = threading.Lock()
+        self.ctl_path = CTL_SOCK
+        self.ctl_sock: socket.socket | None = None
         self.sock = socket.create_server(("0.0.0.0", port), reuse_port=False, backlog=16)
 
     def next_rev(self) -> int:
@@ -2451,6 +3490,15 @@ class Server:
 
     def close(self) -> None:
         self.sock.close()
+        live = self.live
+        if live is not None:
+            live.end("the PC daemon stopped")
+        if self.ctl_sock is not None:
+            self.ctl_sock.close()
+            try:
+                self.ctl_path.unlink()
+            except OSError:
+                pass
 
     # ------------------------------------------------------------ sessions poller
 
@@ -2467,7 +3515,7 @@ class Server:
     def poll_loop(self) -> None:
         while True:
             with self.ctl_cond:
-                self.ctl_cond.wait_for(lambda: self.controls)
+                self.ctl_cond.wait_for(lambda: self.controls or self.live is not None)
             self.poll_now.clear()
             try:
                 panes = self.list_panes()
@@ -2489,6 +3537,12 @@ class Server:
                 self.voice_tick(panes)
             except Exception as ex:
                 log(f"voice tick failed: {ex!r}")
+            live = self.live
+            if live is not None:
+                try:
+                    live.on_panes(panes, self.pane_trs)
+                except Exception as ex:
+                    log(f"live notices failed: {ex!r}")
             self.evict_transcripts()
             self.poll_now.wait(SESSIONS_POLL_S)
 
@@ -2659,6 +3713,342 @@ class Server:
     def cmd_lock(self, target: str) -> threading.Lock:
         with self.cmd_locks_lock:
             return self.cmd_locks.setdefault(target, threading.Lock())
+
+    def run_cmd(self, info: dict, name: str, arg) -> str | None:
+        """PaneCommand `name` on an omp pane, one at a time per pane; CmdFailed when refused."""
+        lock = self.cmd_lock(info["target"])
+        if not lock.acquire(timeout=CMD_QUEUE_S):
+            raise CmdFailed("another command is still running in that terminal")
+        try:
+            return PaneCommand(self, info, name, arg).run()
+        finally:
+            lock.release()
+            self.poll_now.set()
+
+    def pane_transcript(self, info: dict) -> Transcript | None:
+        path = breadcrumb_session(info["tty"], info["pid"])
+        return self.transcript(path) if path else None
+
+    def create_terminal(self, cwd: str | None = None, omp: bool = False) -> str:
+        """A fresh tmux session phone-N (lowest free N) running the default shell in `cwd` (home),
+        optionally starting omp in it; its pane target. RequestError on failure."""
+        with self.deliver_lock:  # two phones pressing "+ New" at once must not collide
+            r = tmux("list-sessions", "-F", "#{session_name}")
+            taken = set(r.stdout.decode(errors="replace").split()) if r.returncode == 0 else set()
+            n = 1
+            while f"phone-{n}" in taken:
+                n += 1
+            name = f"phone-{n}"
+            r = tmux("new-session", "-d", "-s", name, "-c", cwd or str(Path.home()))
+        if r.returncode != 0:
+            raise RequestError(f"new terminal: {tmux_error(r)}")
+        info = pane_info(name)
+        target = info["target"] if isinstance(info, dict) else name
+        if omp:
+            err = deliver_text("new-" + name, target, shlex.quote(omp_binary()), True)
+            if err:
+                raise RequestError(f"started {target} but could not start omp in it: {err}")
+        log(f"created terminal {target}" + (" with omp" if omp else ""))
+        self.poll_now.set()
+        return target
+
+    def answer_ask(self, target: str, call: str, answers) -> str | None:
+        """Answer omp's open question `call` in `target` with keys (see ask_keystrokes); None once
+        the session file records the answer, else the error."""
+        info = pane_info(target)
+        if isinstance(info, str):
+            raise RequestError(info)
+        tr = self.pane_transcript(info)
+        if tr is None:
+            return "no omp session in that terminal"
+        target = info["target"]
+        tr.refresh(force=True)
+        ask = tr.pending_ask()
+        if ask is None or ask["toolCallId"] != call:
+            if tr.has_result(call):
+                return "that question was already answered"
+            return "that question is no longer open"
+        batches = ask_keystrokes(ask["questions"], answers)
+        with self.answer_lock:
+            lines = visible_lines(target)
+            if lines is None:
+                return "cannot read the terminal"
+            if any(DRAFT_TRAP in ln for ln in lines):
+                return "the PC prompt has an unsent draft, so keys would go there: clear it on the PC first"
+            if last_box_top(lines).startswith(TEXT_BOX_MARKERS):
+                return "a text box is open in the question dialog on the PC: close it first"
+            for i, (kind, value) in enumerate(batches):
+                if i:
+                    box = kind == "text" or batches[i - 1][0] == "text"
+                    time.sleep(BOX_PAUSE_S if box else KEY_PAUSE_S)
+                if kind == "keys":
+                    r = tmux("send-keys", "-t", target, *value)
+                else:
+                    r = tmux("send-keys", "-t", target, "-l", "--", value)
+                if r.returncode != 0:
+                    return f"keys: {tmux_error(r)}"
+        deadline = time.monotonic() + ANSWER_WAIT_S
+        while time.monotonic() < deadline:
+            time.sleep(0.2)
+            tr.refresh(force=True)
+            if tr.has_result(call):
+                self.poll_now.set()
+                return None
+        lines = visible_lines(target) or []
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return "omp did not accept the answer; the PC screen shows:\n" + "\n".join(lines[-15:])
+
+    # ------------------------------------------------------------ live calls
+
+    def live_offer(self, ctl: Control, msg: dict) -> None:
+        """`live_offer {req, sdp, voice, mode, target?}`: a new call for this phone (replacing its
+        own running one); answered with `live_answer` or `error {req}` (see LiveSession)."""
+        req, sdp, voice = msg.get("req"), msg.get("sdp"), msg.get("voice") or LIVE_VOICE
+        mode = msg.get("mode") or self.live_pref["mode"]
+        target = msg.get("target") if mode == "direct" else None
+
+        def fail(error: str) -> None:
+            log(f"{ctl.peer}: live_offer refused: {error}")
+            ctl.push({"t": "error", "req": req, "error": error})
+            ctl.push({"t": "live", "phase": "error", "mode": mode, "error": error})
+
+        if not isinstance(req, str) or not req or not isinstance(sdp, str) or not sdp.strip():
+            fail("live_offer needs a req and an sdp")
+            return
+        if voice not in LIVE_VOICES:
+            fail(f"unknown voice {voice!r}; one of {', '.join(LIVE_VOICES)}")
+            return
+        if mode not in LIVE_MODES:
+            fail("mode must be concierge or direct")
+            return
+        if mode == "direct":
+            info = pane_info(target) if isinstance(target, str) and target else "direct mode needs a target"
+            if isinstance(info, str):
+                fail(f"terminal {target}: {info}" if target else info)
+                return
+            if not info["agent"]:
+                fail(f"terminal {info['target']} is not running omp")
+                return
+            target = info["target"]
+        with self.live_lock:
+            old = self.live
+            if old is not None and old.ctl is not ctl and not (ctl.client and old.client == ctl.client):
+                live = None
+            else:
+                live = self.live = LiveSession(self, ctl, req, sdp, voice, mode, target)
+                self.live_pref = {"mode": mode, "target": target}
+        if live is None:
+            fail("a live call is already running on another device; end it there first")
+            return
+        if old is not None:
+            old.end(notify=False)  # the phone replaced it itself
+        with self.ctl_cond:
+            self.ctl_cond.notify_all()  # the poller runs while a call does (notices)
+        log(f"{ctl.peer}: live_offer ({mode}{' ' + target if target else ''}, voice {voice})")
+        live.push(live.state())
+        threading.Thread(target=live.run, daemon=True).start()
+
+    def live_mode(self, mode, target) -> dict:
+        """Route the call's delegations to the concierge or straight to an omp terminal (also the
+        default for the next call); {mode, target, active}."""
+        if mode not in LIVE_MODES:
+            raise RequestError("mode must be concierge or direct")
+        if mode == "direct":
+            if not isinstance(target, str) or not target:
+                raise RequestError("direct mode needs a terminal")
+            info = pane_info(target)
+            if isinstance(info, str):
+                raise RequestError(f"terminal {target}: {info}")
+            if not info["agent"]:
+                raise RequestError(f"terminal {info['target']} is not running omp")
+            target = info["target"]
+        else:
+            target = None
+        with self.live_lock:
+            live = self.live
+            self.live_pref = {"mode": mode, "target": target}
+        if live is not None:
+            if mode == "concierge":
+                try:
+                    self.concierge(start=True)
+                except LiveError as ex:
+                    raise RequestError(str(ex)) from None
+            live.set_mode(mode, target)
+            log(f"live: routing to {target or 'the concierge'}")
+        return {"mode": mode, "target": target, "active": live is not None}
+
+    def live_stop(self, ctl: Control) -> None:
+        live = self.live
+        if live is not None and (live.ctl is ctl or (ctl.client and live.client == ctl.client)):
+            live.end()
+
+    def live_attached(self, ctl: Control) -> None:
+        """A (re)connected phone takes its call back: the call's state goes to it again."""
+        live = self.live
+        if live is not None and ctl.client and live.client == ctl.client:
+            with live.lock:
+                live.ctl, live.gone_at = ctl, None
+            ctl.push(live.state())
+
+    def live_detached(self, ctl: Control) -> None:
+        """The phone's last connection went: the call ends LIVE_GONE_S later unless it is back."""
+        live = self.live
+        if live is None or not (live.ctl is ctl or (ctl.client and live.client == ctl.client)):
+            return
+        with self.ctl_cond:
+            back = bool(live.client) and any(c.client == live.client for c in self.controls)
+        if not back:
+            with live.lock:
+                live.gone_at = time.monotonic()
+            log(f"live: phone gone; the call ends in {LIVE_GONE_S:.0f} s unless it reconnects")
+
+    def concierge(self, start: bool, wait: bool = False) -> str:
+        """Pane target of the concierge omp (tmux session CONCIERGE_SESSION; started first when
+        missing and `start`); with `wait`, only once omp runs in it."""
+        name = f"={CONCIERGE_SESSION}:"
+        with self.concierge_lock:
+            if tmux("has-session", "-t", f"={CONCIERGE_SESSION}").returncode != 0:
+                if not start:
+                    raise LiveError("the concierge is not running")
+                err = start_concierge(self.ctl_path)
+                if err:
+                    raise LiveError(f"cannot start the concierge: {err}")
+                self.poll_now.set()
+        deadline = time.monotonic() + (CONCIERGE_READY_S if wait else 0.0)
+        while True:
+            info = pane_info(name)
+            if isinstance(info, dict) and (info["agent"] or not wait):
+                return info["target"]
+            if time.monotonic() > deadline:
+                raise LiveError(f"the concierge: {info}" if isinstance(info, str) else "the concierge's omp did not start")
+            time.sleep(0.3)
+
+    # ------------------------------------------------------------ local control socket (ddctl)
+
+    def ctl_serve(self, path: Path) -> None:
+        """Listen on the Unix socket `path` (0600, peers checked to be this user) for ddctl:
+        one JSON request line, one JSON reply line {ok, error?, ...}, then close."""
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        old = os.umask(0o177)
+        try:
+            sock.bind(str(path))
+        finally:
+            os.umask(old)
+        sock.listen(8)
+        self.ctl_path, self.ctl_sock = path, sock
+        threading.Thread(target=self.ctl_accept, args=(sock,), daemon=True).start()
+
+    def ctl_accept(self, sock: socket.socket) -> None:
+        while True:
+            try:
+                conn, _ = sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.ctl_handle, args=(conn,), daemon=True).start()
+
+    def ctl_handle(self, conn: socket.socket) -> None:
+        with conn:
+            try:
+                _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                                                 struct.calcsize("3i")))
+                if uid != os.getuid():
+                    log(f"ctl: refused uid {uid}")
+                    return
+                conn.settimeout(10)
+                with conn.makefile("rb") as rf:
+                    line = rf.readline(MAX_LINE)
+                try:
+                    req = json.loads(line)
+                    if not isinstance(req, dict):
+                        raise ValueError("not an object")
+                except ValueError as ex:
+                    reply = {"ok": False, "error": f"bad json: {ex}"}
+                else:
+                    reply = self.ctl_reply(req)
+                conn.sendall(encode(reply))
+            except OSError as ex:
+                log(f"ctl: {ex}")
+
+    def ctl_reply(self, req: dict) -> dict:
+        try:
+            return {"ok": True, **self.ctl_request(req)}
+        except (RequestError, CmdFailed) as ex:
+            return {"ok": False, "error": str(ex)}
+        except StaleFile:
+            return {"ok": False, "error": "the session file changed; try again"}
+        except Exception as ex:
+            log(f"ctl: {req.get('cmd')} failed: {ex!r}")
+            return {"ok": False, "error": f"internal error: {ex}"}
+
+    def ctl_target(self, raw) -> dict:
+        """pane_info of a terminal named by ddctl ("sess:win.pane", or "sess"/"sess:win" for its
+        active pane)."""
+        if not isinstance(raw, str) or not raw.strip():
+            raise RequestError("no terminal given")
+        info = pane_info(raw.strip())
+        if isinstance(info, str):
+            names = ", ".join(p["target"] for p in self.list_panes()) or "none"
+            raise RequestError(f"no terminal {raw!r}; terminals: {names}")
+        return info
+
+    def ctl_request(self, req: dict) -> dict:
+        cmd = req.get("cmd")
+        if cmd == "terminals":
+            return {"terminals": self.list_panes()}
+        if cmd == "live":
+            return self.live_mode(req.get("mode"), req.get("target"))
+        if cmd == "new":
+            cwd = req.get("cwd")
+            if cwd is not None and not (isinstance(cwd, str) and os.path.isabs(cwd) and os.path.isdir(cwd)):
+                raise RequestError(f"not a directory: {cwd}")
+            return {"target": self.create_terminal(cwd, omp=req.get("omp") is True)}
+        if cmd not in ("status", "last", "send", "queue", "stop", "model", "effort", "ask", "answer"):
+            raise RequestError(f"unknown command {cmd!r}")
+        info = self.ctl_target(req.get("target"))
+        target = info["target"]
+        tr = self.pane_transcript(info) if info["agent"] else None
+        if tr is not None:
+            tr.refresh(force=True)
+        if cmd == "status":
+            pane = next((p for p in self.list_panes() if p["target"] == target), None)
+            st = tr.status_info() if tr is not None and tr.exists else {"lastUser": None, "lastAssistant": None, "tools": []}
+            return {"pane": pane, **st, "ask": tr.pending_ask() if tr is not None else None}
+        if cmd == "last":
+            reply = tr.final_reply() if tr is not None else None
+            return {"text": reply[2] if reply else None, "id": reply[0] if reply else None}
+        if cmd == "ask":
+            return {"ask": tr.pending_ask() if tr is not None else None}
+        if cmd == "answer":
+            ask = tr.pending_ask() if tr is not None else None
+            if ask is None:
+                raise RequestError(f"{target} has no open question")
+            err = self.answer_ask(target, ask["toolCallId"], req.get("answers"))
+            if err:
+                raise RequestError(err)
+            return {}
+        if cmd == "send":
+            text = req.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise RequestError("nothing to send")
+            if info["agent"]:
+                if tr is not None and tr.pending_ask() is not None:
+                    raise RequestError(f"{target} is asking a question; answer it first (ask/answer)")
+                text = send_rewrite(text)
+            err = deliver_text("ctl-" + secrets.token_hex(4), target, text, True)
+            if err:
+                raise RequestError(err)
+            self.poll_now.set()
+            return {"result": "steered" if info["working"] else "sent"}
+        name, arg = {"queue": ("queue", req.get("text")), "stop": ("stop", None),
+                     "model": ("switch", req.get("selector")), "effort": ("effort", req.get("level"))}[cmd]
+        result = self.run_cmd(info, name, arg)
+        return {"result": result} if result else {}
 
     # ------------------------------------------------------------ connections
 
@@ -3154,10 +4544,12 @@ class Control:
         writer = threading.Thread(target=self.write_loop, daemon=True)
         writer.start()
         self.server.attach(self)
+        self.server.live_attached(self)
         try:
             self.read_loop()
         finally:
             self.server.detach(self)
+            self.server.live_detached(self)
             with self.cond:
                 self.closed = True
                 self.cond.notify()
@@ -3238,6 +4630,15 @@ class Control:
             self.do_voice(msg)
         elif kind == "say":
             self.do_say(msg)
+        elif kind == "live_offer":
+            self.server.live_offer(self, msg)
+        elif kind == "live_mode":
+            try:
+                self.server.live_mode(msg.get("mode"), msg.get("target"))
+            except RequestError as ex:
+                self.push({"t": "error", "error": f"live_mode: {ex}"})
+        elif kind == "live_stop":
+            self.server.live_stop(self)
         elif kind == "say_stop":
             req = msg.get("req")
             self.stop_utterances(lambda u: u.req == req if isinstance(req, str) else True)
@@ -3282,14 +4683,7 @@ class Control:
         if info["agent"]:
             if enter and not text.strip() and info["working"]:
                 return "An empty Enter would stop the agent; use Stop"
-            # omp sends commands with arguments they do not take to the model as a prompt.
-            line = text.strip()
-            if "\n" not in line:
-                for rx, repl in SEND_REWRITES:
-                    m = rx.match(line)
-                    if m:
-                        text = repl + m.group(1)
-                        break
+            text = send_rewrite(text)
         return deliver_text(msg["id"], target, text, enter)
 
     def do_clip(self, msg: dict) -> str | None:
@@ -3302,62 +4696,18 @@ class Control:
         target, call = msg.get("target"), msg.get("toolCallId")
         if not isinstance(target, str) or not target or not isinstance(call, str) or not call:
             return "answer needs a target and a toolCallId"
-        tr = self.transcript_of(target)
-        if tr is None:
-            return "no omp session in that terminal"
-        tr.refresh(force=True)
-        ask = tr.pending_ask()
-        if ask is None or ask["toolCallId"] != call:
-            if tr.has_result(call):
-                return "that question was already answered"
-            return "that question is no longer open"
-        batches = ask_keystrokes(ask["questions"], msg.get("answers"))
-        lines = visible_lines(target)
-        if lines is None:
-            return "cannot read the terminal"
-        if any(DRAFT_TRAP in ln for ln in lines):
-            return "the PC prompt has an unsent draft, so keys would go there: clear it on the PC first"
-        if last_box_top(lines).startswith(TEXT_BOX_MARKERS):
-            return "a text box is open in the question dialog on the PC: close it first"
-        for i, (kind, value) in enumerate(batches):
-            if i:
-                box = kind == "text" or batches[i - 1][0] == "text"
-                time.sleep(BOX_PAUSE_S if box else KEY_PAUSE_S)
-            if kind == "keys":
-                r = tmux("send-keys", "-t", target, *value)
-            else:
-                r = tmux("send-keys", "-t", target, "-l", "--", value)
-            if r.returncode != 0:
-                return f"keys: {tmux_error(r)}"
-        deadline = time.monotonic() + ANSWER_WAIT_S
-        while time.monotonic() < deadline:
-            time.sleep(0.2)
-            tr.refresh(force=True)
-            if tr.has_result(call):
-                self.kick()
-                self.server.poll_now.set()
-                return None
-        lines = visible_lines(target) or []
-        while lines and not lines[-1].strip():
-            lines.pop()
-        return "omp did not accept the answer; the PC screen shows:\n" + "\n".join(lines[-15:])
+        err = self.server.answer_ask(target, call, msg.get("answers"))
+        if err is None:
+            self.kick()
+        return err
 
     def new_terminal(self) -> None:
         """A fresh tmux session phone-N (lowest free N) running the default shell, watched now."""
-        with self.server.deliver_lock:  # two phones pressing "+ New" at once must not collide
-            r = tmux("list-sessions", "-F", "#{session_name}")
-            taken = set(r.stdout.decode(errors="replace").split()) if r.returncode == 0 else set()
-            n = 1
-            while f"phone-{n}" in taken:
-                n += 1
-            name = f"phone-{n}"
-            r = tmux("new-session", "-d", "-s", name, "-c", str(Path.home()))
-        if r.returncode != 0:
-            self.push({"t": "error", "error": f"new terminal: {tmux_error(r)}"})
+        try:
+            target = self.server.create_terminal()
+        except RequestError as ex:
+            self.push({"t": "error", "error": str(ex)})
             return
-        info = pane_info(name)
-        target = info["target"] if isinstance(info, dict) else name
-        log(f"{self.peer}: created terminal {target}")
         self.push({"t": "created", "target": target})
         with self.cond:
             self.target, self.view, self.force = target, "term", True
@@ -3679,11 +5029,8 @@ class Control:
         info = pane_info(target)
         if isinstance(info, str):
             return {"t": "cmd", "ok": False, "error": info}
-        lock = self.server.cmd_lock(info["target"])
-        if not lock.acquire(timeout=CMD_QUEUE_S):
-            return {"t": "cmd", "ok": False, "error": "another command is still running in that terminal"}
         try:
-            result = PaneCommand(self.server, info, name, msg.get("arg")).run()
+            result = self.server.run_cmd(info, name, msg.get("arg"))
             reply = {"t": "cmd", "ok": True}
             if result:
                 reply["info"] = result
@@ -3691,9 +5038,6 @@ class Control:
         except CmdFailed as ex:
             reply = {"t": "cmd", "ok": False, "error": str(ex)}
             log(f"{self.peer}: cmd {name} on {info['target']} failed: {str(ex).splitlines()[0]}")
-        finally:
-            lock.release()
-        self.server.poll_now.set()
         if name == "page":
             self.poke_page()
         return reply
@@ -3891,6 +5235,11 @@ def cmd_serve(args) -> None:
     if not load_token():
         sys.exit(f"no token at {TOKEN_FILE}; run: {sys.argv[0]}{f' --instance {INSTANCE}' if INSTANCE else ''} pair")
     server = Server(args.port, Path(args.dest).expanduser())
+    ctl = Path(args.ctl).expanduser() if args.ctl else CTL_SOCK
+    try:
+        server.ctl_serve(ctl)
+    except OSError as ex:
+        log(f"no local control socket ({ctl}): {ex}")
 
     def on_signal(*_):
         raise KeyboardInterrupt
@@ -4023,6 +5372,8 @@ def main() -> None:
                          "and port; env DEVDECK_INSTANCE)")
     sub = ap.add_subparsers(dest="cmd")
     p_serve = sub.add_parser("serve", help="run the daemon (default)")
+    p_serve.add_argument("--ctl", metavar="PATH", help="local control socket for ddctl (default "
+                                                       "<state dir>/ctl.sock)")
     p_pair = sub.add_parser("pair", help="install the app on the phone via adb and pair it")
     p_pair.add_argument("-s", "--serial", help="adb serial (default: the only device, else "
                                                f"{DEFAULT_SERIAL})")

@@ -17,6 +17,10 @@ interface DDBridge {
   stopListening?(): void;
   stopSpeaking?(): void;
   setVoiceMode?(on: boolean): void;
+  // live (GPT Live call; absent on older shells)
+  liveStart?(json: string): void;
+  liveStop?(): void;
+  liveMute?(on: boolean): void;
 }
 
 const noop = () => {};
@@ -71,6 +75,10 @@ export const bridge = {
   stopSpeaking: () => dd().stopSpeaking?.(),
   setVoiceMode: (on: boolean) => dd().setVoiceMode?.(on),
   backResult: (handled: boolean) => dd().backResult?.(handled),
+  hasLive: () => typeof dd().liveStart === "function",
+  liveStart: (opts: { voice: string; mode: string; target?: string }) => dd().liveStart?.(JSON.stringify(opts)),
+  liveStop: () => dd().liveStop?.(),
+  liveMute: (on: boolean) => dd().liveMute?.(on),
 };
 
 type Pending = { resolve: (m: Msg) => void; reject: (e: Error) => void; timer: number };

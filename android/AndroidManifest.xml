@@ -12,8 +12,13 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.VIBRATE" />
-    <!-- Voice mode: requested at runtime on the first DD.listen. -->
+    <!-- Voice mode and Live: requested at runtime on the first DD.listen / DD.liveStart. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Live: call audio mode, speakerphone and Bluetooth headset (SCO) routing. Targeting API 30,
+         the legacy BLUETOOTH permission covers SCO; BLUETOOTH_CONNECT is only enforced from 31. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
     <!-- No SCHEDULE_EXACT_ALARM: setExactAndAllowWhileIdle needs it only when targeting API 31+. -->
 
     <!-- Package visibility (API 30): SpeechRecognizer must see the system recognition service. -->
@@ -64,6 +69,11 @@
         <service
             android:name=".LinkService"
             android:exported="false" />
+        <!-- GPT Live call: started only while the app is visible, keeps the microphone with the screen off. -->
+        <service
+            android:name=".LiveService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
         <receiver
             android:name=".PingReceiver"
             android:exported="false" />
