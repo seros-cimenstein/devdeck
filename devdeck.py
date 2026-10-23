@@ -3042,7 +3042,15 @@ def cmd_pair(args) -> None:
     if not hosts:
         sys.exit("no usable IPv4 address on this PC")
     print(f"installing app on {serial}...")
-    subprocess.run(adb + ["install", "-r", str(APK)], check=True, stdout=subprocess.DEVNULL)
+    # Copy first, then install on the phone: over a slow relay a streamed `adb install` takes
+    # long enough for the screen to lock, and Play Protect rejects installs while locked.
+    remote = f"/data/local/tmp/{APK.name}"
+    subprocess.run(adb + ["push", str(APK), remote], check=True, stdout=subprocess.DEVNULL)
+    r = subprocess.run(adb + ["shell", f"pm install -r {remote}; rc=$?; rm -f {remote}; exit $rc"],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or "Success" not in r.stdout:
+        sys.exit(f"install failed: {(r.stdout + r.stderr).strip()} "
+                 "(unlock the phone; if Play Protect asks, choose 'Install anyway', then retry)")
     # Notifications (question asked / turn finished), and keep Doze from cutting the app's
     # network while the screen is off.
     subprocess.run(adb + ["shell", "pm", "grant", APP_PACKAGE, "android.permission.POST_NOTIFICATIONS"],
