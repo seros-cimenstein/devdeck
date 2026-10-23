@@ -3,6 +3,8 @@ import { h, icon } from "./util";
 
 export interface Layer {
   close(): void;
+  /** Optional in-layer back step (e.g. a sub-page); true when handled, so the layer stays. */
+  back?(): boolean;
 }
 const layers: Layer[] = [];
 
@@ -14,10 +16,12 @@ export function removeLayer(l: Layer) {
   const i = layers.indexOf(l);
   if (i >= 0) layers.splice(i, 1);
 }
-/** Closes the topmost layer; false when nothing was open. */
+/** Hardware back: an in-layer step of the topmost layer, else closes it; false when nothing was open. */
 export function popLayer(): boolean {
-  const l = layers.pop();
+  const l = layers.at(-1);
   if (!l) return false;
+  if (l.back?.()) return true;
+  layers.pop();
   l.close();
   return true;
 }
@@ -165,6 +169,7 @@ export class Sheet implements Layer {
   readonly foot: HTMLElement;
   isOpen = true;
   onClose?: () => void;
+  onBack?: () => boolean;
 
   constructor(title: string, sub = "", cls = "") {
     this.titleEl = h("div.sheet-title", { text: title });
@@ -202,6 +207,10 @@ export class Sheet implements Layer {
   setSub(sub: string) {
     this.subEl.textContent = sub;
     this.subEl.hidden = !sub;
+  }
+
+  back(): boolean {
+    return this.onBack?.() ?? false;
   }
 
   close() {

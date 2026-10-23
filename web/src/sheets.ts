@@ -45,6 +45,23 @@ function parseRoles(d: ModelsData, find: (sel: string) => ModelInfo | undefined)
   return [...out.values()].sort((a, b) => Number(b.roles.includes("default")) - Number(a.roles.includes("default")) || b.roles.length - a.roles.length);
 }
 
+const PROVIDER_NAMES: Record<string, string> = {
+  anthropic: "Anthropic",
+  "openai-codex": "OpenAI Codex",
+  openai: "OpenAI",
+  "github-copilot": "GitHub Copilot",
+  "google-antigravity": "Google Antigravity",
+  google: "Google",
+  nvidia: "NVIDIA",
+  "opencode-go": "OpenCode Go",
+  xai: "xAI",
+  openrouter: "OpenRouter",
+};
+
+function providerName(p: string): string {
+  return PROVIDER_NAMES[p] ?? p.split(/[-_]/).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+}
+
 /** Quick session-only model switch (mode "model") or thinking-level change (mode "effort"). */
 export function openModelSheet(mode: "model" | "effort") {
   const p = currentPane();
@@ -61,8 +78,11 @@ class ModelSheet {
   private readonly footMain = h("div.ms-foot");
   private readonly applyBtn = h("button.btn.primary.wide") as HTMLButtonElement;
   private readonly statusEl = h("div.ms-status", { hidden: true });
-  private rows: { el: HTMLElement; m: ModelInfo; hay: string }[] = [];
-  private groups: { el: HTMLElement; rows: HTMLElement[]; count: HTMLElement }[] = [];
+  private rows: { el: HTMLElement; m: ModelInfo }[] = [];
+  private data: ModelsData | undefined;
+  private cur: ModelInfo | undefined;
+  /** "" = the provider menu; otherwise the provider whose models are shown. */
+  private view = "";
   private sel: ModelInfo | undefined;
   private level = "";
   private fast = false;
@@ -88,7 +108,7 @@ class ModelSheet {
         h("span", { text: "Open omp's full model page (roles, defaults)" }),
         h("span.icw", { html: icon("chev") }),
       );
-      this.search.addEventListener("input", () => this.filter());
+      this.search.addEventListener("input", () => this.render());
       this.s.body.append(h("div.ms-top", null, h("div.ms-search", null, h("span.icw", { html: icon("search") }), this.search)), this.rolesEl, link, this.list);
     }
     this.s.foot.hidden = false;
@@ -96,6 +116,7 @@ class ModelSheet {
     this.applyBtn.addEventListener("click", () => void this.apply());
     this.offModels = onModels((d) => this.load(d));
     this.s.onClose = () => this.offModels();
+    this.s.onBack = () => this.back();
 
     const o = this.omp();
     this.fast = !!o?.fast;
@@ -127,89 +148,136 @@ class ModelSheet {
       this.sel = cur;
       this.level = pickLevel(levelsFor(cur), o?.thinking);
     }
-    if (this.mode === "model") this.renderList(d, cur);
+    if (this.mode === "model") {
+      this.data = d;
+      this.cur = cur;
+      this.render();
+    }
     this.renderFoot();
   }
 
-  private renderList(d: ModelsData, cur: ModelInfo | undefined) {
+  private modelRow(m: ModelInfo): HTMLElement {
+    const isCur = m.selector === this.cur?.selector;
+    const el = h(
+      `button.ms-row${isCur ? ".cur" : ""}${m.selector === this.sel?.selector ? ".sel" : ""}`,
+      { "data-sel": m.selector },
+      h("span.ms-main", null, h("span.ms-name", { text: m.name }), h("span.ms-id", { text: m.id })),
+      m.contextWindow ? h("span.ms-ctx", { text: fmtTokens(m.contextWindow) }) : null,
+      isCur ? h("span.ms-cur", { text: "Current" }) : null,
+    );
+    el.addEventListener("click", () => this.select(m));
+    this.rows.push({ el, m });
+    return el;
+  }
+
+  private renderRoles(d: ModelsData) {
     const find = (s: string) => d.models.find((m) => m.selector === s);
     this.rolesEl.textContent = "";
     const roles = parseRoles(d, find);
-    if (roles.length) {
-      const row = h("div.ms-chips");
-      for (const r of roles) {
-        const chip = h(
-          `button.ms-chip${r.model.selector === cur?.selector ? ".cur" : ""}`,
-          { "data-sel": r.model.selector },
-          h("span.ms-chip-n", { text: shortName(r.model.name) + (r.level ? ` · ${r.level}` : "") }),
-          h("span.ms-chip-r", { text: r.roles.join(", ") }),
-        );
-        chip.addEventListener("click", () => this.select(r.model, r.level || undefined));
-        row.append(chip);
-      }
-      this.rolesEl.append(h("div.ms-sec", { text: "Roles" }), row);
+    if (!roles.length) return;
+    const row = h("div.ms-chips");
+    for (const r of roles) {
+      const chip = h(
+        `button.ms-chip${r.model.selector === this.cur?.selector ? ".cur" : ""}`,
+        { "data-sel": r.model.selector },
+        h("span.ms-chip-n", { text: shortName(r.model.name) + (r.level ? ` · ${r.level}` : "") }),
+        h("span.ms-chip-r", { text: r.roles.join(", ") }),
+      );
+      chip.addEventListener("click", () => this.select(r.model, r.level || undefined));
+      row.append(chip);
     }
+    this.rolesEl.append(h("div.ms-sec", { text: "Roles" }), row);
+  }
 
+  /** Provider menu, one provider's models, or (while searching) matches from every provider. */
+  private render() {
+    const d = this.data;
+    if (!d) return;
     const byProvider = new Map<string, ModelInfo[]>();
     for (const m of d.models) {
       const l = byProvider.get(m.provider);
       if (l) l.push(m);
       else byProvider.set(m.provider, [m]);
     }
-    const providers = [...byProvider.keys()];
-    if (cur) providers.sort((a, b) => Number(b === cur.provider) - Number(a === cur.provider));
-    const frag = document.createDocumentFragment();
+    const curProv = this.cur?.provider;
+    const providers = [...byProvider.keys()].sort(
+      (a, b) => Number(b === curProv) - Number(a === curProv) || providerName(a).localeCompare(providerName(b)),
+    );
+    if (this.view && !byProvider.has(this.view)) this.view = "";
+    const terms = this.search.value.toLowerCase().split(/\s+/).filter(Boolean);
     this.rows = [];
-    this.groups = [];
-    for (const prov of providers) {
-      const models = byProvider.get(prov)!;
-      const count = h("span.count", { text: String(models.length) });
-      const g = h("section.ms-group", null, h("div.ms-sec", null, h("span", { text: prov }), count));
-      const gRows: HTMLElement[] = [];
-      for (const m of models) {
-        const isCur = m.selector === cur?.selector;
-        const el = h(
-          `button.ms-row${isCur ? ".cur" : ""}${m.selector === this.sel?.selector ? ".sel" : ""}`,
-          { "data-sel": m.selector },
-          h("span.ms-main", null, h("span.ms-name", { text: m.name }), h("span.ms-id", { text: m.id })),
-          m.contextWindow ? h("span.ms-ctx", { text: fmtTokens(m.contextWindow) }) : null,
-          isCur ? h("span.ms-cur", { text: "Current" }) : null,
-        );
-        el.addEventListener("click", () => this.select(m));
-        this.rows.push({ el, m, hay: `${m.name} ${m.id} ${m.provider}`.toLowerCase() });
-        gRows.push(el);
-        g.append(el);
+    const frag = document.createDocumentFragment();
+    this.rolesEl.hidden = terms.length > 0 || !!this.view;
+    if (!this.rolesEl.hidden) this.renderRoles(d);
+
+    if (terms.length) {
+      let any = false;
+      for (const prov of providers) {
+        const hits = byProvider.get(prov)!.filter((m) => {
+          const hay = `${m.name} ${m.id} ${m.provider} ${providerName(m.provider)}`.toLowerCase();
+          return terms.every((t) => hay.includes(t));
+        });
+        if (!hits.length) continue;
+        any = true;
+        const g = h("section.ms-group", null, h("div.ms-sec", null, h("span", { text: providerName(prov) }), h("span.count", { text: String(hits.length) })));
+        for (const m of hits) g.append(this.modelRow(m));
+        frag.append(g);
       }
-      this.groups.push({ el: g, rows: gRows, count });
-      frag.append(g);
+      if (!any) frag.append(h("div.empty.ms-none", { text: "No models match" }));
+    } else if (!this.view) {
+      frag.append(h("div.ms-sec", { text: "Providers" }));
+      for (const prov of providers) {
+        const models = byProvider.get(prov)!;
+        const holdsSel = !!this.sel && this.sel.provider === prov;
+        const el = h(
+          `button.ms-row.ms-prov${holdsSel ? ".sel" : ""}`,
+          null,
+          h("span.ms-main", null, h("span.ms-name", { text: providerName(prov) }), h("span.ms-id", { text: prov })),
+          prov === curProv ? h("span.ms-cur", { text: "Current" }) : null,
+          h("span.ms-ctx", { text: `${models.length} model${models.length === 1 ? "" : "s"}` }),
+          h("span.icw", { html: icon("chev") }),
+        );
+        el.addEventListener("click", () => {
+          this.view = prov;
+          this.render();
+          this.list.scrollTop = 0;
+        });
+        frag.append(el);
+      }
+    } else {
+      const models = byProvider.get(this.view)!;
+      const back = h(
+        "button.ms-back",
+        null,
+        h("span.ms-back-ic", { text: "\u2039" }),
+        h("span", { text: "All providers" }),
+      );
+      back.addEventListener("click", () => {
+        this.view = "";
+        this.render();
+      });
+      frag.append(back, h("div.ms-sec", null, h("span", { text: providerName(this.view) }), h("span.count", { text: String(models.length) })));
+      for (const m of models) frag.append(this.modelRow(m));
     }
     this.list.textContent = "";
-    this.list.append(frag, h("div.empty.ms-none", { text: "No models match", hidden: true }));
-    this.filter();
-    const selEl = this.list.querySelector<HTMLElement>(".ms-row.sel");
-    if (selEl && !this.search.value) requestAnimationFrame(() => selEl.scrollIntoView({ block: "center" }));
+    this.list.append(frag);
+    const selEl = this.list.querySelector<HTMLElement>(".ms-row.sel:not(.ms-prov)");
+    if (selEl && !terms.length) requestAnimationFrame(() => selEl.scrollIntoView({ block: "center" }));
   }
 
-  private filter() {
-    const terms = this.search.value.toLowerCase().split(/\s+/).filter(Boolean);
-    let any = false;
-    for (const r of this.rows) r.el.hidden = !terms.every((t) => r.hay.includes(t));
-    for (const g of this.groups) {
-      const vis = g.rows.reduce((n, r) => n + Number(!r.hidden), 0);
-      g.el.hidden = !vis;
-      g.count.textContent = String(vis);
-      any ||= vis > 0;
-    }
-    this.rolesEl.hidden = terms.length > 0;
-    const none = this.list.querySelector<HTMLElement>(".ms-none");
-    if (none) none.hidden = any || !this.rows.length;
+  /** Back inside the sheet: from a provider's models to the provider menu. */
+  private back(): boolean {
+    if (!this.view || this.search.value) return false;
+    this.view = "";
+    this.render();
+    return true;
   }
 
   private select(m: ModelInfo, level?: string) {
     this.sel = m;
     const levels = levelsFor(m);
     this.level = pickLevel(levels, level ?? (this.level || this.omp()?.thinking));
-    for (const r of this.rows) r.el.classList.toggle("sel", r.m === m || r.m.selector === m.selector);
+    for (const r of this.rows) r.el.classList.toggle("sel", r.m.selector === m.selector);
     this.renderFoot();
   }
 

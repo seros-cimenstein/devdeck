@@ -131,7 +131,7 @@ OPUS_BITRATE = "24k"
 SPOKEN_CAP = 2500         # characters of spoken text per reply; then "The rest is on screen."
 SENTENCE_MIN = 25         # shorter sentences are merged with the next one
 SENTENCE_MAX = 280        # Kokoro reads at most ~510 phonemes per call; longer ones are split
-FIRST_MAX = 80            # the first one is split at a comma beyond this, so speech starts sooner
+FIRST_MAX = 50            # the first one is split (comma, else a space) beyond this, so speech starts sooner
 AUDIO_CACHE_S = 30 * 60.0
 AUDIO_CACHE_BYTES = 50 << 20
 TTS_IDLE_S = 600.0        # the worker (model in RAM, ~0.9 GB with fp32 weights) exits after this long unused
@@ -1996,9 +1996,11 @@ def split_sentences(text: str) -> list[str]:
     if len(out) > 1 and len(out[-1]) < SENTENCE_MIN and len(out[-2]) + 1 + len(out[-1]) <= SENTENCE_MAX:
         out[-2] += " " + out.pop()
     if out and len(out[0]) > FIRST_MAX:
-        cut = max(out[0].rfind(sep, SENTENCE_MIN, FIRST_MAX) for sep in (", ", "; ", ": ", " - "))
+        cut = max(out[0].rfind(sep, SENTENCE_MIN, FIRST_MAX) for sep in (". ", "! ", "? ", ", ", "; ", ": ", " - "))
+        if cut <= 0:
+            cut = out[0].rfind(" ", SENTENCE_MIN, FIRST_MAX)
         if cut > 0 and len(out[0]) - cut > SENTENCE_MIN:
-            out[0:1] = [out[0][:cut + 1], out[0][cut + 1:].strip()]
+            out[0:1] = [out[0][:cut + 1].strip(), out[0][cut + 1:].strip()]
     return out
 
 

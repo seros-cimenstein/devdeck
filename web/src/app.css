@@ -486,6 +486,10 @@ details.card > .md { padding: 0 14px 10px; font-size: 14px; }
 .ms-id { font: 11.5px var(--mono); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ms-ctx { flex: none; font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .ms-cur { flex: none; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--accent); }
+.ms-prov .icw { flex: none; color: var(--muted); }
+.ms-prov .icw .ic { width: 16px; height: 16px; }
+.ms-back { display: flex; align-items: center; gap: 6px; padding: 8px 4px 2px; color: var(--accent); font-size: 14px; font-weight: 550; }
+.ms-back-ic { font-size: 22px; line-height: 1; margin-top: -2px; }
 .ms-foot { display: flex; flex-direction: column; gap: 6px; }
 .ms-pick { font-size: 13.5px; color: var(--muted); }
 .ms-selrow { display: flex; align-items: center; gap: 10px; }
