@@ -71,7 +71,6 @@ pre, code { font-family: var(--mono); font-variant-ligatures: none; }
 .main { position: relative; flex: 1; min-height: 0; }
 .view { position: absolute; inset: 0; display: none; flex-direction: column; }
 .main.view-chat .chat-view, .main.view-term .term-view { display: flex; }
-.view.stale::after { content: "Cached"; position: absolute; top: 8px; left: 50%; transform: translateX(-50%); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); background: var(--surface2); border: 1px solid var(--border); padding: 2px 10px; border-radius: 999px; pointer-events: none; }
 
 /* ------------------------------------------------------------------ top bar */
 .topbar { flex: none; background: var(--bg); border-bottom: 1px solid var(--border); position: relative; z-index: 5; }
@@ -220,11 +219,13 @@ details.card > .md { padding: 0 14px 10px; font-size: 14px; }
 .code pre { margin: 0; padding: 10px 12px; overflow-x: auto; font-size: 12.5px; line-height: 1.5; -webkit-overflow-scrolling: touch; }
 .katex-block, .md .katex-display { overflow-x: auto; overflow-y: hidden; padding: 4px 0; margin: .6em 0; }
 .katex { font-size: 1.08em; }
-.diagram { margin: .8em 0; padding: 12px; border-radius: 12px; background: var(--surface); border: 1px solid var(--border); overflow-x: auto; min-height: 60px; }
+.diagram { position: relative; margin: .8em 0; padding: 12px; border-radius: 12px; background: var(--surface); border: 1px solid var(--border); overflow-x: auto; min-height: 60px; cursor: zoom-in; }
 .diagram svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
 .mermaid-box.dg-loading, .dg-wait { color: var(--muted); font-size: 12px; display: flex; align-items: center; justify-content: center; }
 .mermaid-box.dg-loading::before { content: ""; width: 14px; height: 14px; margin-right: 8px; border-radius: 50%; border: 2px solid var(--surface3); border-top-color: var(--accent); animation: spin .8s linear infinite; }
 .dg-err { color: var(--error); font-size: 12.5px; margin-bottom: 6px; }
+.dg-open { position: absolute; top: 6px; right: 6px; width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; border-radius: 8px; background: color-mix(in srgb, var(--surface2) 85%, transparent); border: 1px solid var(--border); color: var(--muted); }
+.dg-open .ic { width: 16px; height: 16px; }
 
 /* highlight.js (dark) */
 .hljs { color: #e6edf3; }
@@ -388,6 +389,15 @@ details.card > .md { padding: 0 14px 10px; font-size: 14px; }
 .imgview.zoom img { max-width: none; max-height: none; }
 .svg-host { width: 100%; }
 .img-meta { text-align: center; font-size: 12px; color: var(--muted); padding: 8px; }
+.dg-view { position: fixed; inset: 0; z-index: 25; overflow: hidden; touch-action: none; user-select: none; -webkit-user-select: none; background: var(--surface); opacity: 0; transition: opacity .18s; }
+.dg-view.open { opacity: 1; }
+.dg-content { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+.dg-content.anim { transition: transform .22s var(--ease); }
+.dg-content > svg { display: block; }
+.dg-content.moving { will-change: transform; }
+/* Covered views stop painting; content-visibility keeps their layout and scroll state, so uncovering
+   is cheap. Only boxes sized from outside (flex/fixed): size containment would collapse the rest. */
+body.dg-covered .main, body.dg-covered .panel { content-visibility: hidden; }
 
 .seg { flex: none; display: flex; gap: 4px; margin: 8px 12px; padding: 3px; border-radius: 11px; background: var(--surface); border: 1px solid var(--border); }
 .seg-b { flex: 1; height: 34px; border-radius: 8px; font-size: 13.5px; color: var(--muted); font-weight: 500; transition: background .15s, color .15s; }

@@ -145,7 +145,10 @@ This is the default for agent panes. It renders omp's own session file, not the 
   - code blocks have a Copy button;
   - KaTeX math is rendered;
   - mermaid diagrams render lazily;
-  - ```` ```svg ```` blocks are drawn inline.
+  - ```` ```svg ```` blocks are drawn inline;
+  - tapping a diagram opens it full screen (status bar hidden): pinch or double-tap to zoom,
+    drag to pan (wheel zoom in a desktop browser), back closes it. Turn the phone and accept
+    the system's rotate button (or have auto-rotate on) for landscape; the diagram refits.
 - **Thinking** sections are collapsible.
 - **Tool calls** are compact rows showing status, tool name and intent. Tap one to expand
   its input and output. Long outputs are cut on the PC; "Show full ..." fetches the
@@ -153,12 +156,12 @@ This is the default for agent panes. It renders omp's own session file, not the 
 - **Compaction** shows as a summary card. Errors, aborted turns and `!command` runs show as
   notices.
 - **History**: scrolling up loads older history in pages of 60. The view follows the bottom
-  unless you scroll up; a "Latest" / "N new" pill jumps back.
+  unless you scroll up.
 - **Working row**: while omp works, an animated row shows its context.
 - **Pending sends** appear as dashed bubbles until the PC acknowledges them. A failed send
   offers Retry and Dismiss.
 - **Cache**: the last transcript of each terminal is cached, so reopening a terminal is
-  instant. A "Cached" chip shows until live data arrives.
+  instant; live data replaces it when it arrives.
 
 ### omp controls in the chat view
 

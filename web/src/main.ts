@@ -4,6 +4,7 @@ import { bridge, send, settle } from "./bridge";
 import { ChatView } from "./chat";
 import { Compose } from "./compose";
 import { ControlStrip, openSessionMenu } from "./controls";
+import { diagramSvg, openDiagram } from "./diagram";
 import { Drawer } from "./drawer";
 import { FilesPanel, findRepo, openFileViewer } from "./files";
 import { openGit } from "./git";
@@ -102,7 +103,7 @@ function openTarget(target: string, view?: View) {
   if (p && !p.agent) v = "term";
   const changed = target !== state.target || v !== state.view;
   if (state.view === "chat" && v !== "chat") chat.suspend();
-  if (state.view === "term" && v !== "term") term.setStale(true);
+  if (state.view === "term" && v !== "term") term.suspend();
   state.target = target;
   state.view = v;
   lsSet("dd.last", target);
@@ -371,7 +372,10 @@ document.addEventListener("click", (e) => {
       copy.classList.remove("done");
       copy.querySelector("span")!.textContent = "Copy";
     }, 1400);
+    return;
   }
+  const dg = t.closest<HTMLElement>(".diagram");
+  if (dg && diagramSvg(dg)) openDiagram(dg);
 });
 
 main.className = `main view-${state.view}`;

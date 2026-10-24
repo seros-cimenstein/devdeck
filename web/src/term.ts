@@ -48,11 +48,9 @@ export class TermView {
     this.saveNow();
     this.target = target;
     this.scr.reset();
-    this.wrap.classList.remove("stale");
     void cacheGet<CachedScreen>("scr:" + target).then((c) => {
       if (!c || this.target !== target || this.scr.live) return;
       this.scr.setLines(c.lines);
-      this.wrap.classList.add("stale");
       this.scrollToBottom();
     });
   }
@@ -63,15 +61,13 @@ export class TermView {
       send({ t: "resync" });
       return;
     }
-    if (m.full) this.wrap.classList.remove("stale");
     if (this.atBottom) this.scr.el.scrollTop = this.scr.el.scrollHeight;
     this.saveSoon();
   }
 
-  /** Mark the screen stale (link down or view switched away). */
-  setStale(stale: boolean) {
-    this.wrap.classList.toggle("stale", stale);
-    if (stale) this.scr.live = false;
+  /** The screen stops being live (link down or view switched away). */
+  suspend() {
+    this.scr.live = false;
   }
 
   scrollToBottom() {

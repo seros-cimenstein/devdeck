@@ -12,6 +12,7 @@ interface DDBridge {
   haptic(): void;
   ready(): void;
   backResult?(handled: boolean): void;
+  setFullscreen?(on: boolean): void;
   // voice (absent on older shells)
   listen?(json: string): void;
   stopListening?(): void;
@@ -75,6 +76,8 @@ export const bridge = {
   stopSpeaking: () => dd().stopSpeaking?.(),
   setVoiceMode: (on: boolean) => dd().setVoiceMode?.(on),
   backResult: (handled: boolean) => dd().backResult?.(handled),
+  /** Hides the status bar (diagram viewer); the navigation bar stays. */
+  setFullscreen: (on: boolean) => dd().setFullscreen?.(on),
   hasLive: () => typeof dd().liveStart === "function",
   liveStart: (opts: { voice: string; mode: string; target?: string }) => dd().liveStart?.(JSON.stringify(opts)),
   liveStop: () => dd().liveStop?.(),

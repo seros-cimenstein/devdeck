@@ -82,10 +82,12 @@ export function markdownEl(src: string, cls = "md"): HTMLElement {
   return d;
 }
 
-// ---- inline SVG (omp's ```svg fences): sanitized, isolated in a shadow root so <style> cannot leak,
-// while CSS custom properties from the theme still inherit into it.
+// ---- inline SVG (omp's ```svg fences): sanitized, isolated in a shadow root (on a .svg-host child) so
+// <style> cannot leak, while CSS custom properties from the theme still inherit into it.
 const SVG_SHADOW_CSS =
   ":host{display:block;color:var(--fg)}svg{display:block;max-width:100%;height:auto;margin:0 auto;}";
+// Tapping anywhere on a rendered diagram opens the zoom viewer (main.ts); the button is the visible hint.
+const DG_OPEN = `<button class="dg-open" aria-label="Open diagram">${icon("expand")}</button>`;
 
 export function sanitizeSvg(src: string): string {
   return DOMPurify.sanitize(src, { USE_PROFILES: { svg: true, svgFilters: true }, ADD_TAGS: ["style"] });
@@ -99,8 +101,11 @@ function mountSvg(box: HTMLElement) {
     box.outerHTML = codeBlock(src, "xml");
     return;
   }
-  const root = box.attachShadow({ mode: "open" });
-  root.innerHTML = `<style>${SVG_SHADOW_CSS}</style>${clean}`;
+  const host = document.createElement("div");
+  host.className = "svg-host";
+  host.attachShadow({ mode: "open" }).innerHTML = `<style>${SVG_SHADOW_CSS}</style>${clean}`;
+  box.append(host);
+  box.insertAdjacentHTML("beforeend", DG_OPEN);
 }
 
 // ---- mermaid: loaded on first sight of a diagram, rendered when scrolled into view.
@@ -176,7 +181,7 @@ function renderMermaid(box: HTMLElement) {
       const m = await loadMermaid();
       const { svg } = await m.render(`mmd${++mmSeq}`, src);
       box.classList.remove("dg-loading");
-      box.innerHTML = svg;
+      box.innerHTML = svg + DG_OPEN;
     } catch (e) {
       box.classList.remove("dg-loading");
       box.innerHTML =

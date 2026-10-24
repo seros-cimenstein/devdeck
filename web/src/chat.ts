@@ -33,7 +33,6 @@ export class ChatView {
   private readonly top: HTMLElement;
   private readonly outbox: HTMLElement;
   private readonly working: HTMLElement;
-  private readonly pill: HTMLElement;
   private readonly empty: HTMLElement;
 
   private entries: Entry[] = [];
@@ -46,7 +45,6 @@ export class ChatView {
   private atBottom = true;
   private loadingMore = false;
   private moreFailed = false;
-  private unseen = 0;
   private expanded = new Set<string>();
   private full = new Map<string, string>();
   private scrollQueued = false;
@@ -58,13 +56,7 @@ export class ChatView {
     this.working = h("div.working", { hidden: true });
     this.empty = h("div.empty", { hidden: true });
     this.el = h("div.chat-scroll", null, this.top, this.list, this.empty, this.outbox, this.working);
-    this.pill = h(
-      "button.jump",
-      { onclick: () => this.scrollToBottom(true) },
-      h("span.icw", { html: icon("down") }),
-      h("span.jump-l", { text: "Latest" }),
-    );
-    this.wrap = h("div.view.chat-view", null, this.el, this.pill);
+    this.wrap = h("div.view.chat-view", null, this.el);
 
     this.el.addEventListener("scroll", () => this.onScroll(), { passive: true });
     const ro = new ResizeObserver(() => {
@@ -102,15 +94,12 @@ export class ChatView {
     this.hasMore = false;
     this.loadingMore = false;
     this.moreFailed = false;
-    this.unseen = 0;
     this.sessionId = "";
     this.atBottom = true;
     this.expanded.clear();
     this.full.clear();
-    this.wrap.classList.remove("stale");
     this.updateTop();
     this.updateEmpty();
-    this.updatePill();
   }
 
   onTranscript(m: TranscriptMsg) {
@@ -122,9 +111,7 @@ export class ChatView {
       this.markDelivered(m.entries || []);
       return;
     }
-    let appended = 0;
-    for (const e of m.entries || []) if (this.upsert(e)) appended++;
-    if (appended && !this.atBottom) this.unseen += appended;
+    for (const e of m.entries || []) this.upsert(e);
     this.afterAppend();
     this.markDelivered(m.entries || []);
   }
@@ -147,15 +134,14 @@ export class ChatView {
     for (let i = this.domStart; i < this.entries.length; i++) frag.append(this.node(this.entries[i]));
     this.list.append(frag);
     hydrate(this.list);
-    this.wrap.classList.toggle("stale", fromCache);
     this.updateTop();
     this.updateEmpty();
     this.scrollToBottom(false);
     if (!fromCache) this.saveSoon();
   }
 
-  /** Inserts or replaces one entry; true if it is new. */
-  private upsert(e: Entry): boolean {
+  /** Inserts or replaces one entry. */
+  private upsert(e: Entry) {
     const arr = this.entries;
     let lo = 0;
     let hi = arr.length;
@@ -172,19 +158,18 @@ export class ChatView {
         old.replaceWith(n);
         hydrate(n);
       }
-      return false;
+      return;
     }
     arr.splice(lo, 0, e);
     if (lo < this.domStart) {
       this.domStart++;
-      return true;
+      return;
     }
     const n = this.node(e);
     const next = arr[lo + 1] && this.nodes.get(arr[lo + 1].seq);
     if (next) this.list.insertBefore(n, next);
     else this.list.append(n);
     hydrate(n);
-    return true;
   }
 
   private afterAppend() {
@@ -196,7 +181,6 @@ export class ChatView {
       this.hasMore = true;
     }
     this.updateEmpty();
-    this.updatePill();
     if (this.atBottom) this.el.scrollTop = this.el.scrollHeight;
     this.saveSoon();
   }
@@ -235,8 +219,6 @@ export class ChatView {
       const el = this.el;
       const d = el.scrollHeight - el.scrollTop - el.clientHeight;
       this.atBottom = d < 64;
-      if (this.atBottom) this.unseen = 0;
-      this.updatePill();
       if (el.scrollTop < 900) this.loadOlder();
     });
   }
@@ -321,23 +303,12 @@ export class ChatView {
     if (none) this.empty.textContent = this.live ? "No messages yet" : "Loading conversation...";
   }
 
-  private updatePill() {
-    const el = this.el;
-    const far = el.scrollHeight - el.scrollTop - el.clientHeight > el.clientHeight * 0.6;
-    const show = !this.atBottom && (far || this.unseen > 0);
-    this.pill.classList.toggle("show", show);
-    const label = this.pill.querySelector(".jump-l")!;
-    label.textContent = this.unseen > 0 ? `${this.unseen} new` : "Latest";
-  }
-
   scrollToBottom(smooth: boolean) {
     this.atBottom = true;
-    this.unseen = 0;
     if (this.domStart < this.entries.length - MAX_DOM) this.trim();
     const el = this.el;
     if (smooth && !reducedMotion()) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
     else el.scrollTop = el.scrollHeight;
-    this.updatePill();
   }
 
   // ---------------------------------------------------------------- status rows

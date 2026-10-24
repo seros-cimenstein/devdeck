@@ -12,6 +12,7 @@ import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.graphics.Insets;
 import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Build;
@@ -26,6 +27,9 @@ import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.webkit.ConsoleMessage;
 import android.webkit.JavascriptInterface;
 import android.webkit.RenderProcessGoneDetail;
@@ -216,6 +220,7 @@ public class MainActivity extends Activity implements LinkService.Listener {
             if (view == web) {
                 ready = false;
                 resetVoice();  // a new page instance starts with voice mode off
+                setFullscreen(false);  // drop a diagram viewer's full screen
             }
         }
 
@@ -507,6 +512,47 @@ public class MainActivity extends Activity implements LinkService.Listener {
         else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
 
+    /** Main thread. Diagram viewer: hides the status bar and draws under the camera cutout. The
+     *  navigation bar stays for the back key and the system's rotate suggestion. */
+    private void setFullscreen(boolean on) {
+        Window w = getWindow();
+        if (Build.VERSION.SDK_INT >= 28) {
+            WindowManager.LayoutParams lp = w.getAttributes();
+            lp.layoutInDisplayCutoutMode = on
+                    ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT;
+            w.setAttributes(lp);
+        }
+        if (Build.VERSION.SDK_INT >= 30) {
+            WindowInsetsController c = w.getInsetsController();
+            if (c == null) return;
+            // Hiding the status bar alone leaves its strip reserved (the cutout sits in it): stop fitting
+            // the decor to system bars and keep clear of the navigation bar only.
+            View content = findViewById(android.R.id.content);
+            w.setDecorFitsSystemWindows(!on);
+            if (on) {
+                // Consumed: the WebView must never see these insets, else its safe-area values stick
+                // after the decor fits system bars again.
+                content.setOnApplyWindowInsetsListener((v, insets) -> {
+                    Insets nav = insets.getInsets(WindowInsets.Type.navigationBars());
+                    v.setPadding(nav.left, 0, nav.right, nav.bottom);
+                    return WindowInsets.CONSUMED;
+                });
+                c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                c.hide(WindowInsets.Type.statusBars());
+            } else {
+                content.setOnApplyWindowInsetsListener(null);
+                content.setPadding(0, 0, 0, 0);
+                c.show(WindowInsets.Type.statusBars());
+            }
+            content.requestApplyInsets();
+        } else if (on) {
+            w.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        } else {
+            w.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        }
+    }
+
     /** Main thread. UI page replaced or gone: microphone, playback, screen and server voice off. */
     private void resetVoice() {
         pendingListen = null;
@@ -671,6 +717,13 @@ public class MainActivity extends Activity implements LinkService.Listener {
         @JavascriptInterface
         public void backResult(boolean handled) {
             main.post(() -> MainActivity.this.backResult(handled));
+        }
+
+        @JavascriptInterface
+        public void setFullscreen(boolean on) {
+            main.post(() -> {
+                if (owner == web) MainActivity.this.setFullscreen(on);
+            });
         }
 
         /** Opens the microphone: opts JSON {lang?: "en-US", partial?: true, preferOffline?: true}. */
