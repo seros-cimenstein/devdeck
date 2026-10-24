@@ -573,3 +573,58 @@ export function openRenameSheet() {
   s.foot.append(go);
   setTimeout(() => input.focus(), 320);
 }
+
+// ---------------------------------------------------------------- omp update
+
+interface OmpUpdateMsg {
+  ok: boolean;
+  check: boolean;
+  before: string;
+  after: string;
+  output: string;
+}
+
+/** Runs `omp update` (or `--check`) on the PC and shows versions and output. */
+export function openOmpUpdate() {
+  const s = new Sheet("Update omp", "on the PC", "small");
+  const intro = h("p.sheet-text", {
+    text: "Installs the newest omp on the PC. Terminals already running omp keep their version until you restart them (/restart, or exit and start omp again).",
+  });
+  const out = h("div.ou-out");
+  const check = h("button.btn.wide", { text: "Check only" }) as HTMLButtonElement;
+  const go = h("button.btn.wide.primary", { text: "Update" }) as HTMLButtonElement;
+  const run = (dry: boolean) => {
+    if (!isOnline()) return toast("Offline", "err");
+    check.disabled = go.disabled = true;
+    out.textContent = "";
+    out.append(spinnerEl(dry ? "Checking for updates..." : "Updating omp (can take a few minutes)..."));
+    request<OmpUpdateMsg>({ t: "omp_update", check: dry }, 11 * 60_000)
+      .then((m) => {
+        out.textContent = "";
+        const changed = m.after !== m.before;
+        const head = m.check
+          ? `Installed: ${m.before}`
+          : changed
+            ? `Updated: ${m.before} \u2192 ${m.after}`
+            : m.ok
+              ? `Already up to date: ${m.after}`
+              : `Update failed (still ${m.after})`;
+        out.append(h(`div.ou-head${m.ok ? "" : ".err"}`, { text: head }));
+        if (m.output) out.append(h("pre.ou-log", { text: m.output }));
+        if (!m.check && changed) toast(`omp updated to ${m.after}`, "ok");
+      })
+      .catch((e: Error) => {
+        out.textContent = "";
+        out.append(errorEl(e.message, () => run(dry)));
+      })
+      .finally(() => {
+        check.disabled = go.disabled = false;
+      });
+  };
+  check.addEventListener("click", () => run(true));
+  go.addEventListener("click", () => run(false));
+  s.body.append(intro, out);
+  s.foot.hidden = false;
+  s.foot.classList.add("row");
+  s.foot.append(check, go);
+}

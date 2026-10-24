@@ -1,5 +1,5 @@
 // File browser and viewer (ls/read requests), with a git entry point when inside a repo.
-import { bridge, request } from "./bridge";
+import { bridge, request, send } from "./bridge";
 import { highlight, hydrate, renderMarkdown, sanitizeSvg } from "./md";
 import { hooks } from "./state";
 import type { GitStatusMsg, LsEntry, LsMsg, ReadMsg } from "./types";
@@ -46,7 +46,13 @@ export class FilesPanel {
     this.panel.action("up", "Up", () => this.path && this.go(dirname(this.path)));
     this.crumbs = h("div.crumbs");
     this.list = h("div.flist");
-    this.panel.body.append(this.crumbs, this.list);
+    const here = h(
+      "div.f-here",
+      null,
+      h("button.btn.f-here-b", { onclick: () => this.startHere(false) }, h("span.icw", { html: icon("term") }), h("span", { text: "Terminal here" })),
+      h("button.btn.primary.f-here-b", { onclick: () => this.startHere(true) }, h("span.icw", { html: icon("plus") }), h("span", { text: "omp --yolo here" })),
+    );
+    this.panel.body.append(this.crumbs, here, this.list);
     this.go(start || "~");
   }
 
@@ -76,6 +82,15 @@ export class FilesPanel {
         this.list.textContent = "";
         this.list.append(errorEl(e.message, () => this.go(path)));
       });
+  }
+
+  /** A new terminal whose shell starts in the folder shown (`cd` there), optionally running omp --yolo. */
+  private startHere(omp: boolean) {
+    if (!this.path) return;
+    const msg = omp ? { t: "new", cwd: this.path, omp: true, yolo: true } : { t: "new", cwd: this.path };
+    if (!send(msg)) return toast("Offline: cannot create a terminal", "err");
+    toast(omp ? `Starting omp --yolo in ${basename(this.path) || "/"}...` : `Opening a terminal in ${basename(this.path) || "/"}...`);
+    this.panel.close();
   }
 
   private renderCrumbs() {

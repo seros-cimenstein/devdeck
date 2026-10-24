@@ -1360,6 +1360,38 @@ def omp_binary() -> str:
     return "omp"
 
 
+OMP_UPDATE_S = 600.0
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def omp_update(check: bool) -> dict:
+    """`omp update` (or `--check`): versions before/after and the command's output. Running omp
+    sessions keep the old version until they are restarted."""
+    omp = omp_binary()
+
+    def version() -> str:
+        try:
+            r = subprocess.run([omp, "--version"], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return "?"
+        lines = (r.stdout or r.stderr).strip().splitlines()
+        return lines[0] if lines else "?"
+
+    before = version()
+    cmd = [omp, "update"] + (["--check"] if check else [])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=OMP_UPDATE_S, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise RequestError(f"omp update did not finish within {OMP_UPDATE_S / 60:.0f} minutes") from None
+    except OSError as ex:
+        raise RequestError(f"could not run omp: {ex}") from None
+    out, _ = cap(ANSI_RE.sub("", (r.stdout + r.stderr).strip()), 20_000)
+    after = before if check else version()
+    log(f"omp update{' --check' if check else ''}: exit {r.returncode}, {before} -> {after}")
+    return {"t": "omp_update", "ok": r.returncode == 0, "check": check, "before": before,
+            "after": after, "output": out}
+
+
 class ModelCatalog:
     """`omp models --json` (no model calls: omp's own catalog cache), kept in memory and in
     MODELS_FILE; served stale while a background refresh runs."""
@@ -3731,9 +3763,10 @@ class Server:
         path = breadcrumb_session(info["tty"], info["pid"])
         return self.transcript(path) if path else None
 
-    def create_terminal(self, cwd: str | None = None, omp: bool = False) -> str:
+    def create_terminal(self, cwd: str | None = None, omp: bool = False, yolo: bool = False) -> str:
         """A fresh tmux session phone-N (lowest free N) running the default shell in `cwd` (home),
-        optionally starting omp in it; its pane target. RequestError on failure."""
+        optionally starting omp in it (with --yolo if asked); its pane target. RequestError on
+        failure."""
         with self.deliver_lock:  # two phones pressing "+ New" at once must not collide
             r = tmux("list-sessions", "-F", "#{session_name}")
             taken = set(r.stdout.decode(errors="replace").split()) if r.returncode == 0 else set()
@@ -3747,10 +3780,12 @@ class Server:
         info = pane_info(name)
         target = info["target"] if isinstance(info, dict) else name
         if omp:
-            err = deliver_text("new-" + name, target, shlex.quote(omp_binary()), True)
+            launch = shlex.quote(omp_binary()) + (" --yolo" if yolo else "")
+            err = deliver_text("new-" + name, target, launch, True)
             if err:
                 raise RequestError(f"started {target} but could not start omp in it: {err}")
-        log(f"created terminal {target}" + (" with omp" if omp else ""))
+        log(f"created terminal {target}" + (f" with omp{' --yolo' if yolo else ''}" if omp else "")
+            + (f" in {cwd}" if cwd else ""))
         self.poll_now.set()
         return target
 
@@ -4627,7 +4662,7 @@ class Control:
         elif kind == "type":
             self.do_type(msg)
         elif kind == "new":
-            self.new_terminal()
+            self.new_terminal(msg)
         elif kind == "voice":
             self.do_voice(msg)
         elif kind == "say":
@@ -4644,7 +4679,7 @@ class Control:
         elif kind == "say_stop":
             req = msg.get("req")
             self.stop_utterances(lambda u: u.req == req if isinstance(req, str) else True)
-        elif kind in ("more", "full", "ls", "read", "git", "models", "history", "cmd"):
+        elif kind in ("more", "full", "ls", "read", "git", "models", "history", "cmd", "omp_update"):
             self.request(msg)
         else:
             self.push({"t": "error", "error": f"unknown message type {kind!r}"})
@@ -4703,16 +4738,24 @@ class Control:
             self.kick()
         return err
 
-    def new_terminal(self) -> None:
-        """A fresh tmux session phone-N (lowest free N) running the default shell, watched now."""
+    def new_terminal(self, msg: dict) -> None:
+        """A fresh tmux session phone-N running the default shell, watched now. Optional `cwd`
+        (inside home) and `omp` (start omp there, `yolo` adds --yolo); omp ones open in chat."""
+        omp = msg.get("omp") is True
+        cwd = None
         try:
-            target = self.server.create_terminal()
+            if msg.get("cwd") is not None:
+                cwd = user_path(msg.get("cwd"))
+                if not os.path.isdir(cwd):
+                    raise RequestError(f"not a folder: {cwd}")
+            target = self.server.create_terminal(cwd, omp, msg.get("yolo") is True)
         except RequestError as ex:
             self.push({"t": "error", "error": str(ex)})
             return
-        self.push({"t": "created", "target": target})
+        view = "chat" if omp else "term"
+        self.push({"t": "created", "target": target, "view": view})
         with self.cond:
-            self.target, self.view, self.force = target, "term", True
+            self.target, self.view, self.force = target, view, True
             self.cond.notify()
         self.server.poll_now.set()
 
@@ -4982,6 +5025,8 @@ class Control:
                          "fetchedAt": data["fetchedAt"]}
             elif kind == "history":
                 reply = self.do_history(msg)
+            elif kind == "omp_update":
+                reply = omp_update(msg.get("check") is True)
             else:
                 reply = self.do_cmd(msg)
             reply["req"] = req

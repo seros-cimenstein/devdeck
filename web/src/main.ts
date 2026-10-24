@@ -11,6 +11,7 @@ import { initLive, liveEntry, liveStatus, liveSync, onLive, onLiveDelegation, on
 import { refreshModels } from "./omp";
 import { outboxAck, outboxReconcile, sendText } from "./outbox";
 import { PagePanel } from "./page";
+import { openOmpUpdate } from "./sheets";
 import { currentPane, hooks, state, type View } from "./state";
 import { TermView } from "./term";
 import { TopBar } from "./topbar";
@@ -154,6 +155,7 @@ function openMoreMenu(anchor: HTMLElement) {
     { label: "Resync", icon: "refresh", act: () => (send({ t: "resync" }) ? toast("Resyncing") : toast("Offline", "err")) },
     { label: "Voice settings", icon: "headset", act: openVoiceSettings },
     { label: "New terminal", icon: "plus", act: newTerminal },
+    { label: "Update omp", icon: "refresh", act: openOmpUpdate },
   ]);
 }
 
@@ -308,7 +310,7 @@ function receive(m: Msg) {
     case "ack":
       return onAck(m as unknown as AckMsg);
     case "created":
-      if (typeof m.target === "string") openTarget(m.target, "term");
+      if (typeof m.target === "string") openTarget(m.target, m.view === "chat" ? "chat" : "term");
       return;
     case "open":
       if (typeof m.target === "string") openTarget(m.target);
