@@ -5,7 +5,7 @@ import { hydrate, markdownEl, renderMarkdown } from "./md";
 import { dismissSend, onOutboxChange, outboxFor, retrySend } from "./outbox";
 import { hooks, state } from "./state";
 import type { AssistantEntry, Entry, FullMsg, ToolCall, TranscriptMsg } from "./types";
-import { debounce, h, icon, reducedMotion } from "./util";
+import { debounce, h, icon, reducedMotion, ticking } from "./util";
 import { onSayChange, sayStatus, toggleEntry } from "./voice";
 
 const MAX_DOM = 220; // rendered entries kept while following the bottom
@@ -343,9 +343,10 @@ export class ChatView {
     const busy = p?.state === "working";
     w.hidden = !busy;
     if (busy) {
-      if (!w.firstChild) w.append(h("span.dots", null, h("i"), h("i"), h("i")), h("span.w-l"));
-      w.lastChild!.textContent = p?.context || "Working";
-    }
+      if (!w.firstChild) w.append(ticking(h("span.dots", null, h("i"), h("i"), h("i"))), h("span.w-l"));
+      const label = p?.context || "Working";
+      if (w.lastChild!.textContent !== label) w.lastChild!.textContent = label;
+    } else if (w.firstChild) w.textContent = ""; // no idle stepped indicator keeping the shared timer alive
     if (!busy && p?.state !== "asking") {
       this.list.querySelectorAll(".tool-st.run").forEach((s) => {
         s.classList.replace("run", "pend");
@@ -366,7 +367,7 @@ export class ChatView {
             h("button.lnk", { text: "Retry", onclick: () => retrySend(it.id) }),
             h("button.lnk", { text: "Dismiss", onclick: () => dismissSend(it.id) }),
           )
-        : h("div.ob-st", null, h("span.spin.xs"), h("span", { text: it.enter ? "Sending" : "Pasting (no Enter)" }));
+        : h("div.ob-st", null, ticking(h("span.spin.xs")), h("span", { text: it.enter ? "Sending" : "Pasting (no Enter)" }));
       o.append(h("div.ent.user.pending", null, h("div.bubble", null, h("div.u-text", { text: it.text || "(Enter)" }), status)));
     }
   }
@@ -464,7 +465,7 @@ export class ChatView {
     const busy = paneState === "working" || paneState === "asking";
     const st = t.result ? (t.result.isError ? "err" : "ok") : busy ? "run" : "pend";
     const stEl = h(`span.tool-st.${st}`);
-    if (st === "run") stEl.append(h("span.spin.xs"));
+    if (st === "run") stEl.append(ticking(h("span.spin.xs")));
     else if (st === "ok") stEl.innerHTML = icon("check");
     else if (st === "err") stEl.innerHTML = icon("close");
     const label = t.intent || argSummary(t.args);

@@ -72,14 +72,19 @@ export class TopBar {
     const p = currentPane();
     setBadge(this.badge, badgeKind(p));
     this.badge.hidden = !state.target;
-    this.title.textContent = paneTitle(p, state.target);
+    const title = paneTitle(p, state.target);
+    if (this.title.textContent !== title) this.title.textContent = title;
     const closed = !!state.target && !p && state.panes.length > 0;
     const ctx = closed ? "Terminal closed" : p ? p.context || (p.agent ? "" : p.cmd) || p.target : state.target ? "" : "Pick a terminal";
-    this.ctx.textContent = ctx;
+    if (this.ctx.textContent !== ctx) this.ctx.textContent = ctx;
     this.ctx.classList.toggle("warn", closed);
     const agent = !!p?.agent;
     this.viewBtn.hidden = !agent;
-    this.viewBtn.innerHTML = icon(state.view === "chat" ? "term" : "chat");
+    const view = state.view === "chat" ? "term" : "chat";
+    if (this.viewBtn.dataset.icon !== view) {
+      this.viewBtn.dataset.icon = view;
+      this.viewBtn.innerHTML = icon(view);
+    }
     this.viewBtn.setAttribute("aria-label", state.view === "chat" ? "Terminal view" : "Chat view");
   }
 

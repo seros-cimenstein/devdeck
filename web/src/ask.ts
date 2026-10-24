@@ -4,7 +4,7 @@ import { renderInline, renderMarkdown } from "./md";
 import { paneTitle, state } from "./state";
 import type { AckMsg, Ask, AskQuestion } from "./types";
 import { type Layer, pushLayer, removeLayer, toast } from "./ui";
-import { h, icon, uuid } from "./util";
+import { h, icon, ticking, uuid } from "./util";
 
 interface QState {
   selected: Set<string>;
@@ -75,6 +75,9 @@ export class AskSheet implements Layer {
     if (this.ask && !this.pendingId) this.dismissed.add(this.ask.toolCallId);
     this.isOpen = false;
     removeLayer(this);
+    // The sheet stays in the DOM: a leftover "Answering..." spinner would keep animating off-screen.
+    this.statusEl.hidden = true;
+    this.statusEl.textContent = "";
     this.scrim.classList.remove("open");
     this.sheet.classList.remove("open");
     this.onChange?.();
@@ -279,7 +282,7 @@ export class AskSheet implements Layer {
     s.hidden = false;
     s.className = `ask-status ${kind}`;
     s.textContent = "";
-    if (kind === "pending") s.append(h("span.spin.xs"), h("span", { text }));
+    if (kind === "pending") s.append(ticking(h("span.spin.xs")), h("span", { text }));
     else s.append(h("pre", { text }));
   }
 

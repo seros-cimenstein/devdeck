@@ -98,6 +98,46 @@ export function joinPath(a: string, b: string): string {
 
 export const reducedMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
 
+// ---- Long-lived busy indicators (working badges, running tools, the working row, unsent items, asking
+// badges) step from one 2 Hz timer instead of running CSS animations: in the WebView any running animation
+// makes the whole view redraw every vsync (measured ~25% app + ~20% renderer CPU for one spinner, ~100% +
+// ~25% for a working agent's indicators), a 2 Hz step a few percent. Elements opt in through `ticking()`;
+// the CSS draws the phase in `data-ph` (0..3). Hidden indicators and those in a closed drawer or sheet are
+// not stepped; the timer stops when none exist or the page is hidden.
+const TICK_MS = 500;
+const ticks = document.getElementsByClassName("tick");
+let tickTimer = 0;
+let tickPhase = 0;
+
+function stepTicks() {
+  if (!ticks.length || document.hidden) {
+    clearInterval(tickTimer);
+    tickTimer = 0;
+    return;
+  }
+  tickPhase = (tickPhase + 1) & 3;
+  const ph = String(tickPhase);
+  for (const el of ticks) {
+    if (el.checkVisibility() && !el.closest(".drawer:not(.open), .sheet:not(.open)")) (el as HTMLElement).dataset.ph = ph;
+  }
+}
+
+function startTicks() {
+  if (!tickTimer && !document.hidden && !reducedMotion()) tickTimer = window.setInterval(stepTicks, TICK_MS);
+}
+
+/** Makes `el` a stepped busy indicator (see above); returns it. */
+export function ticking<T extends HTMLElement>(el: T): T {
+  el.classList.add("tick");
+  el.dataset.ph = String(tickPhase);
+  startTicks();
+  return el;
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (ticks.length) startTicks();
+});
+
 export function uuid(): string {
   if (crypto.randomUUID) return crypto.randomUUID();
   const b = crypto.getRandomValues(new Uint8Array(16));

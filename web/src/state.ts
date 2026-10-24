@@ -1,6 +1,6 @@
 // App-wide state shared by views; `hooks` are wired by main.ts.
 import type { Ask, LinkMsg, Pane, PaneState } from "./types";
-import { h, icon, lsGet } from "./util";
+import { h, icon, lsGet, ticking } from "./util";
 
 export type View = "chat" | "term";
 
@@ -58,10 +58,11 @@ export function setBadge(b: HTMLElement, kind: BadgeKind) {
   b.title = BADGE_TITLES[kind];
   switch (kind) {
     case "working":
-      b.innerHTML = '<span class="spin"></span>';
+      b.replaceChildren(ticking(h("span.spin")));
       break;
     case "asking":
       b.textContent = "?";
+      ticking(b);
       break;
     case "done":
       b.innerHTML = icon("check");

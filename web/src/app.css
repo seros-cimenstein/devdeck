@@ -56,6 +56,11 @@ pre, code { font-family: var(--mono); font-variant-ligatures: none; }
 .spin { width: 16px; height: 16px; border-radius: 50%; border: 2px solid color-mix(in srgb, currentColor 25%, transparent); border-top-color: currentColor; animation: spin .8s linear infinite; display: inline-block; flex: none; }
 .spin.xs { width: 12px; height: 12px; border-width: 2px; }
 @keyframes spin { to { transform: rotate(360deg); } }
+/* Stepped busy indicators (util.ts `ticking`): no CSS animation, a shared 2 Hz timer sets data-ph 0..3. */
+.spin.tick { animation: none; }
+.spin.tick[data-ph="1"] { transform: rotate(90deg); }
+.spin.tick[data-ph="2"] { transform: rotate(180deg); }
+.spin.tick[data-ph="3"] { transform: rotate(270deg); }
 .loading { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 32px; color: var(--muted); }
 .empty { color: var(--muted); text-align: center; padding: 40px 16px; font-size: 14px; }
 .errbox { margin: 16px; padding: 14px; border-radius: 12px; background: color-mix(in srgb, var(--error) 12%, var(--surface)); border: 1px solid color-mix(in srgb, var(--error) 40%, transparent); display: flex; flex-direction: column; gap: 10px; align-items: flex-start; font-size: 14px; white-space: pre-wrap; word-break: break-word; }
@@ -96,7 +101,8 @@ pre, code { font-family: var(--mono); font-variant-ligatures: none; }
 .badge .ic { width: 13px; height: 13px; stroke-width: 3; }
 .b-working { color: var(--accent); }
 .b-working .spin { width: 16px; height: 16px; }
-.b-asking { background: var(--error); color: #fff; animation: pulse 1.6s ease-in-out infinite; }
+.b-asking { background: var(--error); color: #fff; }
+.b-asking[data-ph="2"], .b-asking[data-ph="3"] { opacity: .35; }
 .b-done { background: var(--success); color: #04150a; }
 .b-idle { background: var(--surface2); color: var(--muted); font-size: 13px; font-family: var(--sans); }
 .b-running { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
@@ -167,10 +173,8 @@ details.card > .md { padding: 0 14px 10px; font-size: 14px; }
 .working { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; padding: 8px 2px 4px; }
 .w-l { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dots { display: inline-flex; gap: 4px; flex: none; }
-.dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: bounce 1.2s infinite ease-in-out; }
-.dots i:nth-child(2) { animation-delay: .15s; }
-.dots i:nth-child(3) { animation-delay: .3s; }
-@keyframes bounce { 0%, 80%, 100% { opacity: .25; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-3px); } }
+.dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); opacity: .25; }
+.dots[data-ph="0"] i:nth-child(1), .dots[data-ph="1"] i:nth-child(2), .dots[data-ph="2"] i:nth-child(3) { opacity: 1; transform: translateY(-3px); }
 
 .jump { position: absolute; left: 50%; bottom: 14px; transform: translate(-50%, 16px); opacity: 0; pointer-events: none; display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 14px 0 10px; border-radius: 999px; background: var(--surface2); border: 1px solid var(--surface3); box-shadow: 0 6px 20px rgba(0,0,0,.45); font-size: 13px; font-weight: 500; transition: opacity .2s, transform .2s var(--ease); z-index: 3; }
 .jump .ic { width: 16px; height: 16px; }
@@ -763,5 +767,5 @@ details.card > .md { padding: 0 14px 10px; font-size: 14px; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 1ms !important; animation-duration: 1ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
-  .spin, .dots i { animation: none !important; }
+  .spin { animation: none !important; }
 }

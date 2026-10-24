@@ -793,6 +793,13 @@ catalog). Requests (the daemon's side):
 - **UI**: a single-page web app (`web/`, built with bun) shown in a WebView. The assets
   are served from `https://appassets.androidplatform.net/web/index.html`; no remote content
   is loaded and links open externally.
+- **Busy indicators**: in a WebView any running CSS animation redraws the whole view every frame
+  (about a quarter of a core each for the app and the renderer, per measurement on the
+  XCover Pro). The long-lived ones (working and asking badges, running tool rows, the working
+  row, unsent items, a pending answer) therefore step at 2 Hz from one shared timer
+  (`ticking()` in `web/src/util.ts`). Hidden ones are skipped; the timer stops when none is left
+  or the app is hidden.
+  Only short-lived loading spinners and the voice/Live visuals use CSS animations.
 - **Bridge**:
   - The UI talks to the shell through `window.DD`: `send` for live messages, `enqueue` for
     queued ones, plus `pickFiles`, `setWakelock`, `setNotify`, `copyText`, `openUrl`,
