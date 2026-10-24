@@ -952,6 +952,8 @@ class Transcript:
         else:
             e["kind"] = "notice"
             text = notice_text(t, m, obj)
+            if t == "custom_message" and isinstance(obj.get("customType"), str):
+                e["source"] = obj["customType"]
         if text is not None:
             e["text"], truncated = cap(text, TEXT_CAP)
             if truncated:

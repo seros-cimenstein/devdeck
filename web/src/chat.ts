@@ -2,7 +2,7 @@
 import { request } from "./bridge";
 import { cacheGet, cachePut } from "./cache";
 import { hydrate, markdownEl, renderMarkdown } from "./md";
-import { dismissSend, onOutboxChange, outboxFor, retrySend } from "./outbox";
+import { dismissSend, onOutboxChange, outboxDelivered, outboxFor, retrySend } from "./outbox";
 import { hooks, state } from "./state";
 import type { AssistantEntry, Entry, FullMsg, ToolCall, TranscriptMsg } from "./types";
 import { debounce, h, icon, reducedMotion, ticking } from "./util";
@@ -13,6 +13,12 @@ const TRIM_TO = 160;
 const MAX_MEM = 1500; // entries kept in memory
 const LOCAL_PAGE = 40;
 const CACHE_ENTRIES = 80;
+/** Folded-card titles for the omp message types the daemon tags notices with (`source`). */
+const NOTICE_LABELS: Record<string, string> = {
+  "async-result": "Background job result",
+  advisor: "Advisor note",
+  "irc:incoming": "Message from a helper agent",
+};
 
 interface CachedTx {
   sessionId?: string;
@@ -113,12 +119,18 @@ export class ChatView {
       if (!m.reset) return; // appends to a cache snapshot would be out of order: wait for a reset
       this.live = true;
       this.resetWith(m.entries || [], !!m.hasMore, m.sessionId || "", false);
+      this.markDelivered(m.entries || []);
       return;
     }
     let appended = 0;
     for (const e of m.entries || []) if (this.upsert(e)) appended++;
     if (appended && !this.atBottom) this.unseen += appended;
     this.afterAppend();
+    this.markDelivered(m.entries || []);
+  }
+
+  private markDelivered(entries: Entry[]) {
+    for (const e of entries) if (e.kind === "user") outboxDelivered(this.target, e.text, e.ts);
   }
 
   private resetWith(entries: Entry[], hasMore: boolean, sessionId: string, fromCache: boolean) {
@@ -411,8 +423,19 @@ export class ChatView {
         );
         return d;
       }
-      case "notice":
-        return h("div.ent.notice", null, h("span", { text: this.full.get(e.id) ?? e.text }));
+      case "notice": {
+        const text = this.full.get(e.id) ?? e.text;
+        // Long or multi-line notices (background job results, advisor notes) fold into a card;
+        // a pill only suits one short line.
+        if (text.length <= 90 && !text.includes("\n")) return h("div.ent.notice", null, h("span", { text }));
+        const label = NOTICE_LABELS[e.source ?? ""] ?? text.split("\n", 1)[0].slice(0, 70);
+        return h(
+          "details.ent.card.notice-card",
+          null,
+          h("summary", null, h("span.icw", { html: icon("info") }), h("span.nc-l", { text: label })),
+          h("pre.nc-body", { text }),
+        );
+      }
       default:
         return h("div.ent.notice", { text: "Unsupported entry" });
     }

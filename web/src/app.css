@@ -126,6 +126,8 @@ pre, code { font-family: var(--mono); font-variant-ligatures: none; }
 .ent-meta { font-size: 12px; color: var(--warning); margin-top: 4px; }
 .ent.notice { text-align: center; font-size: 12.5px; color: var(--muted); }
 .ent.notice span { display: inline-block; background: var(--surface); border: 1px solid var(--border); padding: 4px 12px; border-radius: 999px; max-width: 100%; white-space: pre-wrap; text-align: left; }
+.notice-card > summary .nc-l { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.nc-body { margin: 0; padding: 0 12px 12px; font: 12px/1.45 var(--mono); color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; }
 details.card > summary { list-style: none; display: flex; align-items: center; gap: 8px; padding: 10px 12px; color: var(--muted); font-size: 13px; cursor: pointer; }
 details.card > summary::-webkit-details-marker { display: none; }

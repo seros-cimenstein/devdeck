@@ -60,6 +60,41 @@ export function outboxAck(m: AckMsg): boolean {
   return true;
 }
 
+/**
+ * A user entry reached the transcript: the send that produced it was delivered even if its ack
+ * never reached this page (it was reloading or hidden when the ack came). Clock skew between the
+ * phone and the PC is allowed for.
+ */
+export function outboxDelivered(target: string, text: string, ts: number) {
+  const want = text.trim();
+  let hit = false;
+  for (const it of items.values()) {
+    if (it.target === target && !it.failed && it.text.trim() === want && ts >= it.ts - 120_000) {
+      items.delete(it.id);
+      hit = true;
+      break;
+    }
+  }
+  if (hit) changed();
+}
+
+/**
+ * The shell's queue is the source of truth: online with nothing queued means no send is still
+ * in flight, so pending bubbles older than a few seconds are leftovers from a lost ack.
+ */
+export function outboxReconcile(queued: number) {
+  if (queued > 0) return;
+  const cutoff = Date.now() - 10_000;
+  let hit = false;
+  for (const it of [...items.values()]) {
+    if (!it.failed && it.ts < cutoff) {
+      items.delete(it.id);
+      hit = true;
+    }
+  }
+  if (hit) changed();
+}
+
 export function outboxFor(target: string): OutItem[] {
   return [...items.values()].filter((i) => i.target === target);
 }

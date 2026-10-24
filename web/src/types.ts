@@ -127,6 +127,8 @@ export interface CompactionEntry extends EntryBase {
 export interface NoticeEntry extends EntryBase {
   kind: "notice";
   text: string;
+  /** omp's customType for custom_message notices (e.g. "async-result"). */
+  source?: string;
 }
 export type Entry = UserEntry | AssistantEntry | CompactionEntry | NoticeEntry;
 

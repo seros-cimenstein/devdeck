@@ -211,6 +211,7 @@ const ICON_PATHS: Record<string, string> = {
   sun: "M12 7a5 5 0 100 10 5 5 0 000-10zM12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2",
   play: "M8 5l11 7-11 7z",
   history: "M3 12a9 9 0 103-6.7L3 8M3 3v5h5M12 7v5l3 3",
+  info: "M12 3a9 9 0 100 18 9 9 0 000-18zM12 11v6M12 7.5v.01",
   stop: "M7 7h10v10H7z",
   keyboard: "M3 6h18v12H3zM7 10h.01M11 10h.01M15 10h.01M18 10h-.01M7 14h10",
   edit: "M4 20h4L19 9l-4-4L4 16zM13 7l4 4",

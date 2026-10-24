@@ -9,7 +9,7 @@ import { FilesPanel, findRepo, openFileViewer } from "./files";
 import { openGit } from "./git";
 import { initLive, liveEntry, liveStatus, liveSync, onLive, onLiveDelegation, onLiveLocal, onLiveNotice, onLiveTranscript } from "./live";
 import { refreshModels } from "./omp";
-import { outboxAck, sendText } from "./outbox";
+import { outboxAck, outboxReconcile, sendText } from "./outbox";
 import { PagePanel } from "./page";
 import { currentPane, hooks, state, type View } from "./state";
 import { TermView } from "./term";
@@ -271,6 +271,7 @@ function onLink(l: LinkMsg) {
     voiceOnline();
   }
   lastLinkState = l.state;
+  if (l.state === "online") outboxReconcile(l.queued ?? 0);
   strip.update();
   compose.refresh();
   drawer.render();
