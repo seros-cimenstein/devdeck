@@ -35,7 +35,7 @@ export class FilesPanel {
   private seq = 0;
 
   constructor(start: string) {
-    this.panel = new Panel("Files", "files");
+    this.panel = new Panel("Files", "files", false);
     this.gitBtn = this.panel.action("git", "Git", () => this.repo && hooks.openGit(this.repo));
     this.gitBtn.hidden = true;
     this.panel.action("eye", "Toggle hidden files", () => {
@@ -43,7 +43,7 @@ export class FilesPanel {
       lsSet("dd.hidden", this.showHidden);
       this.renderList();
     });
-    this.panel.action("up", "Up", () => this.path && this.go(dirname(this.path)));
+    this.panel.leadAction("up", "Up", () => this.path && this.go(dirname(this.path)));
     this.crumbs = h("div.crumbs");
     this.list = h("div.flist");
     const here = h(

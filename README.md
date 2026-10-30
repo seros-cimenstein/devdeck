@@ -311,7 +311,8 @@ in the overflow menu.
 ### Files and Git
 
 **Files** (overflow menu) starts in the watched pane's working directory:
-- breadcrumbs, where the home icon is `~`, plus an Up button;
+- breadcrumbs, where the home icon is `~`, plus an Up button (top left; the phone's Back
+  closes Files);
 - an eye icon toggles hidden files;
 - text files open syntax-highlighted with line numbers, a wrap toggle and Copy;
 - Markdown is rendered (with a toggle to the source);

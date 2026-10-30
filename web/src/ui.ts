@@ -47,20 +47,23 @@ export class Panel implements Layer {
   readonly head: HTMLElement;
   readonly titleEl: HTMLElement;
   readonly subEl: HTMLElement;
+  private readonly titles: HTMLElement;
   readonly actions: HTMLElement;
   readonly body: HTMLElement;
   private closed = false;
   onClose?: () => void;
 
-  constructor(title: string, cls = "") {
+  /** `back: false` drops the header Back button (system Back still closes the panel). */
+  constructor(title: string, cls = "", back = true) {
     this.titleEl = h("div.p-title", { text: title });
     this.subEl = h("div.p-sub");
     this.actions = h("div.p-actions");
+    this.titles = h("div.p-titles", null, this.titleEl, this.subEl);
     this.head = h(
       "div.p-head",
       null,
-      h("button.ib", { "aria-label": "Back", html: icon("back"), onclick: () => this.close() }),
-      h("div.p-titles", null, this.titleEl, this.subEl),
+      back ? h("button.ib", { "aria-label": "Back", html: icon("back"), onclick: () => this.close() }) : null,
+      this.titles,
       this.actions,
     );
     this.body = h("div.p-body");
@@ -76,9 +79,17 @@ export class Panel implements Layer {
     this.subEl.hidden = !sub;
   }
 
+  /** Header button at the right, after the earlier actions. */
   action(iconName: string, label: string, fn: () => void): HTMLButtonElement {
-    const b = h("button.ib", { "aria-label": label, title: label, html: icon(iconName), onclick: fn }) as HTMLButtonElement;
+    const b = headButton(iconName, label, fn);
     this.actions.append(b);
+    return b;
+  }
+
+  /** Header button at the left, between Back and the title. */
+  leadAction(iconName: string, label: string, fn: () => void): HTMLButtonElement {
+    const b = headButton(iconName, label, fn);
+    this.titles.before(b);
     return b;
   }
 
@@ -93,6 +104,10 @@ export class Panel implements Layer {
     setTimeout(done, 400);
     this.onClose?.();
   }
+}
+
+function headButton(iconName: string, label: string, fn: () => void): HTMLButtonElement {
+  return h("button.ib", { "aria-label": label, title: label, html: icon(iconName), onclick: fn }) as HTMLButtonElement;
 }
 
 export function spinnerEl(text = ""): HTMLElement {
