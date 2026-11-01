@@ -173,6 +173,53 @@ export function openMenu(anchor: HTMLElement, items: MenuItem[]) {
   pushLayer(layer);
 }
 
+/**
+ * The grab bar at the top of a bottom sheet: a full-width strip that collapses the sheet when tapped or dragged
+ * down (past 80 px, or a quick flick); a shorter drag springs back.
+ */
+export function grabHandle(sheet: HTMLElement, close: () => void): HTMLElement {
+  const zone = h("div.grab-zone", { role: "button", "aria-label": "Collapse" }, h("div.grab"));
+  let startY = 0;
+  let startT = 0;
+  let dy = 0;
+  let active = false;
+  const start = (y: number) => {
+    active = true;
+    startY = y;
+    startT = performance.now();
+    dy = 0;
+    sheet.style.transition = "none";
+  };
+  const move = (y: number) => {
+    if (!active) return;
+    dy = Math.max(0, y - startY);
+    sheet.style.transform = `translateY(${dy}px)`;
+  };
+  const end = (cancelled: boolean) => {
+    if (!active) return;
+    active = false;
+    sheet.style.transition = "";
+    sheet.style.transform = "";
+    const fast = dy > 20 && dy / Math.max(1, performance.now() - startT) > 0.5;
+    if (dy > 80 || fast || (!cancelled && dy < 6)) close();
+  };
+  // Touch: touch events with preventDefault, because the WebView cancels a touch pointer stream once it decides
+  // the finger is panning. Mouse (desktop browser): pointer events with capture.
+  zone.addEventListener("touchstart", (e) => start(e.touches[0].clientY), { passive: true });
+  zone.addEventListener("touchmove", (e) => (e.preventDefault(), move(e.touches[0].clientY)), { passive: false });
+  zone.addEventListener("touchend", (e) => (e.preventDefault(), end(false)));
+  zone.addEventListener("touchcancel", () => end(true));
+  zone.addEventListener("pointerdown", (e) => {
+    if (e.pointerType !== "mouse") return;
+    zone.setPointerCapture(e.pointerId);
+    start(e.clientY);
+  });
+  zone.addEventListener("pointermove", (e) => e.pointerType === "mouse" && move(e.clientY));
+  zone.addEventListener("pointerup", (e) => e.pointerType === "mouse" && end(false));
+  zone.addEventListener("pointercancel", (e) => e.pointerType === "mouse" && end(true));
+  return zone;
+}
+
 // ---- bottom sheet created on demand and removed when closed; later sheets stack above earlier ones
 let sheetDepth = 0;
 export class Sheet implements Layer {
@@ -195,7 +242,6 @@ export class Sheet implements Layer {
     this.el = h(
       `div.sheet${cls ? "." + cls : ""}`,
       { role: "dialog", "aria-modal": "true" },
-      h("div.grab"),
       h(
         "div.sheet-head.pad",
         null,
@@ -205,6 +251,7 @@ export class Sheet implements Layer {
       this.body,
       this.foot,
     );
+    this.el.prepend(grabHandle(this.el, () => this.close()));
     const z = 30 + 2 * sheetDepth++;
     this.scrim.style.zIndex = String(z);
     this.el.style.zIndex = String(z + 1);

@@ -317,9 +317,12 @@ shows:
 Submit is enabled once every question has an answer. It shows "Answering in the
 terminal...", then closes with "Answer sent", or shows the PC's error with Retry.
 
-A dismissed sheet leaves a red "? question ... Answer" banner above the compose bar. Agents
-asking in other terminals show a red ? in the drawer; tapping one opens the terminal and the
-sheet.
+Tap the grab bar at the top of the sheet, or drag it down, to collapse it (this works on
+every bottom sheet; a short drag springs back). A collapsed sheet leaves a red "? question
+... Answer" banner above the compose bar. What you picked, typed under "Other" or wrote as
+a note is kept for that question (also across an app restart) and is back when you reopen
+it; it is dropped once the answer is sent or the question closes. Agents asking in other
+terminals show a red ? in the drawer; tapping one opens the terminal and the sheet.
 
 The answer is typed into omp's question dialog by the PC (see "How it works"). It is
 refused when:

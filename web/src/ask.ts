@@ -3,14 +3,35 @@ import { enqueue } from "./bridge";
 import { renderInline, renderMarkdown } from "./md";
 import { paneTitle, state } from "./state";
 import type { AckMsg, Ask, AskQuestion } from "./types";
-import { type Layer, pushLayer, removeLayer, toast } from "./ui";
-import { h, icon, ticking, uuid } from "./util";
+import { grabHandle, type Layer, pushLayer, removeLayer, toast } from "./ui";
+import { h, icon, lsGet, lsSet, ticking, uuid } from "./util";
 
 interface QState {
   selected: Set<string>;
   other: boolean;
   custom: string;
   note: string;
+}
+
+/** Answers picked or typed but not sent yet, per ask (`toolCallId`), so collapsing the sheet or a reload keeps them. */
+const DRAFTS_KEY = "dd.askDrafts";
+const DRAFTS_MAX = 20;
+type StoredQ = { selected: string[]; other: boolean; custom: string; note: string };
+type Drafts = Record<string, { ts: number; qs: StoredQ[] }>;
+
+function loadDraft(ask: Ask): QState[] | null {
+  const d = lsGet<Drafts>(DRAFTS_KEY, {})[ask.toolCallId];
+  if (!d || d.qs.length !== ask.questions.length) return null;
+  return d.qs.map((q) => ({ selected: new Set(q.selected), other: q.other, custom: q.custom, note: q.note }));
+}
+
+function saveDraft(id: string, qs: QState[] | null) {
+  const all = lsGet<Drafts>(DRAFTS_KEY, {});
+  const empty = !qs || qs.every((q) => !q.selected.size && !q.other && !q.custom && !q.note);
+  if (empty) delete all[id];
+  else all[id] = { ts: Date.now(), qs: qs.map((q) => ({ selected: [...q.selected], other: q.other, custom: q.custom, note: q.note })) };
+  const keep = Object.entries(all).sort((a, b) => b[1].ts - a[1].ts).slice(0, DRAFTS_MAX);
+  lsSet(DRAFTS_KEY, Object.fromEntries(keep));
 }
 
 export class AskSheet implements Layer {
@@ -40,13 +61,8 @@ export class AskSheet implements Layer {
     this.voiceEl = h("div.ask-voice", { hidden: true });
     this.submitBtn = h("button.btn.primary.wide", { text: "Submit", onclick: () => this.submit() }) as HTMLButtonElement;
     this.foot = h("div.sheet-foot", null, this.voiceEl, this.statusEl, this.submitBtn);
-    this.sheet = h(
-      "div.sheet.ask-sheet",
-      { role: "dialog", "aria-modal": "true" },
-      h("div.grab"),
-      this.body,
-      this.foot,
-    );
+    this.sheet = h("div.sheet.ask-sheet", { role: "dialog", "aria-modal": "true" }, this.body, this.foot);
+    this.sheet.prepend(grabHandle(this.sheet, () => this.close()));
     document.getElementById("app")!.append(this.scrim, this.sheet);
   }
 
@@ -59,7 +75,7 @@ export class AskSheet implements Layer {
     this.target = target;
     this.ask = ask;
     this.pendingId = "";
-    this.qs = ask.questions.map(() => ({ selected: new Set<string>(), other: false, custom: "", note: "" }));
+    this.qs = loadDraft(ask) ?? ask.questions.map(() => ({ selected: new Set<string>(), other: false, custom: "", note: "" }));
     this.render();
     this.isOpen = true;
     this.scrim.classList.add("open");
@@ -72,7 +88,10 @@ export class AskSheet implements Layer {
 
   close() {
     if (!this.isOpen) return;
-    if (this.ask && !this.pendingId) this.dismissed.add(this.ask.toolCallId);
+    if (this.ask && !this.pendingId) {
+      this.dismissed.add(this.ask.toolCallId);
+      saveDraft(this.ask.toolCallId, this.qs);
+    }
     this.isOpen = false;
     removeLayer(this);
     // The sheet stays in the DOM: a leftover "Answering..." spinner would keep animating off-screen.
@@ -89,7 +108,9 @@ export class AskSheet implements Layer {
     const p = state.byTarget.get(this.target);
     if (!p || p.ask?.toolCallId !== this.ask.toolCallId) {
       if (!this.pendingId) {
+        const id = this.ask.toolCallId;
         this.close();
+        saveDraft(id, null);
         toast("The question was answered or cancelled");
       }
     }
@@ -100,6 +121,7 @@ export class AskSheet implements Layer {
     this.pendingId = "";
     if (m.ok) {
       this.close();
+      if (this.ask) saveDraft(this.ask.toolCallId, null);
       toast("Answer sent", "ok");
     } else {
       this.setStatus("err", m.error || "The answer could not be delivered");
@@ -247,16 +269,22 @@ export class AskSheet implements Layer {
     });
     opts.append(otherRow, otherInput);
     box.append(opts);
-    // Re-renders (voice answers) keep what is already chosen.
+    // Re-renders (voice answers) and reopening (a saved draft) keep what is already chosen.
     inputs.forEach((inp, oi) => (inp.checked = st.selected.has(q.options[oi].label)));
     otherRadio.checked = st.other;
     otherInput.value = st.custom;
     if (st.selected.size || st.other) sync();
+    if (st.custom) requestAnimationFrame(() => (otherInput.style.height = `${Math.min(otherInput.scrollHeight, 140)}px`));
 
     const noteIn = h("textarea.note-in", { rows: 1, placeholder: "Note for the agent (optional)" }) as HTMLTextAreaElement;
-    noteIn.hidden = true;
-    noteIn.addEventListener("input", () => (st.note = noteIn.value));
+    noteIn.value = st.note;
+    noteIn.hidden = !st.note;
+    noteIn.addEventListener("input", () => {
+      st.note = noteIn.value;
+      this.persist();
+    });
     const noteBtn = h("button.lnk.note-btn", { text: "Add note" });
+    noteBtn.hidden = !!st.note;
     noteBtn.addEventListener("click", () => {
       noteIn.hidden = false;
       noteBtn.hidden = true;
@@ -275,6 +303,12 @@ export class AskSheet implements Layer {
     if (this.pendingId) return;
     const ok = this.qs.every((_, i) => this.complete(i));
     this.submitBtn.disabled = !ok;
+    this.persist();
+  }
+
+  /** Saves the answers so far, so they survive collapsing the sheet and an app restart. */
+  private persist() {
+    if (this.ask && this.isOpen) saveDraft(this.ask.toolCallId, this.qs);
   }
 
   private setStatus(kind: "pending" | "err", text: string) {
