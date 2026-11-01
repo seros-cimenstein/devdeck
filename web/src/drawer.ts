@@ -16,6 +16,7 @@ export class Drawer implements Layer {
   constructor(
     private readonly onPick: (target: string) => void,
     private readonly onNew: () => void,
+    private readonly onRestore: () => void,
   ) {
     this.list = h("div.d-list");
     this.hostEl = h("div.d-host");
@@ -25,6 +26,7 @@ export class Drawer implements Layer {
       h("div.d-head", null, h("div", null, h("div.d-title", { text: "Terminals" }), this.hostEl)),
       this.list,
       h("button.d-new", { onclick: () => (this.close(), this.onNew()) }, h("span.icw", { html: icon("plus") }), h("span", { text: "New terminal" })),
+      h("button.d-new.d-restore", { onclick: () => (this.close(), this.onRestore()) }, h("span.icw", { html: icon("history") }), h("span", { text: "Restore sessions..." })),
     );
     this.scrim = h("div.scrim.d-scrim", { onclick: () => this.close() });
     document.getElementById("app")!.append(this.scrim, this.el);

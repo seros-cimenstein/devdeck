@@ -295,6 +295,7 @@ details.card > .md { padding: 0 14px 10px; font-size: 14px; }
 .d-ctx { font-size: 13px; color: color-mix(in srgb, var(--fg) 80%, transparent); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .d-cwd { font: 11.5px var(--mono); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; unicode-bidi: plaintext; }
 .d-new { display: flex; align-items: center; gap: 10px; margin: 8px; padding: 12px 14px; border-radius: 12px; border: 1px dashed var(--surface3); color: var(--accent); font-weight: 600; }
+.d-restore { margin-top: 0; }
 
 .sheet { position: fixed; left: 0; right: 0; bottom: 0; max-height: 90%; z-index: 31; background: var(--surface); border-radius: 20px 20px 0 0; border-top: 1px solid var(--border); display: flex; flex-direction: column; transform: translateY(105%); transition: transform .3s var(--ease); box-shadow: 0 -10px 40px rgba(0,0,0,.5); max-width: 760px; margin: 0 auto; padding-bottom: env(safe-area-inset-bottom); }
 .sheet.open { transform: translateY(0); }

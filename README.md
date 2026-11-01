@@ -113,8 +113,8 @@ From left to right:
   offline, grey when idle and hollow when unpaired. The pill also shows the round-trip time
   and an amber count of queued items. Tap it for details.
 - **Overflow menu**: Files, Git, Chat/Terminal view, Sketch, Keep screen awake,
-  Notifications, Resync, Voice settings, New terminal, omp settings (global when no omp
-  terminal is open), Usage limits and Update omp.
+  Notifications, Resync, Voice settings, New terminal, Restore sessions..., omp settings
+  (global when no omp terminal is open), Usage limits and Update omp.
 
 A thin progress bar under the top bar shows a running upload.
 
@@ -140,6 +140,7 @@ Every tmux pane gets one row:
 
 "New terminal" creates its own tmux session (`phone-1`, `phone-2`, …, lowest free number)
 running your shell in `~`, and opens it in the terminal view. Close it by typing `exit`.
+"Restore sessions..." under it opens the restore checklist (see "Restore" below).
 
 ### Chat view
 
@@ -197,7 +198,7 @@ offline, never queued), one at a time per terminal, and reports omp's own error 
 - **Thinking** (`/effort` or `/thinking` in the slash palette): a small sheet with the model's
   levels plus Auto.
 - **Context meter** (used/window) and a **plan badge** while plan mode is on.
-- **Session menu**: New session, Resume..., Side questions..., Compact (optional focus), Clear
+- **Session menu**: New session, Resume..., Restore sessions..., Side questions..., Compact (optional focus), Clear
   context, Plan mode on/off, Plan review..., Retry last turn, Rewind..., Session tree...,
   Rename, Session info, Usage limits..., omp settings.... Rename makes omp format the title
   with a small model call (an emoji and a category prefix are added).
@@ -212,7 +213,8 @@ offline, never queued), one at a time per terminal, and reports omp's own error 
   opens a new terminal in the session's folder running `omp --restore <id>`, which closes the
   cut-off turn and continues it (like `/retry`), and shows it in chat. Sessions whose
   terminal went away while omp ran (tmux killed, omp killed, terminal closed) are marked
-  **Closed**. `/restore` opens a checklist of every Interrupted or Closed session of every
+  **Closed**. `/restore` (also "Restore sessions..." in the terminals drawer, the overflow
+  menu and the session menu) opens a checklist of every Interrupted or Closed session of every
   project (title, folder, age, tag; "No sessions to restore" when there are none) with
   **Select all** and **Restore N**: the PC opens one terminal per ticked session, continuing
   Interrupted ones (`omp --restore`) and reopening Closed ones (`omp --resume`, with

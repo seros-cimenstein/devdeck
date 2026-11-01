@@ -86,6 +86,7 @@ export function openSessionMenu(anchor: HTMLElement) {
   openMenu(anchor, [
     { label: "New session", icon: "plus", disabled: off, act: () => void actions.newSession() },
     { label: "Resume...", icon: "history", disabled: off, act: actions.resume },
+    { label: "Restore sessions...", icon: "history", disabled: off, act: actions.restore },
     { label: "Side questions...", icon: "btw", disabled: off, act: () => actions.btw() },
     { label: "Compact...", icon: "compress", disabled: off, act: actions.compact },
     { label: "Clear context", icon: "eraser", disabled: off || busy, act: () => void actions.clear() },

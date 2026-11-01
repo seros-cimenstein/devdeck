@@ -88,6 +88,7 @@ page.onChange = () => updatePageBanner();
 const drawer = new Drawer(
   (t) => openTarget(t),
   () => newTerminal(),
+  () => openRestoreSheet(),
 );
 const ask = new AskSheet();
 ask.onChange = () => updateAskBanner();
@@ -181,6 +182,7 @@ function openMoreMenu(anchor: HTMLElement) {
     { label: "Resync", icon: "refresh", act: () => (send({ t: "resync" }) ? toast("Resyncing") : toast("Offline", "err")) },
     { label: "Voice settings", icon: "headset", act: openVoiceSettings },
     { label: "New terminal", icon: "plus", act: newTerminal },
+    { label: "Restore sessions...", icon: "history", act: openRestoreSheet },
     { label: "omp settings", icon: "sliders", act: openSettings },
     { label: "Usage limits", icon: "gauge", act: openUsage },
     { label: "Update omp", icon: "refresh", act: openOmpUpdate },
