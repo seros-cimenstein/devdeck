@@ -54,7 +54,7 @@ export class Drawer implements Layer {
 
   render(force = false) {
     this.hostEl.textContent = state.link?.host || "";
-    const sig = JSON.stringify([state.target, [...state.done], state.panes.map((p) => [p.target, p.state, p.context, p.cwd, p.name, p.cmd, !!p.ask])]);
+    const sig = JSON.stringify([state.target, [...state.done], state.panes.map((p) => [p.target, p.state, p.context, p.cwd, p.name, p.cmd, !!p.ask, !!p.sketch])]);
     if (!force && sig === this.sig) return;
     this.sig = sig;
     if (!this.isOpen && !force) return;
@@ -65,7 +65,7 @@ export class Drawer implements Layer {
       const sub = p.context || (p.agent ? "" : p.cmd);
       frag.append(
         h(
-          `button.d-item${cur ? ".cur" : ""}${p.state === "asking" ? ".ask" : ""}`,
+          `button.d-item${cur ? ".cur" : ""}${p.state === "asking" || p.sketch ? ".ask" : ""}`,
           { onclick: () => (this.close(), this.onPick(p.target)) },
           badgeEl(badgeKind(p)),
           h(

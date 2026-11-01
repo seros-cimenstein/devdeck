@@ -1,5 +1,6 @@
 // DevDeck WebView UI entry: wires the bridge, state and views.
 import { AskSheet } from "./ask";
+import { btwResync, onBtwDelta, onBtwRecord } from "./btw";
 import { bridge, send, settle } from "./bridge";
 import { ChatView } from "./chat";
 import { Compose } from "./compose";
@@ -12,13 +13,19 @@ import { initLive, liveEntry, liveStatus, liveSync, onLive, onLiveDelegation, on
 import { refreshModels } from "./omp";
 import { outboxAck, outboxReconcile, sendText } from "./outbox";
 import { PagePanel } from "./page";
+import { initPlanReview, openPlanReview, planOpenFor, planSync } from "./plan";
+import { openSettings } from "./settings";
 import { openOmpUpdate } from "./sheets";
+import { onSketchChange, onSketchEvent, openSketch, sketchLink, sketchOpenFor } from "./sketch";
 import { currentPane, hooks, state, type View } from "./state";
 import { TermView } from "./term";
 import { TopBar } from "./topbar";
+import { onUsagePush, openUsage } from "./usage";
 import type {
   AckMsg,
   AudioMsg,
+  BtwDeltaMsg,
+  BtwRecordMsg,
   LinkMsg,
   LiveDelegationMsg,
   LiveLocalMsg,
@@ -29,9 +36,11 @@ import type {
   Pane,
   ScreenMsg,
   SessionsMsg,
+  SketchEventMsg,
   SttMsg,
   TranscriptMsg,
   TtsMsg,
+  UsageMsg,
   VoiceErrorMsg,
 } from "./types";
 import { openMenu, popLayer, toast } from "./ui";
@@ -66,8 +75,10 @@ const compose = new Compose((target, text, enter) => {
 });
 const askBanner = h("div.ask-banner", { hidden: true });
 const pageBanner = h("div.ask-banner.page-banner", { hidden: true });
+const sketchBanner = h("div.ask-banner.sketch-banner", { hidden: true });
+const planBanner = h("div.ask-banner.plan-banner", { hidden: true });
 const main = h("main.main", null, chat.wrap, term.wrap);
-app.append(top.el, strip.el, main, pageBanner, askBanner, voicePanel, compose.el);
+app.append(top.el, strip.el, main, pageBanner, sketchBanner, planBanner, askBanner, voicePanel, compose.el);
 const page = new PagePanel();
 page.onChange = () => updatePageBanner();
 const drawer = new Drawer(
@@ -84,6 +95,8 @@ initVoice({
   onSent: () => chat.scrollToBottom(true),
 });
 initLive({ onStatus: () => top.setLive(liveStatus()) });
+onSketchChange(() => updateSketchBanner());
+initPlanReview(() => updatePlanBanner());
 
 hooks.open = (t, v) => openTarget(t, v);
 hooks.openAsk = (t, a) => {
@@ -93,6 +106,7 @@ hooks.openAsk = (t, a) => {
 hooks.openFiles = (p) => new FilesPanel(p || currentPane()?.cwd || "~");
 hooks.openGit = (p) => openGit(p);
 hooks.openFile = (p) => openFileViewer(p);
+hooks.setDraft = (t, text) => compose.putDraft(t, text);
 
 // ---------------------------------------------------------------- navigation
 
@@ -126,6 +140,9 @@ function openTarget(target: string, view?: View) {
   updateAttention();
   maybeAutoAsk();
   updateAskBanner();
+  updateSketchBanner();
+  planSync(target);
+  updatePlanBanner();
 }
 
 function newTerminal() {
@@ -149,13 +166,18 @@ function openMoreMenu(anchor: HTMLElement) {
       },
     },
     ...(p?.agent
-      ? [{ label: state.view === "chat" ? "Terminal view" : "Chat view", icon: state.view === "chat" ? "term" : "chat", act: () => openTarget(p.target, state.view === "chat" ? "term" : "chat") }]
+      ? [
+          { label: state.view === "chat" ? "Terminal view" : "Chat view", icon: state.view === "chat" ? "term" : "chat", act: () => openTarget(p.target, state.view === "chat" ? "term" : "chat") },
+          { label: "Sketch", icon: "edit", act: () => openSketch(p.target) },
+        ]
       : []),
     { label: "Keep screen awake", icon: "sun", toggle: true, on: !!l?.wakelock, act: () => bridge.setWakelock(!l?.wakelock) },
     { label: "Notifications", icon: "bell", toggle: true, on: !!l?.notify, act: () => bridge.setNotify(!l?.notify) },
     { label: "Resync", icon: "refresh", act: () => (send({ t: "resync" }) ? toast("Resyncing") : toast("Offline", "err")) },
     { label: "Voice settings", icon: "headset", act: openVoiceSettings },
     { label: "New terminal", icon: "plus", act: newTerminal },
+    { label: "omp settings", icon: "sliders", act: openSettings },
+    { label: "Usage limits", icon: "gauge", act: openUsage },
     { label: "Update omp", icon: "refresh", act: openOmpUpdate },
   ]);
 }
@@ -215,10 +237,13 @@ function onSessions(list: Pane[]) {
   updateAttention();
   maybeAutoAsk();
   updateAskBanner();
+  updateSketchBanner();
+  planSync(state.target);
+  updatePlanBanner();
 }
 
 function updateAttention() {
-  top.setAttention(state.panes.some((p) => p.target !== state.target && (p.state === "asking" || state.done.has(p.target))));
+  top.setAttention(state.panes.some((p) => p.target !== state.target && (p.state === "asking" || !!p.sketch || state.done.has(p.target))));
 }
 
 function maybeAutoAsk() {
@@ -229,7 +254,8 @@ function maybeAutoAsk() {
 
 function syncPage() {
   const p = currentPane();
-  if (state.view === "chat" && p?.agent) page.sync(p.target, p.omp?.page);
+  // A pending plan review is answered in the native sheet, not in omp's mirrored overlay.
+  if (state.view === "chat" && p?.agent) page.sync(p.target, p.planReview ? null : p.omp?.page);
   else page.reset();
   updatePageBanner();
 }
@@ -237,7 +263,7 @@ function syncPage() {
 function updatePageBanner() {
   const p = currentPane();
   const pg = p?.omp?.page;
-  const show = !!pg && state.view === "chat" && page.hiddenFor === p?.target && !page.isOpen;
+  const show = !!pg && !p?.planReview && state.view === "chat" && page.hiddenFor === p?.target && !page.isOpen;
   pageBanner.hidden = !show;
   if (!show) return;
   pageBanner.textContent = "";
@@ -263,6 +289,33 @@ function updateAskBanner() {
   );
 }
 
+function updateSketchBanner() {
+  const p = currentPane();
+  const req = p?.sketch;
+  const show = !!req && sketchOpenFor() !== p?.target;
+  sketchBanner.hidden = !show;
+  if (!show || !p || !req) return;
+  sketchBanner.textContent = "";
+  sketchBanner.append(
+    h("span.ab-badge", { html: icon("edit") }),
+    h("span.ab-text", { text: req.prompt.split("\n", 1)[0] || "The agent asks for a sketch" }),
+    h("button.btn.primary.sm", { text: "Draw", onclick: () => openSketch(p.target) }),
+  );
+}
+
+function updatePlanBanner() {
+  const p = currentPane();
+  const r = p?.planReview;
+  const show = !!r && state.view === "chat" && planOpenFor() !== r.id;
+  planBanner.hidden = !show;
+  if (!show || !p || !r) return;
+  planBanner.replaceChildren(
+    h("span.ab-badge", { html: icon("plan") }),
+    h("span.ab-text", { text: `Plan ready for review: ${r.title || "plan"}` }),
+    h("button.btn.primary.sm", { text: "Review", onclick: () => openPlanReview(p.target, r) }),
+  );
+}
+
 function onLink(l: LinkMsg) {
   state.link = l;
   top.setLink(l);
@@ -272,6 +325,10 @@ function onLink(l: LinkMsg) {
   if (l.state === "online" && lastLinkState !== "online") {
     refreshModels().catch(() => {});
     voiceOnline();
+    sketchLink(true);
+    btwResync();
+  } else if (l.state !== "online" && lastLinkState === "online") {
+    sketchLink(false);
   }
   lastLinkState = l.state;
   if (l.state === "online") outboxReconcile(l.queued ?? 0);
@@ -302,7 +359,9 @@ function receive(m: Msg) {
     case "screen": {
       const sm = m as unknown as ScreenMsg;
       if (sm.page != null) {
-        if (state.view === "chat" && sm.target === state.target) page.onScreen(sm);
+        // omp's plan review overlay is answered in the native sheet instead.
+        const native = sm.page !== false && !!state.byTarget.get(sm.target)?.planReview;
+        if (state.view === "chat" && sm.target === state.target && !native) page.onScreen(sm);
         return;
       }
       if (state.view === "term" && sm.target === state.target) term.onScreen(sm);
@@ -344,6 +403,15 @@ function receive(m: Msg) {
       return onLiveDelegation(m as unknown as LiveDelegationMsg);
     case "live_notice":
       return onLiveNotice(m as unknown as LiveNoticeMsg);
+    case "sketch_event":
+      return onSketchEvent(m as unknown as SketchEventMsg);
+    case "btw_delta":
+      return onBtwDelta(m as unknown as BtwDeltaMsg);
+    case "btw_record":
+      return onBtwRecord(m as unknown as BtwRecordMsg);
+    case "usage":
+      if (settle(m)) return;
+      return onUsagePush(m as unknown as UsageMsg);
     case "pong":
       return;
     default:

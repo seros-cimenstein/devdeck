@@ -292,7 +292,8 @@ def catalog() -> list[dict]:
         except (OSError, ValueError, KeyError, TypeError):
             models = None
         if isinstance(models, list):
-            return [m for m in models if isinstance(m, dict) and isinstance(m.get("selector"), str)]
+            return [m for m in models if isinstance(m, dict) and isinstance(m.get("selector"), str)
+                    and m.get("kind", "chat") == "chat"]
     try:
         r = subprocess.run(["omp", "models", "--json"], capture_output=True, text=True, timeout=90,
                            stdin=subprocess.DEVNULL, cwd=HOME)

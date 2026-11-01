@@ -1,30 +1,31 @@
 // omp session controls: model list cache, `cmd` requests with pending tracking, display helpers.
-import { request } from "./bridge";
+import { RequestError, request } from "./bridge";
 import { currentPane, state } from "./state";
-import type { CmdMsg, ModelInfo, ModelsMsg, OmpInfo } from "./types";
+import type { CmdMsg, ModelInfo, ModelsMsg, OmpInfo, RolesKey, RolesMsg } from "./types";
 import { toast } from "./ui";
 import { lsGet, lsSet } from "./util";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-const LEVEL_LABEL: Record<string, string> = { off: "Off", minimal: "Min", low: "Low", medium: "Med", high: "High", xhigh: "XHigh", max: "Max", auto: "Auto" };
+const LEVEL_LABEL: Record<string, string> = { off: "Off", minimal: "Min", low: "Low", medium: "Med", high: "High", xhigh: "XHigh", max: "Max", auto: "Auto", inherit: "Inherit" };
 export const levelLabel = (l: string) => LEVEL_LABEL[l] ?? l;
 
-/** Levels offered for a model: omp always allows `off` in front of the model's own levels. */
+/** Levels offered for a model: `off`, the model's own levels, then session-only `auto` (none without thinking). */
 export function levelsFor(m: ModelInfo | undefined): string[] {
   if (!m?.thinking?.length) return [];
-  return ["off", ...m.thinking.filter((l) => l !== "off")];
+  return ["off", ...m.thinking.filter((l) => l !== "off" && l !== "auto"), "auto"];
 }
 
-/** The level to preselect: `want` when supported, else the closest supported one. */
+/** The level to preselect: `want` when supported, else the closest supported concrete level. */
 export function pickLevel(levels: string[], want: string | null | undefined): string {
   if (!levels.length) return "";
   if (want && levels.includes(want)) return want;
+  const concrete = levels.filter((l) => l !== "off" && l !== "auto");
   const wi = THINKING_LEVELS.indexOf(want || "medium");
-  let best = levels[levels.length - 1];
+  let best = concrete[concrete.length - 1] ?? levels[0];
   let bestD = Infinity;
-  for (const l of levels) {
+  for (const l of concrete) {
     const d = Math.abs(THINKING_LEVELS.indexOf(l) - wi);
-    if (l !== "off" && d < bestD) {
+    if (d < bestD) {
       best = l;
       bestD = d;
     }
@@ -48,14 +49,14 @@ export const isOnline = () => state.link?.state === "online";
 
 export interface ModelsData {
   models: ModelInfo[];
-  roles: Record<string, string>;
   fetchedAt?: number;
   /** When this client last received the list (ms). */
   at: number;
 }
 
-const MODELS_KEY = "dd.models";
+const MODELS_KEY = "dd.models.v2";
 const MODELS_FRESH_MS = 10 * 60_000;
+lsSet("dd.models", null); // pre-v2 shape (with roles), never read again
 let models: ModelsData | null = lsGet<ModelsData | null>(MODELS_KEY, null);
 let bySelector = indexModels(models);
 let inflight: Promise<ModelsData> | null = null;
@@ -78,8 +79,8 @@ export function refreshModels(force = false): Promise<ModelsData> {
   if (inflight) return inflight;
   inflight = request<ModelsMsg>({ t: "models" }, 120_000)
     .then((m) => {
-      const d: ModelsData = { models: m.models || [], roles: m.roles || {}, fetchedAt: m.fetchedAt, at: Date.now() };
-      const changed = !models || JSON.stringify(models.models) !== JSON.stringify(d.models) || JSON.stringify(models.roles) !== JSON.stringify(d.roles);
+      const d: ModelsData = { models: m.models || [], fetchedAt: m.fetchedAt, at: Date.now() };
+      const changed = !models || JSON.stringify(models.models) !== JSON.stringify(d.models);
       models = d;
       bySelector = indexModels(d);
       lsSet(MODELS_KEY, d);
@@ -90,6 +91,84 @@ export function refreshModels(force = false): Promise<ModelsData> {
       inflight = null;
     });
   return inflight;
+}
+
+// ---------------------------------------------------------------- model roles (omp config), in memory
+
+/**
+ * omp's role settings as read for one omp pane (its working directory picks the project config layer);
+ * `target` "" = the global settings.
+ */
+let roles: { target: string; msg: RolesMsg } | null = null;
+const rolesInflight = new Map<string, Promise<RolesMsg>>();
+const rolesListeners = new Set<(r: RolesMsg, target: string) => void>();
+
+export const rolesCached = (target: string): RolesMsg | null => (roles?.target === target ? roles.msg : null);
+export function onRoles(fn: (r: RolesMsg, target: string) => void): () => void {
+  rolesListeners.add(fn);
+  return () => rolesListeners.delete(fn);
+}
+function setRolesState(target: string, msg: RolesMsg) {
+  roles = { target, msg };
+  for (const fn of rolesListeners) fn(msg, target);
+}
+
+/** Re-reads omp's role settings from the PC (for the omp pane `target`, else global); concurrent calls share one request. */
+export function refreshRoles(target: string): Promise<RolesMsg> {
+  let p = rolesInflight.get(target);
+  if (p) return p;
+  p = request<RolesMsg>(target ? { t: "roles", target } : { t: "roles" }, 30_000)
+    .then((r) => {
+      setRolesState(target, r);
+      return r;
+    })
+    .finally(() => rolesInflight.delete(target));
+  rolesInflight.set(target, p);
+  return p;
+}
+
+/** The configured role values (`modelRoles`) as omp stores them. */
+export function roleValues(r: RolesMsg): Record<string, string> {
+  return Object.fromEntries(r.roles.filter((x) => x.value).map((x) => [x.name, x.value!]));
+}
+
+export type PresetsValue = Record<string, { modelRoles: Record<string, string>; defaultThinkingLevel?: string }>;
+export function presetsValue(r: RolesMsg): PresetsValue {
+  return Object.fromEntries(r.presets.map((p) => [p.name, { modelRoles: p.roles, ...(p.thinking ? { defaultThinkingLevel: p.thinking } : {}) }]));
+}
+
+/** The value of `key` as last received: the `base` a `roles_set` write is checked against. */
+export function rolesBase(r: RolesMsg, key: RolesKey): unknown {
+  switch (key) {
+    case "modelRoles":
+      return roleValues(r);
+    case "retry.fallbackChains":
+      return r.chains;
+    case "cycleOrder":
+      return r.cycle;
+    case "compaction.modelThresholds":
+      return r.thresholds;
+    case "modelPresets":
+      return presetsValue(r);
+  }
+}
+
+/**
+ * Writes one whole setting on the PC (for the omp pane `target`, else global). Resolves with the fresh state
+ * (listeners re-render), or null after toasting the error; a conflict ("changed on the PC") also refetches.
+ */
+export async function setRoles(key: RolesKey, value: unknown, base: unknown, target: string): Promise<RolesMsg | null> {
+  try {
+    const msg = { t: "roles_set", key, value, base, ...(target ? { target } : {}) };
+    const r = await request<RolesMsg>(msg, 60_000);
+    setRolesState(target, r);
+    return r;
+  } catch (e) {
+    const text = (e as Error).message;
+    toast(text, "err");
+    if (text.includes("changed on the PC")) refreshRoles(target).catch(() => {});
+    return null;
+  }
 }
 
 /** The pane's current model: `omp.model`, else a list entry whose display name matches the footer name. */
@@ -110,7 +189,7 @@ export function modelLabel(o: OmpInfo): string {
 
 // ---------------------------------------------------------------- commands
 
-export type CmdName = "switch" | "effort" | "fast" | "plan" | "compact" | "new" | "clear" | "retry" | "resume" | "rename" | "stop" | "queue" | "page";
+export type CmdName = "switch" | "effort" | "fast" | "plan" | "compact" | "new" | "clear" | "retry" | "resume" | "rename" | "stop" | "queue" | "page" | "preset";
 
 const CMD_LABEL: Record<CmdName, string> = {
   switch: "Switching model",
@@ -126,6 +205,7 @@ const CMD_LABEL: Record<CmdName, string> = {
   stop: "Stopping",
   queue: "Queueing",
   page: "Opening page",
+  preset: "Applying preset",
 };
 
 const pending = new Map<string, { cmd: CmdName; label: string }[]>();
@@ -186,4 +266,20 @@ export async function ompCmd(cmd: CmdName, arg?: string, okText = ""): Promise<b
     toast((e as Error).message, "err");
     return false;
   }
+}
+
+/** User-facing text for a failed native-page request; the PC's `error.code` picks a clearer message. */
+export function errText(e: unknown): string {
+  const code = e instanceof RequestError ? e.code : "";
+  switch (code) {
+    case "no_extension":
+      return "omp in this terminal hasn't loaded the devdeck extension. Restart omp in this terminal (/restart, or exit and start omp again).";
+    case "busy":
+      return "The agent is working. Stop it or wait for the turn to end, then try again.";
+    case "btw_busy":
+      return "A side question is already running in this session. Wait for it or cancel it.";
+    case "live":
+      return "That session is open in a terminal; it can't be deleted.";
+  }
+  return (e as Error)?.message || String(e);
 }

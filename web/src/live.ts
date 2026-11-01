@@ -541,7 +541,7 @@ function openVoicePicker() {
         `button.vs-voice${sel ? ".sel" : ""}`,
         { "aria-pressed": String(sel) },
         h("span.vs-vmain", null, h("span.vs-vname", { text: v.name }), h("span.vs-vdesc", { text: v.desc })),
-        call.active && v.id === call.voice ? h("span.tag.live", { text: "Now" }) : null,
+        call.active && v.id === call.voice ? h("span.tag.ok", { text: "Now" }) : null,
       );
       card.addEventListener("click", () => {
         settings.voice = v.id;

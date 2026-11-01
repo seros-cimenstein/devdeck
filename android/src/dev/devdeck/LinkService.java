@@ -169,6 +169,7 @@ public class LinkService extends Service {
     // Read thread only: previous pane states for notification transitions.
     private final Map<String, String> lastStates = new HashMap<>();
     private final Map<String, String> lastAskIds = new HashMap<>();
+    private final Map<String, String> lastSketchIds = new HashMap<>();
     private final Set<String> noted = new HashSet<>();
 
     private final ConcurrentLinkedQueue<String> inbox = new ConcurrentLinkedQueue<>();
@@ -943,13 +944,25 @@ public class LinkService extends Service {
             String state = p.optString("state");
             JSONObject ask = p.optJSONObject("ask");
             String askId = ask == null ? null : ask.optString("toolCallId", null);
+            JSONObject sketch = p.optJSONObject("sketch");
+            String sketchId = sketch == null ? null : sketch.optString("toolCallId", null);
             present.add(target);
             String prev = lastStates.put(target, state);
             String prevAsk = askId != null ? lastAskIds.put(target, askId) : lastAskIds.remove(target);
+            String prevSketch = sketchId != null ? lastSketchIds.put(target, sketchId) : lastSketchIds.remove(target);
             if (prev == null) continue;  // first sighting: no transition to report
             boolean looking = visible && watching != null && matches(target, watching);
             String session = p.optString("session", target);
             String label = perSession.getOrDefault(session, 1) > 1 ? target : session;
+            if (sketchId != null) {
+                // request_sketch: the agent waits for a drawing (state stays "working")
+                if (alerts && !looking && !sketchId.equals(prevSketch)) {
+                    String text = sketch.optString("prompt", "");
+                    postAgentNote(target, CH_ASK, label + " wants a sketch", text.isEmpty() ? "Draw something for the agent" : text, false);
+                }
+                continue;
+            }
+            if (prevSketch != null) cancelAgentNote(target);
             if ("asking".equals(state)) {
                 boolean fresh = !"asking".equals(prev) || (askId != null && prevAsk != null && !askId.equals(prevAsk));
                 boolean detail = !fresh && askId != null && prevAsk == null && noted.contains(target);
@@ -962,6 +975,7 @@ public class LinkService extends Service {
         }
         lastStates.keySet().retainAll(present);
         lastAskIds.keySet().retainAll(present);
+        lastSketchIds.keySet().retainAll(present);
         for (String t : new ArrayList<>(notedSnapshot())) if (!present.contains(t)) cancelAgentNote(t);
     }
 

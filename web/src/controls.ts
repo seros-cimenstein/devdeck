@@ -1,10 +1,17 @@
-// Chat-view session control strip (model, context, mode, tasks, session menu) and the omp actions behind it.
+// Chat-view session control strip (model, context, mode, tasks, side question, session menu) and the omp actions behind it.
 import { bridge } from "./bridge";
+import { btwChip, onBtw, openBtw } from "./btw";
+import { openModelHub, openThinkingSheet } from "./models";
 import { fmtTokens, isOnline, modelLabel, ompCmd, onModels, onPending, pendingFor } from "./omp";
-import { openCompactSheet, openHistorySheet, openModelSheet, openRenameSheet, openTasksSheet } from "./sheets";
+import { requestPlanReview } from "./plan";
+import { openSettings } from "./settings";
+import { openCompactSheet, openHistorySheet, openRenameSheet, openSessionInfo, openTasksSheet } from "./sheets";
+import { openSketch } from "./sketch";
 import { currentPane, state } from "./state";
+import { openRewind, openTree } from "./tree";
+import { openUsage } from "./usage";
 import { confirmSheet, openMenu, toast } from "./ui";
-import { h, icon } from "./util";
+import { h, icon, ticking } from "./util";
 
 // ---------------------------------------------------------------- actions
 
@@ -13,13 +20,28 @@ function working(): boolean {
 }
 
 export const actions = {
-  model: () => openModelSheet("model"),
-  effort: () => openModelSheet("effort"),
+  model: () => openModelHub(),
+  presets: () => openModelHub("roles"),
+  effort: () => openThinkingSheet(),
   resume: () => openHistorySheet(),
   compact: () => openCompactSheet(),
   rename: () => openRenameSheet(),
   tasks: () => openTasksSheet(),
-  page: (cmd: string) => void ompCmd("page", cmd),
+  /** Side questions; `ask` asks at once, else the sheet opens with the question box focused. */
+  btw: (ask?: string) => {
+    const p = currentPane();
+    if (p?.agent) openBtw(p.target, ask ? { ask } : { focus: true });
+  },
+  planReview: () => {
+    const p = currentPane();
+    if (p?.agent) void requestPlanReview(p.target);
+  },
+  rewind: () => openRewind(),
+  branch: () => openRewind(true),
+  tree: () => openTree(),
+  settings: () => openSettings(),
+  sessionInfo: () => openSessionInfo(),
+  usage: () => openUsage(),
   fast: () => {
     const on = !currentPane()?.omp?.fast;
     void ompCmd("fast", on ? "on" : "off", `Fast tier ${on ? "on" : "off"}`);
@@ -46,6 +68,11 @@ export const actions = {
     return ompCmd("stop", undefined, "Stopped");
   },
   queue: (text: string): Promise<boolean> => ompCmd("queue", text, working() ? "Queued as follow-up" : "Sent"),
+  /** The sketch canvas instead of omp's `/sketch`, which would open a browser on the PC. */
+  sketch: (diagram = false) => {
+    const p = currentPane();
+    if (p?.agent) openSketch(p.target, diagram);
+  },
 };
 
 export function openSessionMenu(anchor: HTMLElement) {
@@ -57,32 +84,19 @@ export function openSessionMenu(anchor: HTMLElement) {
   openMenu(anchor, [
     { label: "New session", icon: "plus", disabled: off, act: () => void actions.newSession() },
     { label: "Resume...", icon: "history", disabled: off, act: actions.resume },
+    { label: "Side questions...", icon: "btw", disabled: off, act: () => actions.btw() },
     { label: "Compact...", icon: "compress", disabled: off, act: actions.compact },
     { label: "Clear context", icon: "eraser", disabled: off || busy, act: () => void actions.clear() },
     { label: "Plan mode", icon: "plan", toggle: true, on: plan, disabled: off, act: () => void actions.plan() },
+    { label: "Plan review...", icon: "plan", disabled: off, act: actions.planReview },
     { label: "Retry last turn", icon: "refresh", disabled: off || busy, act: actions.retry },
+    { label: "Rewind...", icon: "rewind", disabled: off, act: actions.rewind },
+    { label: "Session tree...", icon: "tree", disabled: off, act: actions.tree },
     { label: "Rename...", icon: "edit", disabled: off, act: actions.rename },
-    { label: "omp pages...", icon: "term", disabled: off, act: () => openPagesMenu(anchor) },
+    { label: "Session info", icon: "info", disabled: off, act: actions.sessionInfo },
+    { label: "Usage limits...", icon: "gauge", disabled: off, act: actions.usage },
+    { label: "omp settings...", icon: "sliders", disabled: off, act: actions.settings },
   ]);
-}
-
-export const PAGE_CMDS: { cmd: string; label: string; desc: string }[] = [
-  { cmd: "/model", label: "Model page", desc: "omp's model hub: roles, defaults" },
-  { cmd: "/settings", label: "Settings", desc: "omp's settings page" },
-  { cmd: "/resume", label: "Resume picker", desc: "omp's own session picker (Delete removes sessions)" },
-  { cmd: "/tree", label: "Session tree", desc: "Browse and switch branches" },
-  { cmd: "/branch", label: "Branch", desc: "Branch from an earlier message" },
-  { cmd: "/rewind", label: "Rewind", desc: "Rewind to an earlier point" },
-  { cmd: "/modelpreset", label: "Model presets", desc: "Pick a model preset" },
-  { cmd: "/plan-review", label: "Plan review", desc: "Review the current plan" },
-  { cmd: "/session", label: "Session info", desc: "Session details page" },
-];
-
-function openPagesMenu(anchor: HTMLElement) {
-  openMenu(
-    anchor,
-    PAGE_CMDS.map((c) => ({ label: c.label, icon: "term", act: () => actions.page(c.cmd) })),
-  );
 }
 
 // ---------------------------------------------------------------- strip
@@ -99,6 +113,9 @@ export class ControlStrip {
   private readonly mode: HTMLButtonElement;
   private readonly tasks: HTMLButtonElement;
   private readonly tasksText: HTMLElement;
+  private readonly btw: HTMLButtonElement;
+  private readonly btwMark: HTMLElement;
+  private btwTopic = "";
   private readonly pend: HTMLElement;
   private readonly menu: HTMLButtonElement;
   private sig = "";
@@ -118,13 +135,20 @@ export class ControlStrip {
     this.mode = h("button.cs-chip.cs-mode", { onclick: () => currentPane()?.omp?.mode === "plan" && void actions.plan() }) as HTMLButtonElement;
     this.tasksText = h("span");
     this.tasks = h("button.cs-chip.cs-tasks", { onclick: actions.tasks }, h("span.icw", { html: icon("list") }), this.tasksText) as HTMLButtonElement;
+    this.btwMark = h("span.cs-btw-mk");
+    this.btw = h("button.cs-chip.cs-btw", { "aria-label": "Side question" }, h("span.icw", { html: icon("btw") }), h("span", { text: "BTW" }), this.btwMark) as HTMLButtonElement;
+    this.btw.addEventListener("click", () => {
+      const p = currentPane();
+      if (p?.agent) openBtw(p.target, { topicId: this.btwTopic });
+    });
     this.pend = h("span.cs-pend", { hidden: true, role: "status" }, h("span.spin"));
     this.menu = h("button.ib.cs-menu", { "aria-label": "Session menu", html: icon("more") }) as HTMLButtonElement;
     this.menu.addEventListener("click", () => openSessionMenu(this.menu));
     this.menu.append(this.pend);
-    this.el = h("div.cstrip", { hidden: true }, this.model, this.ctx, this.mode, this.tasks, h("span.cs-gap"), this.menu);
+    this.el = h("div.cstrip", { hidden: true }, this.model, this.ctx, this.mode, this.tasks, this.btw, h("span.cs-gap"), this.menu);
     onPending(() => this.update());
     onModels(() => this.update());
+    onBtw(() => this.update());
   }
 
   /** Cheap: rewrites only when the visible facts changed. */
@@ -134,7 +158,8 @@ export class ControlStrip {
     const o = p?.omp;
     const online = isOnline();
     const pend = p ? pendingFor(p.target) : undefined;
-    const sig = show ? JSON.stringify([p!.target, o, online, pend?.label, p!.state]) : "";
+    const btw = p ? btwChip(p.target) : null;
+    const sig = show ? JSON.stringify([p!.target, o, online, pend?.label, p!.state, btw]) : "";
     if (sig === this.sig) return;
     this.sig = sig;
     this.el.hidden = !show;
@@ -144,6 +169,13 @@ export class ControlStrip {
     this.ctx.hidden = !o?.ctx;
     this.mode.hidden = !o || !o.mode || o.mode === "none";
     this.tasks.hidden = !o?.todo;
+    this.btw.hidden = !btw;
+    this.btwTopic = btw?.topicId ?? "";
+    if (btw) {
+      this.btw.classList.toggle("run", btw.running);
+      this.btw.title = btw.running ? "A side question is running" : "Side answer ready";
+      this.btwMark.replaceChildren(btw.running ? ticking(h("span.spin.xs")) : h("span.cs-dot"));
+    }
     for (const b of [this.model, this.ctx, this.mode, this.tasks, this.menu]) b.disabled = !online;
     this.pend.hidden = !pend;
     this.menu.classList.toggle("pending", !!pend);

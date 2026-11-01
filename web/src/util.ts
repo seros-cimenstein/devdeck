@@ -229,6 +229,11 @@ const ICON_PATHS: Record<string, string> = {
   hangup: "M3 14.5c5-4.7 13-4.7 18 0l-2.6 2.6-3.4-1.6V13c-2-.8-4-.8-6 0v2.5l-3.4 1.6z",
   wave: "M4 10v4M8 7v10M12 4v16M16 7v10M20 10v4",
   expand: "M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5",
+  trash: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6",
+  rewind: "M11 6l-6 6 6 6M19 6l-6 6 6 6",
+  btw: "M4 5h16v11H9l-5 4zM10 9a2 2 0 113 1.7c-.6.4-1 .8-1 1.3M12 14h.01",
+  tree: "M6 3v18M6 7h7M6 15h7M15 7a2 2 0 104 0 2 2 0 00-4 0M15 15a2 2 0 104 0 2 2 0 00-4 0",
+  gauge: "M3.5 17a8.5 8.5 0 1117 0M12 17l4-5.5M12 17h.01",
 };
 export function icon(name: string, cls = ""): string {
   return `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true"><path d="${ICON_PATHS[name] || ""}"/></svg>`;

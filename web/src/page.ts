@@ -1,4 +1,5 @@
-// Live omp page panel: mirrors omp's full-screen pages (/model, /settings, pickers) inside chat view.
+// Live omp page panel: mirrors omp pages DevDeck has no native sheet for (provider logins from the model hub,
+// any other overlay) inside chat view.
 import { bridge, send } from "./bridge";
 import { type Layer, pushLayer, removeLayer, toast } from "./ui";
 import { ScreenMirror } from "./screen";

@@ -109,6 +109,16 @@ export function request<T>(msg: Msg, timeoutMs = 60000): Promise<T> {
   return promise;
 }
 
+/** A request refused by the PC: `error {req, error, code?}`; `code` is a stable machine-readable reason. */
+export class RequestError extends Error {
+  constructor(
+    message: string,
+    readonly code = "",
+  ) {
+    super(message);
+  }
+}
+
 /** Routes a reply to its request; true if consumed. */
 export function settle(msg: Msg): boolean {
   const req = msg.req;
@@ -117,7 +127,7 @@ export function settle(msg: Msg): boolean {
   if (!p) return true; // late reply to a timed-out/abandoned request
   pending.delete(req);
   clearTimeout(p.timer);
-  if (msg.t === "error") p.reject(new Error(String(msg.error || "error")));
+  if (msg.t === "error") p.reject(new RequestError(String(msg.error || "error"), typeof msg.code === "string" ? msg.code : ""));
   else p.resolve(msg);
   return true;
 }

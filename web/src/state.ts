@@ -20,6 +20,8 @@ export const hooks = {
   openFiles: (_path?: string) => {},
   openGit: (_path: string) => {},
   openFile: (_path: string) => {},
+  /** Adds text to a terminal's compose draft (a rewound prompt). */
+  setDraft: (_target: string, _text: string) => {},
 };
 
 export const currentPane = (): Pane | undefined => state.byTarget.get(state.target);
@@ -34,6 +36,7 @@ export type BadgeKind = PaneState | "done";
 export function badgeKind(p: Pane | undefined): BadgeKind {
   if (!p) return "shell";
   if (p.agent && p.state === "idle" && state.done.has(p.target)) return "done";
+  if (p.sketch) return "asking"; // the agent waits for a drawing
   return p.state;
 }
 

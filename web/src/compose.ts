@@ -1,10 +1,10 @@
 // Compose bar: multi-line input with per-terminal drafts, send (+Enter) / long-press send (no Enter), attach,
 // Stop while the agent works, queue-as-follow-up, slash palette and quick keys for agent panes.
 import { bridge } from "./bridge";
-import { actions, PAGE_CMDS } from "./controls";
+import { actions } from "./controls";
 import { QuickKeys } from "./keys";
 import { liveStatus } from "./live";
-import { isOnline, isPending, onPending } from "./omp";
+import { isOnline, isPending, ompCmd, onPending } from "./omp";
 import { onOutboxChange, outboxFor, retrySend } from "./outbox";
 import { state } from "./state";
 import { openMenu, toast } from "./ui";
@@ -19,23 +19,50 @@ interface SlashCmd {
   name: string;
   desc: string;
   aliases?: string[];
-  page?: boolean;
-  run: () => void;
+  /** Native action; without one, picking the command puts `/name ` in the input to add an argument and send. */
+  run?: () => void;
 }
 
 const SLASH: SlashCmd[] = [
-  { name: "model", desc: "Switch model for this session", aliases: ["models", "switch"], run: actions.model },
+  { name: "model", desc: "Models and roles (native hub)", aliases: ["models", "switch"], run: actions.model },
+  { name: "modelpreset", desc: "Model presets (hub, Roles tab)", aliases: ["presets"], run: actions.presets },
   { name: "effort", desc: "Set the thinking level", aliases: ["thinking"], run: actions.effort },
   { name: "fast", desc: "Toggle the fast tier", run: actions.fast },
   { name: "plan", desc: "Toggle plan mode", run: () => void actions.plan() },
+  { name: "plan-review", desc: "Review the current plan", run: actions.planReview },
+  { name: "btw", desc: "Side question, the agent keeps working", run: () => actions.btw() },
   { name: "compact", desc: "Compact the context (optional focus)", run: actions.compact },
   { name: "new", desc: "Start a new session", run: () => void actions.newSession() },
-  { name: "resume", desc: "Resume an earlier session", run: actions.resume },
+  { name: "resume", desc: "Resume or delete sessions, all projects", run: actions.resume },
+  { name: "rewind", desc: "Go back to before an earlier prompt", run: actions.rewind },
+  { name: "branch", desc: "Branch from an earlier prompt", run: actions.branch },
+  { name: "tree", desc: "Session tree: browse and switch branches", run: actions.tree },
   { name: "clear", desc: "Clear the context, keep the session", run: () => void actions.clear() },
   { name: "retry", desc: "Retry the last failed turn", run: actions.retry },
   { name: "rename", desc: "Rename this session", run: actions.rename },
-  ...PAGE_CMDS.map((c) => ({ name: c.cmd.slice(1), desc: c.desc, page: true, run: () => actions.page(c.cmd) })),
+  { name: "session", desc: "Session info (id, file, tokens, cost)", run: actions.sessionInfo },
+  { name: "usage", desc: "Provider limits, saved resets, session spend", run: actions.usage },
+  { name: "settings", desc: "omp settings", run: actions.settings },
+  { name: "sketch", desc: "Draw for the agent (/sketch diagram: mark up a diagram)", run: () => actions.sketch() },
+  { name: "diagramify", desc: "SVG picture of this project (add #code or a path to zoom)" },
+  { name: "basic", desc: "SVG diagram of what you describe after it" },
 ];
+
+/**
+ * Typed commands whose omp version would open a terminal page (or, for `/btw`, an inline panel where Esc
+ * would stop the agent): handled natively instead. The argument is ignored except for `/btw` and `/resume`.
+ */
+const NATIVE_TYPED: Record<string, (arg: string) => void> = {
+  btw: (arg) => actions.btw(arg || undefined),
+  "plan-review": () => actions.planReview(),
+  resume: (arg) => (arg ? void ompCmd("resume", arg) : actions.resume()),
+  rewind: () => actions.rewind(),
+  branch: () => actions.branch(),
+  tree: () => actions.tree(),
+  session: () => actions.sessionInfo(),
+  usage: () => actions.usage(),
+  settings: () => actions.settings(),
+};
 
 export class Compose {
   readonly el: HTMLElement;
@@ -135,6 +162,18 @@ export class Compose {
     this.ta.focus();
   }
 
+  /** Adds `text` to the draft of `target` (after any text already there); shown at once for the open terminal. */
+  putDraft(target: string, text: string) {
+    const cur = target === this.target ? this.ta.value : this.drafts[target] || "";
+    const next = cur.trim() ? `${cur.replace(/\s+$/, "")}\n\n${text}` : text;
+    this.drafts[target] = next;
+    lsSet(DRAFTS_KEY, this.drafts);
+    if (target !== this.target) return;
+    this.ta.value = next;
+    this.autosize();
+    this.refresh();
+  }
+
   private agentWorking(): boolean {
     const p = state.byTarget.get(this.target);
     return !!p?.agent && p.state === "working";
@@ -208,6 +247,31 @@ export class Compose {
     }
     const text = this.ta.value.replace(/\s+$/, "");
     if (!text && !enter) return;
+    const agent = !!state.byTarget.get(this.target)?.agent;
+    const sketch = /^\/sketch(?:\s+(diagram))?$/.exec(text.trim());
+    if (sketch && agent) {
+      this.clearInput();
+      actions.sketch(!!sketch[1]);
+      return;
+    }
+    // Bare model commands would open omp's terminal page or picker; open the native hub instead.
+    // `/model x` still goes to omp (the daemon rewrites it to `/switch x`).
+    const modelCmd = /^\/(models?|switch|modelpreset)$/.exec(text.trim());
+    if (modelCmd && agent) {
+      this.clearInput();
+      this.ta.blur();
+      if (modelCmd[1] === "modelpreset") actions.presets();
+      else actions.model();
+      return;
+    }
+    const native = /^\/([\w-]+)(?:\s+([\s\S]*))?$/.exec(text.trim());
+    const run = native && agent && Object.hasOwn(NATIVE_TYPED, native[1]) ? NATIVE_TYPED[native[1]] : undefined;
+    if (run) {
+      this.clearInput();
+      this.ta.blur();
+      run(native![2]?.trim() ?? "");
+      return;
+    }
     this.onSend(this.target, text, enter);
     this.clearInput();
     if (!enter) toast("Pasted without Enter");
@@ -219,30 +283,25 @@ export class Compose {
     const show = !!p?.agent && !!m && document.activeElement === this.ta;
     const q = m?.[1].toLowerCase() ?? "";
     const hits = show ? SLASH.filter((c) => c.name.startsWith(q) || c.aliases?.some((a) => a.startsWith(q))) : [];
-    const sig = hits.map((c) => c.name + (c.page ? "*" : "")).join(",") + (isOnline() ? "" : "!");
+    const sig = hits.map((c) => c.name).join(",") + (isOnline() ? "" : "!");
     this.slash.hidden = !hits.length;
     if (sig === this.slashSig) return;
     this.slashSig = sig;
     this.slash.textContent = "";
     const off = !isOnline();
-    let pageHeader = false;
     for (const c of hits) {
-      if (c.page && !pageHeader) {
-        pageHeader = true;
-        this.slash.append(h("div.sl-sec", { text: "omp pages (live)" }));
-      }
-      const b = h(
-        "button.sl-item",
-        { role: "option", disabled: off },
-        h("span.sl-name", { text: "/" + c.name }),
-        h("span.sl-desc", { text: c.desc }),
-        c.page ? h("span.tag", { text: "page" }) : null,
-      );
+      const b = h("button.sl-item", { role: "option", disabled: off }, h("span.sl-name", { text: "/" + c.name }), h("span.sl-desc", { text: c.desc }));
       b.addEventListener("pointerdown", (e) => e.preventDefault());
       b.addEventListener("click", () => {
+        this.slash.hidden = true;
+        if (!c.run) {
+          this.ta.value = `/${c.name} `;
+          this.ta.setSelectionRange(this.ta.value.length, this.ta.value.length);
+          this.ta.dispatchEvent(new Event("input"));
+          return;
+        }
         this.clearInput();
         this.ta.blur();
-        this.slash.hidden = true;
         c.run();
       });
       this.slash.append(b);

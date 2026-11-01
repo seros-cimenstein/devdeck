@@ -41,7 +41,8 @@ and systemd unit. Both can run at the same time.
 
 ```sh
 ./devdeck.py pair              # builds the app, installs it via adb, shares a random token
-./devdeck.py install-service   # systemd user service, starts with the graphical session
+./devdeck.py install-service   # systemd user service, starts with the graphical session;
+                              # also links the devdeck omp extension (install-ext)
 ```
 
 **Which phone.** `pair` uses adb's only device. If several are connected it uses
@@ -108,8 +109,9 @@ From left to right:
 - **Link pill**: the dot is green when online, amber and pulsing while connecting, red when
   offline, grey when idle and hollow when unpaired. The pill also shows the round-trip time
   and an amber count of queued items. Tap it for details.
-- **Overflow menu**: Files, Git, Chat/Terminal view, Keep screen awake, Notifications,
-  Resync and New terminal.
+- **Overflow menu**: Files, Git, Chat/Terminal view, Sketch, Keep screen awake,
+  Notifications, Resync, Voice settings, New terminal, omp settings (global when no omp
+  terminal is open), Usage limits and Update omp.
 
 A thin progress bar under the top bar shows a running upload.
 
@@ -167,30 +169,101 @@ This is the default for agent panes. It renders omp's own session file, not the 
 
 A control strip drives the watched omp session natively. Every action runs live (disabled
 offline, never queued), one at a time per terminal, and reports omp's own error text.
-- **Model chip** (`Opus 5.5 · high`, plus ⚡ for the fast tier) opens the model sheet: search,
-  your configured roles, every model grouped by provider. Pick a model, a thinking level it
-  supports and Fast, then "Switch for this session" (omp's `/switch`: session only, the
-  configuration is untouched). Changing only the level uses `/effort`. A link opens omp's
-  own full model page (roles and defaults) as a live page.
+- **Model chip** (`Opus 5.5 · high`, plus ⚡ for the fast tier), `/model` (also `/models` and
+  a bare `/switch`, picked from the palette or typed and sent) and `/modelpreset` (opens on the
+  Roles tab) open the native model hub, at parity with omp's own `/model` hub; omp's terminal
+  model page and pickers are never opened for these:
+  - **Models**: ranked search (`opus55` finds `claude-opus-5-5`), kind chips (Chat, Tiny,
+    Image, TTS, STT, Search...) and a provider filter. The list has Current, Recent (used in
+    the last 30 days) and Top (by intelligence) sections, with the same model on several
+    providers grouped into one row with provider pills. Catalog noise sits behind "Show N
+    more". Rows show intelligence 🧠, time to first token, measured tokens/s, context,
+    vision, price per M tokens and the roles that use the model.
+  - **Model detail**: every fact (max output, cache prices, uses, last use), the same model
+    on other providers, "Use in this session" (thinking level including Auto, Fast, then
+    omp's `/switch` or `/effort`: session only), role toggles, the model's fallback chain and
+    its compaction limit (`90000`, `f90000` or `80%`).
+  - **Roles**: chat, custom and model-kind roles with model, level, fallbacks and cycle
+    marker. A role opens a detail page: change its model (a picker filtered to the kinds the
+    role accepts), its thinking level, clear it, edit its fallback chain and its place in the
+    Ctrl+P cycle. Also: new custom roles, fallback chains keyed by model or `provider/*`, cycle
+    order, and presets (save current, apply with `/modelpreset switch`, delete).
+  - Changes are written to omp's config at once (see "Model roles"). Assigning `default` also
+    switches this session, as omp's hub does. A link at the end of Roles opens omp's own model
+    page as a live page (for provider logins).
+- **Thinking** (`/effort` or `/thinking` in the slash palette): a small sheet with the model's
+  levels plus Auto.
 - **Context meter** (used/window) and a **plan badge** while plan mode is on.
-- **Session menu**: New session, Resume... (this directory's sessions with title, recap,
-  live/current markers), Compact (optional focus), Clear context, Plan mode on/off, Retry
-  last turn, Rename. Rename makes omp format the title with a small model call (an emoji and
-  a category prefix are added).
+- **Session menu**: New session, Resume..., Side questions..., Compact (optional focus), Clear
+  context, Plan mode on/off, Plan review..., Retry last turn, Rewind..., Session tree...,
+  Rename, Session info, Usage limits..., omp settings.... Rename makes omp format the title
+  with a small model call (an emoji and a category prefix are added).
+- **Resume** (`/resume`): "This folder" lists this directory's sessions (title, recap,
+  pinned, live/current markers); tap one to resume it here. "All projects" lists every
+  project's sessions with their folder; one from another project opens in a new terminal
+  there (`omp --resume`). The trash button deletes a session (never the current or a live
+  one): its files move to the PC's trash and the row offers Undo.
 - **Stop**: with an empty compose box while omp works, Send becomes Stop (one Escape). With
   text while working, Send steers; "Queue as follow-up" delivers it after the turn.
 - **Tasks**: a `Tasks 3/7` chip shows omp's todo list.
 - **Slash palette**: typing `/` lists the supported commands. Typed `/model x`, `/models x`
   and `/thinking x` are rewritten to omp's `/switch x` and `/effort x`, because omp would
-  send a command with arguments it does not take to the model as a prompt.
+  send a command with arguments it does not take to the model as a prompt. Your omp prompt
+  commands `/diagramify` and `/basic` fill in `/diagramify ` or `/basic ` so you can add a
+  `#code`, a path or what to draw, then Send.
 - **Keys in chat**: a keyboard toggle shows the quick-key rows inside the chat view.
 
-**Live omp pages.** omp's own interactive pages (the `/model` hub, `/settings`, the
-`/resume` picker, `/tree`, the `/effort` picker, plan review, any overlay) can be opened from
-the palette and are mirrored in a live panel inside the chat view: tap a row to move the
-selection there, double-tap to also press Enter, use the arrow/Tab/Enter/Esc bar, or type to
-filter. The panel closes when omp closes the page. Changes you make there (role
-assignments, settings) are saved by omp as usual.
+**Native omp pages.** omp's interactive pages have phone sheets instead. Picked from the
+palette or typed and sent, `/btw`, `/plan-review`, `/rewind`, `/branch`, `/tree`,
+`/settings`, `/session`, `/usage` and `/resume` (bare) never open omp's terminal page:
+- **Side questions** (`/btw`, session menu): ask about the session while the agent keeps
+  working. The model sees the conversation but runs no tools, and nothing enters the
+  transcript. `/btw your question` + Send asks at once; bare `/btw` opens the sheet: topics
+  newest first (Running / Done / Cancelled / Error, "from omp" for ones asked on the PC),
+  then a topic's thread with the answer streaming in as markdown, Copy, Cancel while it
+  runs, and a follow-up box that keeps the topic's context. One side question runs at a time
+  per session. While one runs, a **BTW** chip with a spinner sits in the control strip; an
+  answer that finished while the sheet was closed leaves a dot on the chip until you read it.
+- **Plan review**: when omp asks to approve a plan, a sheet opens like the ask sheet: the
+  plan file as markdown, omp's choices (execute, compact then execute, keep planning,
+  refine...), the execution-model tier and, for refine, a feedback box. Closing it leaves a
+  "Plan ready for review" banner. `/plan-review` reopens it, or asks omp to open a review of
+  the newest plan (omp's reason is shown when it can't). The PC's overlay is not mirrored.
+- **Rewind** (`/rewind`, `/branch`): this path's prompts, newest first. Tap one and confirm:
+  omp goes back to just before it and the prompt comes back into the compose box (after any
+  draft) to edit and resend. Later messages stay in the session as a branch.
+- **Session tree** (`/tree`): the whole session file as an outline. Prompts or Everything;
+  side branches are indented under their branch point (`2 branches`), the current path has
+  a blue edge and the current entry is marked; labels and branch summaries show. Tap an
+  entry for Go here, Go here with a summary (of the branch you leave) or, for prompts,
+  Rewind before it. Going to a prompt also puts its text into the compose box, as omp does.
+- **Settings** (`/settings`, session menu, overflow menu): omp's settings with their
+  `/settings` labels, grouped by its tabs and searchable; a blue dot marks values set in your
+  config. Booleans toggle in the list; tap a setting for its editor (options, number, text,
+  or JSON for lists and maps), its default and Reset. Changes apply to running omp sessions
+  at once. Project-config values are read-only; credentials are never shown or changed.
+- **Session info** (`/session`): id, folder, file, dates, entries, messages, tokens, cost,
+  artifact size, side questions and models used; Copy ID and Show in Files.
+- **Usage** (`/usage`, session menu, overflow menu): omp's provider limits. At the top this
+  session's spend (cost, tokens in/out/cache; from the session menu or palette only). Then
+  one card per account, grouped by provider (this session's provider first): plan, "Limit
+  reached", and each quota window as a bar (blue, amber at omp's warning, red when
+  exhausted, grey when not reported) with "18% used" (or "0 / 200 requests") and "Resets in
+  2 h 14 m · 1:51 PM" in local time. Emails are masked (`a•••@example.com`); tap one to show
+  it. Codex and Claude accounts list their saved rate-limit resets (what each restores, when
+  it expires, amber within 24 h, and omp's auto-spend setting); **Spend one...** confirms
+  with the account, what it restores, the current window usage and the expiry, then runs
+  omp's `usage reset` (it can't be undone). **7-day history** adds a usage line per window
+  with its peak. The sheet opens at once with the last numbers (offline too, marked as
+  such) while the PC refreshes them; **Refresh** asks omp again.
+- Rewind and tree moves are refused while the agent works (stop it first), and side
+  questions while one runs. An omp started before the DevDeck extension was installed shows
+  "restart omp in this terminal" (`/restart`, or exit and start omp again).
+
+**Live omp pages.** Pages DevDeck has no sheet for (the model hub's provider-login link, any
+other overlay omp opens on the PC) are mirrored in a live panel inside the chat view: tap a
+row to move the selection there, double-tap to also press Enter, use the
+arrow/Tab/Enter/Esc bar, or type to filter. The panel closes when omp closes the page.
 
 ### Terminal view
 
@@ -371,8 +444,10 @@ Git access is read-only: DevDeck never stages, commits or takes git's index lock
 - Environment:
   - `XDG_CONFIG_HOME` / `XDG_STATE_HOME` move the token and state directories.
   - `DEVDECK_OMP_DIR` (default `~/.omp/agent`) is where omp's `terminal-sessions/`
-    breadcrumbs, sessions, `config.yml` (model roles), `history.db` and
-    `session-pins.json` are read. Useful for tests that must not touch the real ones.
+    breadcrumbs, sessions, `history.db`, `models.db` and `session-pins.json` are read
+    (`stats.db` one level up). Useful for tests that must not touch the real ones. omp's
+    settings (model roles) are read and written through the `omp config` command, so for
+    those also set `PI_CODING_AGENT_DIR` to the same directory.
   - `DEVDECK_TTS_DEVICE` = `auto` (default), `cpu` or `cuda`: where the voice is synthesised
     (see "Engine" under How it works).
   - `DEVDECK_CONCIERGE_MODEL` = `provider/id[:level]` (default
@@ -390,7 +465,7 @@ Git access is read-only: DevDeck never stages, commits or takes git's index lock
   *wrote*.
 
 On a slow link the writes block, intermediate states are skipped, and no backlog builds up.
-Requests (`ls`, `read`, `git`, `more`, `full`, `models`, `history`, `cmd`) run in small
+Requests (`ls`, `read`, `git`, `more`, `full`, `models`, `roles`, `roles_set`, `history`, `cmd`) run in small
 worker threads, at most 3 per connection.
 
 **Panes** are polled once every 2 s, for all clients together, and only while a client is
@@ -465,10 +540,39 @@ without a `model_change`. Only then the daemon reads omp's footer from the scree
 mode, and the name (catalog name without `Claude `) is mapped back to a model, preferring
 the model this daemon last switched the pane to, then the default role's.
 
-**Models and roles.** `omp models --json` (omp's own catalog, no model call; about 2 s) is
-run in a thread on first use, cached in memory and in `~/.local/state/devdeck/models.json`,
-and refreshed in the background after 6 hours while the stale copy keeps being served.
-Roles are read from the `modelRoles:` block of `~/.omp/agent/config.yml` on every request.
+**Models.** `omp models --json --kind all` (omp's own catalog, every kind, no model call;
+about 2 s) is run in a thread on first use, cached in memory and in
+`~/.local/state/devdeck/models.json`, and refreshed in the background after 6 hours while
+the stale copy keeps being served. Two read-only additions:
+- omp's provider-model cache `~/.omp/agent/models.db` gives the intelligence score omp's own
+  hub shows (for the selector, else the same id on another provider) and which chat models
+  have web-search grounding (they can serve the `web` role);
+- omp's `~/.omp/stats.db` gives, per model, the replies of the last 30 days, the last use,
+  and the medians of output tokens per second (whole reply, as omp's hub computes it) and of
+  time to first token over the latest 50 replies with 50+ output tokens (re-read at most
+  once a minute).
+
+A row is `hidden` (collapsed behind "Show N more") when it is a dated alias of a same-named
+row (`claude-haiku-4-5-20251001`), or a chat model with no score, no known price and no use.
+
+**Model roles.** Read with `omp config list --json` in the pane's omp cwd (so a project
+`.omp/config.yml` applies; about 0.15 s, cached until omp's global or that project's config
+file changes): `modelRoles`, `modelRoleStorage`, `defaultThinkingLevel`, `cycleOrder`,
+`modelTags`, `retry.fallbackChains`, `compaction.modelThresholds`, `modelPresets`. Roles are
+omp's built-in chat roles (`default smol slow vision plan commit tiny memory task advisor
+widget`), custom roles (named in `modelRoles`, `cycleOrder` or `modelTags`) and model-kind
+roles (`image web speech dictation judge`), each with the model kinds it accepts and, when
+unset, what omp falls back to (`tiny`/`widget` → `@smol`, `memory` → `@tiny`, `smol`/`slow`
+→ `@default` and `advisor` → `@slow` when those are set, else omp's built-in list).
+
+Writes (`roles_set`) replace one whole setting with `omp config set`, which writes omp's
+global config under omp's own lock. The daemon first re-reads the setting and refuses when it
+no longer equals what the phone edited ("changed on the PC"), checks every changed selector
+against the catalog (kind accepted by the role, web grounding for `web`, thinking level
+supported, levels only on chat models), then re-reads to confirm. Role writes are refused
+with `modelRoleStorage: project`, and a write that a project layer still overrides is
+reported. Running omp sessions pick the change up themselves; only assigning `default`
+switches a session, which the phone does with `switch` afterwards (as omp's hub does).
 
 **Session history.** The session files directly under `~/.omp/agent/sessions/*/` whose
 header `cwd` is the pane's omp cwd. Only the first lines (title slot and header) are read,
@@ -485,7 +589,7 @@ exact slash command plus one Enter, then a confirmation:
 
 | cmd | sends | confirmed by |
 |---|---|---|
-| `switch` `provider/id[:level]` | `/switch ...` (validated against the models list and the model's levels) | a new `model_change` for that model, or the footer showing it |
+| `switch` `provider/id[:level]` | `/switch ...` (validated against the models list: a chat model and its levels) | a new `model_change` for that model, or the footer showing it |
 | `effort` level | `/effort level` | `thinking_level_change`, or the footer glyph |
 | `fast` `on`/`off` | `/fast on/off` | `service_tier_change`, or footer ⚡; "unavailable" fails |
 | `plan` | `/plan` | `mode_change` or the footer badge (info: new mode); the "Exit plan mode?" dialog fails |
@@ -498,6 +602,7 @@ exact slash command plus one Enter, then a confirmation:
 | `stop` | one Escape (only while working; never two within 600 ms) | the spinner leaves the title, or an aborted reply |
 | `queue` text | working: paste + Ctrl+Q (follow-up); idle: paste + Enter | sent |
 | `page` `/model` ... | the bare page command | omp shows a page within 4 s (info: its title) |
+| `preset` name | `/modelpreset switch name` (must exist in `modelPresets`) | a `model_change`, or omp's roles now equal the preset's |
 
 Any new `Error: ...` status line fails the command at once with that text; a timeout
 (6 s) fails with omp's latest status lines and footer.
@@ -510,6 +615,83 @@ a page is open it streams the visible rows as `screen` frames tagged `page:true`
 4/s) and sends one `page:false` frame when it closes. The pane poller reports `omp.page`
 for panes watched in the chat view. `tap {row}` finds omp's `❯` selection marker nearest to
 the row and presses Up/Down for the rows in between, skipping rules and blank rows.
+
+**The devdeck omp extension (`omp-ext/devdeck/`).** What has no CLI and no safe paste route
+(streamed side answers, answering plan review, moving the session leaf) goes through a small
+omp extension kept in this repo. `./devdeck.py install-ext` (also run by `install-service`)
+symlinks it to `~/.omp/agent/extensions/devdeck`; omp processes started afterwards load it
+(running ones need a restart; extension-backed requests then fail with
+`code:"no_extension"`). On load it serves HTTP on `127.0.0.1` (random port, random token
+as `?t=`) and publishes `{pid, port, token, sessionId, planReview}` in
+`~/.omp/agent/devdeck/<omp pid>.json` (mode 600, removed on exit, dead ones pruned). The
+daemon maps a pane to it like the sketch extension: the registration whose pid runs below
+the pane's process (the outermost one, if an agent runs `omp -p` inside). It also writes
+`~/.omp/agent/devdeck/settings-schema.json` (omp's settings registry: types, defaults, enum
+values, `/settings` tabs and groups) once per process.
+
+**Native omp pages.**
+- **/btw.** `btw_ask` opens the extension's event stream (`/events`, server-sent events),
+  then `POST /btw`. The extension runs omp's own RPC `/btw` controller
+  (`RpcBtwController`) on the main session: one side question at a time, the session's
+  context, no tools, never in the transcript, follow-ups by topic id, and every topic
+  checkpointed in `<session artifact dir>/btw-history/entry-<id>.json` exactly as the TUI's
+  `/btw` does, so omp's own `/btw` history lists phone topics and the phone lists terminal
+  ones (verified both ways). Ids of topics asked from the phone are appended to
+  `~/.omp/agent/devdeck/btw/<session id>.ids` (`source:"devdeck"`). Deltas and records are
+  relayed until that topic's turn ends (at most 15 min). `btw_list` reads the history files
+  (no extension needed; omp's `interrupted` shows as cancelled), plus the running topic's
+  partial answer from the extension. Cancel aborts the provider request.
+- **Plan review.** The extension forwards `plan_review_requested` / `plan_review_resolved`
+  (and `getPendingPlanReview()` at start) into its registration; the pane poller turns it
+  into the pane's `planReview` (disabled choices dropped, `refine` needs feedback, tiers
+  from omp's model slider). `plan_answer` calls `resolvePlanReview` (the terminal overlay
+  closes itself), `plan_open` calls `openPlanReview()`, which never aborts work and reports
+  why it could not open (plan mode off, omp working, no plan file).
+- **Tree, rewind, branch.** `tree` reads the whole session file: every entry but
+  bookkeeping (header, title, custom state, usage, credential pins, labels, title changes;
+  their children hang on the nearest shown ancestor), labels applied, the leaf by omp's rule
+  (the last entry, or its `activeLeafId`). Full text of any entry, off-branch too, comes from
+  `full`. `goto` runs PaneCommand `goto` (same checks as `cmd`; refused while working with
+  `code:"busy"`): it pastes `/devdeck-goto <nonce> <entryId> [summarize]`, whose handler calls
+  `navigateTree` (command context only), clears omp's editor when omp put a rewound prompt
+  there (the phone takes it as `draft`), and appends a hidden `dev.devdeck.goto` custom
+  entry so the move reaches the session file and the chat view resets on the new branch.
+  Confirmed by polling the extension for the nonce's outcome (10 s; 180 s with a summary).
+- **Settings.** Three `omp config list --json` runs in parallel in the pane's omp cwd
+  (effective values, `--scope global`, `--scope project`) give values and layers; the
+  extension's schema adds labels, enum options, defaults and the `/settings` tab and group
+  (keys the page does not show follow, grouped by first key segment). Credentials are only
+  listed (`secret:true`, no value) and refused for writes. Writes are `omp config set` /
+  `reset` on the global layer; running omp sessions watch their config directory and apply
+  changes live (verified), so `restartHint` is false. A write a project layer still
+  overrides is reported.
+- **Session info** reads the session file: entries of the whole file; messages, models,
+  tokens and cost of the current branch (as omp's `/session` counts them: replies,
+  `model_usage` entries and subagent `task` usage), artifact dir size, `/btw` topic count.
+- **Usage.** `omp usage --json` (every account's quota windows; omp serves its own report
+  cache, so about a second when warm, a minute or more when cold) and `omp usage reset
+  --json` (saved resets with each account's credential id) run in parallel in a thread,
+  always with `--no-extensions`: the devdeck and sketch extensions start servers on load, so
+  a CLI run with them prints its JSON and then never exits. The daemon reads stdout until
+  the first complete JSON object, then gives omp 5 s to exit before killing it. The result
+  is kept in memory and in `~/.local/state/devdeck/usage.json`: a copy younger than 60 s is
+  answered as is; an older one (or any with `force`) is answered at once with `stale:true`
+  while a refresh runs, and the fresh limits follow as a `usage` push (with `error` and the
+  old copy when omp failed; after a failure only `force` retries within 30 s). Nothing
+  cached: the request waits for the refresh (120 s for `omp usage`). The session line is
+  the target's session file counted as for Session info. `autoRedeem` is omp's
+  `codexResets.autoRedeem` / `claudeResets.autoRedeem` (`omp config list`). `usage_reset`
+  re-lists the saved resets, refuses unknown accounts, ones omp could not load and ones with
+  no reset usable now (one spend at a time), runs `omp usage reset <provider>/<credential
+  id>`, then lists again: `ok` only when omp's count for that account went down.
+  `usage_history` folds `omp usage --history --days N --json` (hourly snapshots, ~100 KB a
+  day) into one series per account and window (~40 KB for 7 days).
+- **Resume extras.** `history {all:true}` lists every project's sessions (100 newest).
+  `session_delete` moves the session file and its artifact dir to
+  `~/.local/state/devdeck/trash/<trashId>/` (with `meta.json`), refusing the pane's session
+  and any session a terminal's breadcrumb names; `session_restore` moves them back (never
+  over an existing file). Trash older than 30 days is dropped on the next delete.
+  `new {resume}` starts `omp --resume <id>`.
 
 **Messages, keys, clipboard.**
 - Messages go in with `tmux load-buffer` and `paste-buffer -p`, plus `send-keys Enter`.
@@ -643,7 +825,9 @@ synthesised on the PC and streamed per sentence (protocol: "Voice messages").
 **State on disk.**
 - Delivered ids (last 2000) are kept in `~/.local/state/devdeck/seen.json`.
 - Partial uploads live in `~/.local/state/devdeck/partial/` until complete.
-- The models list is cached in `~/.local/state/devdeck/models.json`.
+- Sessions deleted from the phone wait in `~/.local/state/devdeck/trash/` for 30 days.
+- The models list is cached in `~/.local/state/devdeck/models.json`, provider usage limits
+  in `~/.local/state/devdeck/usage.json`.
 - `ddctl`'s control socket is `~/.local/state/devdeck/ctl.sock` (see "Concierge and `ddctl`").
 
 ### Live calls (daemon)
@@ -848,7 +1032,7 @@ Client → PC lines stay plain.
 
 | Group | Messages |
 |---|---|
-| Live | `watch {target, view}`, `pause`, `resume`, `resync`, `ping {ts}`, `keys {target, keys[]}`, `tap {target, row}`, `type {target, text}`, `new {}` (→ `created {target:"phone-N:W.P"}`) |
+| Live | `watch {target, view}`, `pause`, `resume`, `resync`, `ping {ts}`, `keys {target, keys[]}`, `tap {target, row}`, `type {target, text}`, `new {cwd?, omp?, yolo?, resume?:sessionId}` (→ `created {target:"phone-N:W.P"}`; `resume` needs `omp:true` and starts `omp --resume <id>`) |
 | Queued (carry `id`, always answered by `ack {id, ok, error?}`, deduplicated) | `send {target, text, enter}`, `clip {text}`, `answer {target, toolCallId, answers:[{qid, selected[], custom?, note?}]}` |
 | Voice (live, never queued) | `voice {target, on, opts}`, `say {req, target?, entryId?, text?, voice?, speed?}`, `say_stop {req?}` (see "Voice messages") |
 | Live (never queued) | `live_offer`, `live_mode`, `live_stop` (see "Live messages") |
@@ -864,14 +1048,20 @@ Requests:
 - `ls {path}` → `ls {path, parent, entries:[{name, type, size, mtime(ms), linkTo?}]}`.
 - `read {path}` → `read {path, size, mime, kind:"text"|"image"|"binary", text?|data?, truncated}`.
 - `git {path, op:"status"|"diff"|"log", file?, staged?}`.
-- `models {}` → `models {models:[{selector:"provider/id", provider, id, name, contextWindow, reasoning, thinking:[levels]|null}], roles:{role:"provider/id[:level]"}, fetchedAt(ms)}`.
-  Chat models only; served from cache (see "Models and roles").
-- `history {target}` → `history {cwd, sessions:[{id, title, recap?, mtime(ms), live, current, pinned}]}`:
+- `models {}` → `models {models:[{selector:"provider/id", provider, id, name, kind, contextWindow, maxTokens, reasoning, thinking:[levels]|null, vision, price:{input, output, cacheRead, cacheWrite}|null, int|null, webSearch, usage:{count, last(ms), tps, ttft(ms)}|null, hidden}], fetchedAt(ms)}`.
+  Every catalog kind; served from cache, usage recomputed (see "Models").
+- `roles {target?}` → `roles {storage, defaultThinking, roles:[{name, label, group:"chat"|"custom"|"kind", accepts:[kinds], thinking, value|null, selector|null, level|null, auto|null, desc}], cycle, chains:{key:[selectors]}, thresholds:{key: tokens|"f…"|"…%"}, presets:[{name, roles, thinking}]}`:
+  omp's settings in the pane's omp cwd (home without `target`; see "Model roles").
+- `roles_set {target?, key, value, base}` → `roles {...}`: `key` is one of `modelRoles`,
+  `retry.fallbackChains`, `cycleOrder`, `compaction.modelThresholds`, `modelPresets`;
+  `value` the whole new value, `base` the value it was edited from. Errors come back as
+  `error {req}`.
+- `history {target, all?}` → `history {cwd, sessions:[{id, title, recap?, mtime(ms), live, current, pinned, cwd?}]}`:
   the sessions of the pane's omp cwd, pinned first then newest, at most 50, empty ones
-  skipped.
+  skipped. With `all:true`: every project's sessions (at most 100), each with its `cwd`.
 - `cmd {target, cmd, arg?}` → `cmd {ok, error?, info?}`: `cmd` is one of `switch`,
   `effort`, `fast`, `plan`, `compact`, `new`, `clear`, `retry`, `resume`, `rename`, `stop`,
-  `queue`, `page` (table in "omp commands"). Refusals and failures also come back as
+  `queue`, `page`, `preset` (table in "omp commands"). Refusals and failures also come back as
   `cmd {ok:false, error}` (omp's own error text when it printed one); `error {req}` only
   for malformed requests. Live only: the UI disables these offline.
 
@@ -955,7 +1145,51 @@ Voices: `af_heart`, `af_bella`, `af_nicole`, `af_aoede`, `af_kore`, `af_sarah`,
 - **Live** (see "Live messages" below): `live`, `live_answer`, `live_transcript`,
   `live_delegation`, `live_notice`.
 - **Other replies**: `created`, `ack`, `pong`, `error {error, req?}`, `full`, `ls`, `read`,
-  `git`, `models`, `history`, `cmd`.
+  `git`, `models`, `roles`, `history`, `cmd`.
+
+**Native omp pages** (requests as above; live only). `error {req, error, code?}`: `code` is
+`no_extension` when the pane's omp has not loaded the devdeck extension, `btw_busy`, `busy`
+(omp works) or `live` (session open in a terminal).
+- `BtwTopic = {id, title, status:"running"|"complete"|"cancelled"|"error", updated(ms),
+  turns:[{question, answer, status, error?, ts(ms)}], source:"devdeck"|"omp"}`.
+- `btw_list {target}` → `btw_list {target, sessionId, topics:[BtwTopic]}`, newest first.
+- `btw_ask {target, question, topicId?}` → `btw_ask {target, topicId}` once started.
+- `btw_cancel {target, topicId?}` → `btw_cancel {cancelled}`.
+- Pushed to every unpaused client watching `target` in the chat view, and to the asker:
+  `btw_delta {target, topicId, delta}`, `btw_record {target, topic}` (each status change).
+- Pane field `planReview?: {id, title, choices:[{id, label, needsFeedback?}],
+  tiers:[{role, label, model?}]|null, defaultRole?}` (a change wakes paused clients).
+- `plan_get {target, id}` → `plan_get {id, path, markdown}`;
+  `plan_answer {target, id, choice, feedback?, role?}` → `plan_answer {ok, error?}`;
+  `plan_open {target}` → `plan_open {ok, error?}`.
+- `tree {target}` → `tree {target, sessionId, leafId, entries:[{id, parentId, kind:"user"|
+  "assistant"|"tool"|"compaction"|"branch_summary"|"notice"|"other", preview, ts, label?,
+  onPath}]}`.
+- `goto {target, entryId, summarize?, rewind?}` → `goto {ok, error?, draft?}` (`draft`: the
+  prompt text when the entry is a user prompt; `rewind` requires one).
+- `settings {target?}` / `settings_set {target?, key, value}` (`value:null` resets) →
+  `settings {items:[{key, group, type, value?, default?, options?, label?, description,
+  scope:"global"|"project"|"default", secret?}], restartHint}`.
+- `session_info {target}` → `session_info {id, file, cwd, title, created, modified, entries,
+  userMessages, assistantMessages, models:[{model, count}], tokens:{input, output, cacheRead,
+  cacheWrite}, cost|null, artifactsBytes, btwTopics, parentSession?}`.
+- `session_delete {target, id}` → `session_delete {ok, trashId}`;
+  `session_restore {trashId}` → `session_restore {ok}`.
+- `usage {target?, force?}` → `usage {target?, fetchedAt, generatedAt, reports, unavailable,
+  disabled, resets|null, resetsError?, autoRedeem?:{"openai-codex", anthropic}, session?:
+  {tokens:{input, output, cacheRead, cacheWrite}, cost|null}, stale?}`. `reports` are omp's
+  `omp usage --json` reports (`{provider, fetchedAt, limits:[{id, label, scope, window:{id,
+  label, durationMs?, resetsAt?}, amount:{used?, limit?, usedFraction?, unit}, status}],
+  metadata:{planType?, email?, accountId?, orgName?, limitReached?}}`), `unavailable` /
+  `disabled` its `accountsWithoutUsage` / `disabledCredentials`, `resets` the accounts of
+  `omp usage reset --json` (`{provider, credentialId, email, accountId, availableCount,
+  redeemableCount, soonestExpiry?, credits:[{title, status, expiresAt}], unavailableReason?,
+  error?}`); `session` only with an omp `target`. `stale:true`: a refresh runs and a `usage`
+  push without `req` (same shape, `error?` when it failed) follows.
+- `usage_reset {account:"provider/credentialId"}` → `usage_reset {ok, account, output,
+  left|null}` (spends one saved reset; irreversible, the app confirms first).
+- `usage_history {days?:1-30}` (default 7) → `usage_history {days, sinceMs, series:[{provider,
+  email?, accountId?, limitId, label, windowLabel, points:[[ms, usedFraction]]}]}`.
 
 **Live messages.** One call per daemon.
 - `live_offer {req, sdp, voice, mode:"concierge"|"direct", target?}` → `live_answer {req,

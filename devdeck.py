@@ -37,6 +37,7 @@ import socket
 import sqlite3
 import ssl
 import stat
+import statistics
 import struct
 import subprocess
 import sys
@@ -59,6 +60,7 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "stat
 SEEN_FILE = STATE_DIR / "seen.json"
 PARTIAL_DIR = STATE_DIR / "partial"
 CTL_SOCK = STATE_DIR / "ctl.sock"  # local control socket for ddctl (serve --ctl overrides)
+TRASH_DIR = STATE_DIR / "trash"   # sessions deleted from the phone (restorable)
 DEFAULT_DEST = Path.home() / "Downloads" / "phone"
 UNIT_NAME = "devdeck.service"
 DEFAULT_PORT = 47490
@@ -106,10 +108,29 @@ KEY_PAUSE_S = 0.04
 BOX_PAUSE_S = 0.15       # around text typed into the dialog's note / custom answer boxes
 DRAFT_TRAP = "Finish or clear the current prompt to answer"
 
-# omp controls (models, history, cmd) and live pages
+# omp controls (models, roles, history, cmd) and live pages
 MODELS_FILE = STATE_DIR / "models.json"
+MODELS_VERSION = 2        # shape of MODELS_FILE; other versions are refetched
 MODELS_TTL_S = 6 * 3600.0
 MODELS_TIMEOUT_S = 90.0
+OMP_MODELS_DB = OMP_DIR / "models.db"        # omp's provider-model cache (intelligence scores, web grounding)
+OMP_STATS_DB = OMP_DIR.parent / "stats.db"   # omp's usage statistics (one row per assistant reply)
+USAGE_DAYS = 30
+USAGE_SAMPLES = 50        # speed and time to first token: medians of this many latest replies
+USAGE_TTL_S = 60.0
+OMP_CONFIG_TIMEOUT_S = 30.0
+# Provider usage limits (omp's /usage): `omp usage --json` plus `omp usage reset --json`
+LIMITS_FILE = STATE_DIR / "usage.json"
+LIMITS_VERSION = 1        # shape of LIMITS_FILE; other versions are refetched
+LIMITS_FRESH_S = 60.0     # older copies are served at once and refreshed in the background
+LIMITS_TIMEOUT_S = 120.0  # omp fetches every account's report; a cold cache takes a minute or more
+LIMITS_RETRY_S = 30.0     # after a failed refresh, only an explicit one (force) retries sooner
+RESET_ACCOUNT_RE = re.compile(r"^(anthropic|openai-codex)/(\d{1,6})$")  # `omp usage reset` target
+RESET_SPEND_S = 90.0
+HISTORY_DAYS_MAX = 30
+PRESET_RE = re.compile(r"^[\w.-]{1,64}$")
+ROLE_NAME_RE = re.compile(r"^[\w.-]{1,64}$")
+DATED_ID_RE = re.compile(r"-\d{8}$")
 CMD_WAIT_S = 6.0
 CMD_QUEUE_S = 20.0        # how long a command waits for the previous one on the same pane
 CMD_SETTLE_S = 0.8        # footer-confirmed commands wait this long for an error line first
@@ -118,6 +139,7 @@ PAGE_WAIT_S = 4.0
 PAGE_CHECK_S = 0.6        # chat view: how often the watched pane is checked for an open page
 TODO_CAP = 4000
 HISTORY_MAX = 50
+HISTORY_ALL_MAX = 100    # sessions in the all-projects list
 TITLE_MAX = 120
 TYPE_MAX = 200
 TAP_MAX = 200
@@ -130,6 +152,32 @@ PAGE_COMMANDS = ("/model", "/models", "/switch", "/effort", "/settings", "/resum
                  "/rewind", "/modelpreset", "/plan-review", "/session")
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 SEND_REWRITES = ((re.compile(r"^/models?\s+(\S.*)$"), "/switch "), (re.compile(r"^/thinking\s+(\S+)$"), "/effort "))
+
+# Sketch canvas (the omp `sketch` extension, relayed to the phone; README "Sketch")
+SKETCH_DIR = OMP_DIR / "sketch"  # the extension's <omp pid>.json registrations
+SKETCH_PATHS = {"/send": "POST", "/decline": "POST", "/diagrams": "GET", "/info": "GET"}
+SKETCH_HTTP_S = 15.0
+SKETCH_EVENTS_S = 45.0    # the server sends a heartbeat every 15 s
+SKETCH_RETRY_S = 2.0
+SKETCH_MISSING = "omp in that terminal has not loaded the sketch extension (install it, then restart omp)"
+
+# The devdeck omp extension (omp-ext/devdeck/, README "The devdeck omp extension"): /btw, plan
+# review and tree moves of the omp in a pane, over its token-gated server on 127.0.0.1
+EXT_DIR = OMP_DIR / "devdeck"   # <omp pid>.json registrations, btw/<session id>.ids, settings-schema.json
+EXT_SRC = HERE / "omp-ext" / "devdeck"
+EXT_LINK = OMP_DIR / "extensions" / "devdeck"
+EXT_HTTP_S = 15.0
+EXT_EVENTS_S = 45.0          # the server sends a heartbeat every 15 s
+EXT_MISSING = "omp in this terminal hasn't loaded the devdeck extension; restart omp"
+BTW_QUESTION_MAX = 20_000
+BTW_RUN_S = 15 * 60.0        # a side question's events are relayed at most this long
+TREE_PREVIEW = 160
+TREE_SKIP = {"session", "title", "custom", "model_usage", "credential_pin", "label", "title_change"}
+ENTRY_ID_RE = re.compile(r"^[\w-]{1,64}$")
+GOTO_WAIT_S = 10.0
+GOTO_SUMMARY_S = 180.0       # "go here with summary" waits for omp's branch summary (a model call)
+SETTINGS_TYPES = ("boolean", "enum", "number", "string", "array", "record")
+TRASH_KEEP_S = 30 * 86400.0  # deleted sessions stay restorable this long
 
 # voice mode: Kokoro TTS (omp's local runtime), streamed per sentence as Ogg/Opus
 VOICES = ("af_heart", "af_bella", "af_nicole", "af_aoede", "af_kore", "af_sarah", "am_michael", "am_fenrir",
@@ -168,7 +216,7 @@ def apply_instance(name: str) -> None:
     """Point every per-install path and name at a side-by-side instance `name` (e.g. "plus":
     app dev.devdeckplus, ~/.config/devdeck-plus, devdeck-plus.service, port 47491)."""
     global INSTANCE, LABEL, APK, APP_PACKAGE, APP_ACTIVITY, CONFIG_DIR, TOKEN_FILE, STATE_DIR, SEEN_FILE
-    global PARTIAL_DIR, MODELS_FILE, UNIT_NAME, DEFAULT_PORT, CTL_SOCK
+    global PARTIAL_DIR, MODELS_FILE, LIMITS_FILE, UNIT_NAME, DEFAULT_PORT, CTL_SOCK, TRASH_DIR
     if not INSTANCE_RE.match(name):
         sys.exit(f"bad instance name {name!r}: lowercase letters and digits, starting with a letter")
     INSTANCE = name
@@ -182,7 +230,9 @@ def apply_instance(name: str) -> None:
     SEEN_FILE = STATE_DIR / "seen.json"
     PARTIAL_DIR = STATE_DIR / "partial"
     MODELS_FILE = STATE_DIR / "models.json"
+    LIMITS_FILE = STATE_DIR / "usage.json"
     CTL_SOCK = STATE_DIR / "ctl.sock"
+    TRASH_DIR = STATE_DIR / "trash"
     UNIT_NAME = f"devdeck-{name}.service"
     DEFAULT_PORT = 47491
 
@@ -199,7 +249,12 @@ def load_token() -> str:
 
 
 class RequestError(Exception):
-    """A readable failure of one client request."""
+    """A readable failure of one client request; `code` (optional) is a machine-readable reason the
+    app acts on (`no_extension`, `btw_busy`, `busy`, `live`)."""
+
+    def __init__(self, msg: str, code: str | None = None):
+        super().__init__(msg)
+        self.code = code
 
 
 # ---------------------------------------------------------------- persistent state
@@ -349,6 +404,369 @@ def breadcrumb_session(tty: str, pane_pid: int) -> str | None:
 def session_id_of(path: str) -> str:
     stem = os.path.basename(path).removesuffix(".jsonl")
     return stem.split("_", 1)[1] if "_" in stem else stem
+
+
+def parent_pid(pid: int) -> int:
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return int(f.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def descent(pid: int, ancestor: int) -> int | None:
+    """How many generations process `pid` runs below `ancestor` (0: it is `ancestor`), None when
+    it does not (a dead pid never does)."""
+    for depth in range(16):
+        if pid == ancestor:
+            return depth
+        if pid <= 1:
+            return None
+        pid = parent_pid(pid)
+    return None
+
+
+def pane_registration(directory: Path, pane_pid: int) -> tuple[int, dict] | None:
+    """(omp pid, registration) an omp extension published as `<directory>/<omp pid>.json` for the
+    omp running in the pane whose process is `pane_pid` (registrations without a token skipped).
+    When omp processes run inside it (an agent's `omp -p`), the outermost one is the pane's."""
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return None
+    found: list[tuple[int, int, dict]] = []
+    for name in names:
+        m = re.fullmatch(r"(\d+)\.json", name)
+        depth = descent(int(m.group(1)), pane_pid) if m else None
+        if depth is None:
+            continue
+        try:
+            reg = json.loads((directory / name).read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(reg, dict) and isinstance(reg.get("token"), str):
+            found.append((depth, int(m.group(1)), reg))
+    if not found:
+        return None
+    _, pid, reg = min(found, key=lambda f: f[0])
+    return pid, reg
+
+
+def sketch_registration(pane_pid: int) -> dict | None:
+    """{pid, port, token, request} the sketch extension published for the omp running in the pane
+    whose process is `pane_pid`. `port` is None until /sketch starts the server; `request` is the
+    pending request_sketch call as {id, prompt}, or None."""
+    found = pane_registration(SKETCH_DIR, pane_pid)
+    if found is None:
+        return None
+    pid, reg = found
+    port = reg.get("port")
+    req = reg.get("request")
+    ok_req = isinstance(req, dict) and isinstance(req.get("id"), str) and isinstance(req.get("prompt"), str)
+    return {"pid": pid, "port": port if isinstance(port, int) and port > 0 else None,
+            "token": reg["token"], "request": {"id": req["id"], "prompt": req["prompt"]} if ok_req else None}
+
+
+def sketch_conn(reg: dict, timeout: float) -> http.client.HTTPConnection:
+    return http.client.HTTPConnection("127.0.0.1", reg["port"], timeout=timeout)
+
+
+def sketch_http(reg: dict, method: str, path: str, body: bytes | None = None) -> tuple[int, str, str]:
+    """(status, content type, body text) of one request to the pane's sketch server."""
+    conn = sketch_conn(reg, SKETCH_HTTP_S)
+    try:
+        headers = {"Content-Type": "application/json"} if body is not None else {}
+        conn.request(method, f"{path}?t={urllib.parse.quote(reg['token'])}", body=body, headers=headers)
+        r = conn.getresponse()
+        return r.status, r.getheader("Content-Type") or "", r.read().decode(errors="replace")
+    except (OSError, http.client.HTTPException) as ex:
+        raise RequestError(f"omp's sketch canvas is not reachable: {ex}") from None
+    finally:
+        conn.close()
+
+
+class SketchFeed:
+    """Relays the live events (`/events`, server-sent events) of one pane's sketch server to one
+    phone connection as `sketch_event`, reconnecting while omp restarts the server (session
+    switch); `closed` once that omp is gone."""
+
+    def __init__(self, push, target: str, pane_pid: int):
+        self.push, self.target, self.pane_pid = push, target, pane_pid
+        self.stopped = threading.Event()
+        self.sock: socket.socket | None = None
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def stop(self) -> None:
+        self.stopped.set()
+        sock = self.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def emit(self, event: str, data: str | None = None) -> None:
+        if not self.stopped.is_set():
+            self.push({"t": "sketch_event", "target": self.target, "event": event,
+                       **({"data": data} if data is not None else {})})
+
+    def run(self) -> None:
+        self.down = False  # `down` already told to the phone
+        while not self.stopped.is_set():
+            reg = sketch_registration(self.pane_pid)
+            if reg is None:
+                self.emit("closed")
+                return
+            if reg["port"] is not None:
+                try:
+                    self.listen(reg)
+                except (OSError, http.client.HTTPException):
+                    pass
+            if self.stopped.is_set():
+                return
+            if not self.down:
+                self.emit("down")
+                self.down = True
+            self.stopped.wait(SKETCH_RETRY_S)
+
+    def listen(self, reg: dict) -> None:
+        conn = sketch_conn(reg, SKETCH_EVENTS_S)
+        try:
+            conn.request("GET", f"/events?t={urllib.parse.quote(reg['token'])}")
+            r = conn.getresponse()
+            if r.status != 200:
+                raise http.client.HTTPException(f"HTTP {r.status}")
+            self.sock = conn.sock
+            if self.stopped.is_set():
+                return
+            self.emit("open")
+            self.down = False
+            event, data = "message", []
+            while not self.stopped.is_set():
+                line = r.readline()
+                if not line:
+                    return
+                line = line.decode(errors="replace").rstrip("\r\n")
+                if not line:
+                    if data:
+                        self.emit(event, "\n".join(data))
+                    event, data = "message", []
+                elif line.startswith("event:"):
+                    event = line[6:].strip()
+                elif line.startswith("data:"):
+                    data.append(line[5:].removeprefix(" "))
+        finally:
+            self.sock = None
+            conn.close()
+
+
+def ext_registration(pane_pid: int) -> dict | None:
+    """{pid, port, token, sessionId, planReview} the devdeck extension published for the omp running
+    in the pane whose process is `pane_pid`; None when that omp has not loaded it."""
+    found = pane_registration(EXT_DIR, pane_pid)
+    if found is None:
+        return None
+    pid, reg = found
+    port, sid, plan = reg.get("port"), reg.get("sessionId"), reg.get("planReview")
+    if not isinstance(port, int) or isinstance(port, bool) or port <= 0:
+        return None
+    return {"pid": pid, "port": port, "token": reg["token"], "sessionId": sid if isinstance(sid, str) else None,
+            "planReview": plan if isinstance(plan, dict) else None}
+
+
+def ext_conn(reg: dict, timeout: float) -> http.client.HTTPConnection:
+    return http.client.HTTPConnection("127.0.0.1", reg["port"], timeout=timeout)
+
+
+def ext_http(reg: dict, method: str, path: str, body: dict | None = None, query: dict | None = None,
+             timeout: float = EXT_HTTP_S) -> tuple[int, dict]:
+    """(HTTP status, JSON object reply) of one request to a pane's devdeck extension."""
+    conn = ext_conn(reg, timeout)
+    data = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
+    try:
+        conn.request(method, f"{path}?{urllib.parse.urlencode({'t': reg['token'], **(query or {})})}", body=data,
+                     headers={"Content-Type": "application/json"} if data is not None else {})
+        r = conn.getresponse()
+        status, text = r.status, r.read().decode(errors="replace")
+    except (OSError, http.client.HTTPException) as ex:
+        raise RequestError(f"omp's devdeck extension is not reachable: {ex}") from None
+    finally:
+        conn.close()
+    try:
+        reply = json.loads(text) if text else {}
+    except ValueError:
+        reply = {"error": text.strip()[:300] or f"HTTP {status}"}
+    return status, reply if isinstance(reply, dict) else {}
+
+
+def plan_review_field(raw: dict) -> dict | None:
+    """A pane's `planReview` from what the extension published (omp's `plan_review_requested`):
+    the choices omp offers now (disabled ones dropped), the execution-model tiers of its slider and
+    the tier the slider starts on."""
+    rid = raw.get("id")
+    if not isinstance(rid, str) or not rid:
+        return None
+    choices = []
+    for o in raw.get("options") or []:
+        if isinstance(o, dict) and isinstance(o.get("id"), str) and not o.get("disabled"):
+            choice = {"id": o["id"], "label": str(o.get("label") or o["id"])}
+            if o["id"] == "refine":
+                choice["needsFeedback"] = True
+            choices.append(choice)
+    tiers = []
+    for t in raw.get("tiers") or []:
+        if isinstance(t, dict) and isinstance(t.get("role"), str):
+            model = f"{t.get('provider')}/{t.get('model')}" if t.get("provider") and t.get("model") else None
+            if model and t.get("thinkingLevel"):
+                model += f":{t['thinkingLevel']}"
+            tiers.append({"role": t["role"], "label": t["role"], **({"model": model} if model else {})})
+    out = {"id": rid, "title": str(raw.get("title") or "Plan"), "choices": choices, "tiers": tiers or None}
+    if tiers:
+        out["defaultRole"] = "default" if any(t["role"] == "default" for t in tiers) else tiers[0]["role"]
+    return out
+
+
+BTW_STATUS = {"running": "running", "complete": "complete", "cancelled": "cancelled", "error": "error",
+              "interrupted": "cancelled"}
+
+
+def btw_topic(rec, source: str) -> dict | None:
+    """A BtwTopic (wire protocol) from one record of omp's /btw history (a topic: its first turn
+    plus `followUps`). omp's `interrupted` (the asking omp went away) shows as cancelled."""
+    if not isinstance(rec, dict) or not isinstance(rec.get("id"), str) or not isinstance(rec.get("question"), str):
+        return None
+    turns, updated = [], 0
+    for t in [rec, *(rec.get("followUps") if isinstance(rec.get("followUps"), list) else [])]:
+        if not isinstance(t, dict) or not isinstance(t.get("question"), str):
+            continue
+        turn = {"question": t["question"], "answer": t["answer"] if isinstance(t.get("answer"), str) else "",
+                "status": BTW_STATUS.get(t.get("status"), "error"), "ts": ts_ms(t.get("createdAt")) or 0}
+        error = t.get("error") if isinstance(t.get("error"), str) else None
+        if error or t.get("status") == "interrupted":
+            turn["error"] = error or "interrupted: the omp that was answering stopped"
+        turns.append(turn)
+        updated = max(updated, ts_ms(t.get("updatedAt")) or turn["ts"])
+    title = rec["title"] if isinstance(rec.get("title"), str) and rec["title"].strip() else rec["question"]
+    return {"id": rec["id"], "title": " ".join(title.split())[:TITLE_MAX], "status": turns[-1]["status"],
+            "updated": updated, "turns": turns, "source": source}
+
+
+def devdeck_btw_ids(session_id: str | None) -> set[str]:
+    """Ids of the /btw topics of a session that were asked from the phone (the extension notes them)."""
+    if not session_id or not UUID_RE.match(session_id):
+        return set()
+    try:
+        return set((EXT_DIR / "btw" / f"{session_id}.ids").read_text().split())
+    except OSError:
+        return set()
+
+
+def btw_disk_records(session_path: str) -> list[dict]:
+    """The topics of omp's /btw history of a session (`<artifact dir>/btw-history/entry-<id>.json`,
+    the files omp's TUI and RPC /btw write), with their `.title` sidecars."""
+    folder = os.path.join(session_path.removesuffix(".jsonl"), "btw-history")
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        m = re.fullmatch(r"entry-([A-Za-z0-9][\w-]{0,127})\.json", name)
+        if not m:
+            continue
+        try:
+            rec = json.loads(Path(folder, name).read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict) or rec.get("id") != m.group(1):
+            continue
+        try:
+            rec["title"] = Path(folder, f"entry-{m.group(1)}.title").read_text()
+        except OSError:
+            pass
+        out.append(rec)
+    return out
+
+
+class BtwFeed:
+    """Relays the side question DevDeck started in one pane's omp: the devdeck extension's
+    `/events` (server-sent events) become `btw_delta` / `btw_record` pushes (Server.btw_push) until
+    that question's turn ends. `ready` is set once the stream is open (or failed), so the ask is
+    posted only after it and no delta is missed."""
+
+    def __init__(self, server: Server, target: str, reg: dict, session_id: str | None, asker, new_topic: bool):
+        self.server, self.target, self.reg, self.session_id, self.asker = server, target, reg, session_id, asker
+        self.new_topic = new_topic  # a new question (else a follow-up in an existing topic)
+        self.topic_id: str | None = None  # the asked topic, once the ask returned
+        self.ready = threading.Event()
+        self.stopped = threading.Event()
+        self.sock: socket.socket | None = None
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def stop(self) -> None:
+        self.stopped.set()
+        sock = self.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def run(self) -> None:
+        deadline = time.monotonic() + BTW_RUN_S
+        conn = ext_conn(self.reg, EXT_EVENTS_S)
+        try:
+            conn.request("GET", f"/events?t={urllib.parse.quote(self.reg['token'])}")
+            r = conn.getresponse()
+            if r.status != 200:
+                raise http.client.HTTPException(f"HTTP {r.status}")
+            self.sock = conn.sock
+            event, data = "message", []
+            while not self.stopped.is_set() and time.monotonic() < deadline:
+                line = r.readline()
+                if not line:
+                    return
+                line = line.decode(errors="replace").rstrip("\r\n")
+                if line:
+                    if line.startswith("event:"):
+                        event = line[6:].strip()
+                    elif line.startswith("data:"):
+                        data.append(line[5:].removeprefix(" "))
+                    continue
+                if data:
+                    self.on_event(event, "\n".join(data))
+                event, data = "message", []
+        except (OSError, http.client.HTTPException, ValueError) as ex:
+            if not self.stopped.is_set():
+                log(f"btw events of {self.target}: {ex!r}")
+        finally:
+            self.ready.set()
+            self.sock = None
+            conn.close()
+            self.server.btw_feed_done(self)
+
+    def on_event(self, event: str, data: str) -> None:
+        if event == "hello":
+            self.ready.set()
+            return
+        msg = json.loads(data)
+        if not isinstance(msg, dict):
+            return
+        if event == "btw_delta" and isinstance(msg.get("recordId"), str) and isinstance(msg.get("delta"), str):
+            self.server.btw_push(self.target, {"t": "btw_delta", "target": self.target, "topicId": msg["recordId"],
+                                               "delta": msg["delta"]}, self.asker)
+        elif event == "btw_record":
+            rec = msg.get("record")
+            rid = rec.get("id") if isinstance(rec, dict) else None
+            # The extension notes a new topic's id only once the ask returned, after its first record.
+            mine = self.new_topic and (self.topic_id is None or rid == self.topic_id)
+            source = "devdeck" if mine or rid in devdeck_btw_ids(self.session_id) else "omp"
+            topic = btw_topic(rec, source)
+            if topic is None:
+                return
+            self.server.btw_push(self.target, {"t": "btw_record", "target": self.target, "topic": topic}, self.asker)
+            if topic["status"] != "running" and (self.topic_id is None or rid == self.topic_id):
+                self.stopped.set()
 
 
 def capture(target: str, scrollback: bool = True) -> dict | str:
@@ -1393,8 +1811,9 @@ def omp_update(check: bool) -> dict:
 
 
 class ModelCatalog:
-    """`omp models --json` (no model calls: omp's own catalog cache), kept in memory and in
-    MODELS_FILE; served stale while a background refresh runs."""
+    """`omp models --json --kind all` (no model calls: omp's own catalog cache) plus intelligence
+    scores and web grounding from omp's models.db, kept in memory and in MODELS_FILE; served
+    stale while a background refresh runs."""
 
     def __init__(self, path: Path):
         self.path = path
@@ -1406,7 +1825,8 @@ class ModelCatalog:
         self.failed_at = 0.0
         try:
             data = json.loads(path.read_text())
-            if isinstance(data.get("models"), list) and isinstance(data.get("fetchedAt"), int):
+            if (data.get("v") == MODELS_VERSION and isinstance(data.get("models"), list)
+                    and isinstance(data.get("fetchedAt"), int)):
                 self._set(data)
         except (OSError, ValueError, AttributeError) as ex:
             if path.exists():
@@ -1436,26 +1856,40 @@ class ModelCatalog:
     def _refresh(self) -> None:
         data, err = None, None
         try:
-            r = subprocess.run([omp_binary(), "models", "--json"], capture_output=True, stdin=subprocess.DEVNULL,
-                               timeout=MODELS_TIMEOUT_S, cwd=Path.home())
+            r = subprocess.run([omp_binary(), "models", "--json", "--kind", "all"], capture_output=True,
+                               stdin=subprocess.DEVNULL, timeout=MODELS_TIMEOUT_S, cwd=Path.home())
             out = r.stdout.decode(errors="replace")
             line = next((ln for ln in out.splitlines() if ln.startswith("{")), None)
             if line is None:
                 tail = (r.stderr.decode(errors="replace").strip().splitlines() or [f"exit {r.returncode}"])[-1]
                 raise ValueError(tail)
+            scores, by_id, grounded = model_scores()
             models = []
             for m in json.loads(line)["models"]:
                 if not isinstance(m, dict) or not isinstance(m.get("provider"), str) or not isinstance(m.get("id"), str):
                     continue
-                if isinstance(m.get("kind"), str) and m["kind"] not in ("chat", "llm"):
-                    continue
-                thinking = m.get("thinking")
-                models.append({"selector": f"{m['provider']}/{m['id']}", "provider": m["provider"], "id": m["id"],
+                sel = f"{m['provider']}/{m['id']}"
+                kind = m.get("kind") if isinstance(m.get("kind"), str) else "chat"
+                thinking, cost = m.get("thinking"), m.get("cost")
+                price = None
+                if m.get("pricingStatus") == "fixed" and isinstance(cost, dict):
+                    price = {k: float(cost[k]) if isinstance(cost.get(k), (int, float)) else 0.0
+                             for k in ("input", "output", "cacheRead", "cacheWrite")}
+                models.append({"selector": sel, "provider": m["provider"], "id": m["id"],
                                "name": m.get("name") if isinstance(m.get("name"), str) else m["id"],
+                               "kind": "chat" if kind == "llm" else kind,
                                "contextWindow": m.get("contextWindow") if isinstance(m.get("contextWindow"), int) else None,
+                               "maxTokens": m.get("maxTokens") if isinstance(m.get("maxTokens"), int) else None,
                                "reasoning": m.get("reasoning") is True,
-                               "thinking": [x for x in thinking if isinstance(x, str)] if isinstance(thinking, list) else None})
-            data = {"models": models, "fetchedAt": int(time.time() * 1000)}
+                               "thinking": [x for x in thinking if isinstance(x, str)] if isinstance(thinking, list) else None,
+                               "vision": isinstance(m.get("input"), list) and "image" in m["input"],
+                               "price": price, "int": scores.get(sel, by_id.get(m["id"])),
+                               "webSearch": sel in grounded, "dup": False})
+            # Dated aliases ("claude-haiku-4-5-20251001") of a same-named row of the same provider.
+            undated = {(m["provider"], m["name"]) for m in models if not DATED_ID_RE.search(m["id"])}
+            for m in models:
+                m["dup"] = bool(DATED_ID_RE.search(m["id"])) and (m["provider"], m["name"]) in undated
+            data = {"v": MODELS_VERSION, "models": models, "fetchedAt": int(time.time() * 1000)}
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = self.path.with_suffix(".tmp")
@@ -1477,10 +1911,24 @@ class ModelCatalog:
     def lookup(self, selector: str | None) -> dict | None:
         return self.index.get(selector) if selector else None
 
+    def rows(self) -> list[dict]:
+        """The catalog for the phone: each model with this machine's usage and a `hidden` flag
+        for noise (dated aliases; chat rows with no score, no price and no use)."""
+        data = self.get(wait=True)
+        usage = model_usage()
+        out = []
+        for m in data["models"]:
+            u = usage.get(m["selector"])
+            hidden = m["dup"] or (m["kind"] == "chat" and m["int"] is None and m["price"] is None and u is None)
+            row = {k: v for k, v in m.items() if k != "dup"}
+            row["usage"], row["hidden"] = u, hidden
+            out.append(row)
+        return out
+
     def by_footer_name(self, name: str, prefer: list[str]) -> dict | None:
-        """The model omp's footer shows as `name` (catalog name minus a leading "Claude ").
+        """The chat model omp's footer shows as `name` (catalog name minus a leading "Claude ").
         Several providers serve the same name: `prefer` lists selectors/providers to try first."""
-        hits = [m for m in self.index.values() if footer_name(m["name"]) == name]
+        hits = [m for m in self.index.values() if m["kind"] == "chat" and footer_name(m["name"]) == name]
         if not hits:
             return None
 
@@ -1492,31 +1940,604 @@ class ModelCatalog:
         return min(hits, key=rank)
 
 
+def first_json(buf: bytes) -> dict | None:
+    """The first complete JSON object in `buf` (output that may still be arriving), else None."""
+    i = buf.find(b"{")
+    if i < 0:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(buf[i:].decode(errors="replace"))
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def last_line(text: str) -> str:
+    return next((ln.strip() for ln in reversed(text.splitlines()) if ln.strip()), "")[:300]
+
+
+def omp_cli(args: list[str], timeout: float, want_json: bool = True) -> tuple[dict | None, str]:
+    """Runs `omp <args> --no-extensions` in the home directory: (the first JSON object it prints,
+    else None; its other output without ANSI codes). Without extensions because the devdeck and
+    sketch extensions start servers on load that keep a CLI run alive after its output (`omp usage
+    --json` then never exits). Reading stops at the first complete JSON object (`want_json`) or
+    when omp closes its output; a process still running 5 s later is killed. RequestError when omp
+    cannot be started or does not answer within `timeout`."""
+    try:
+        p = subprocess.Popen([omp_binary(), *args, "--no-extensions"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=Path.home())
+    except OSError as ex:
+        raise RequestError(f"could not run omp: {ex}") from None
+    bufs = {p.stdout: bytearray(), p.stderr: bytearray()}
+    live = list(bufs)
+    obj, deadline = None, time.monotonic() + timeout
+    try:
+        while live and obj is None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise RequestError(f"omp {' '.join(a for a in args[:2] if not a.startswith('-'))} "
+                                   f"did not answer within {timeout:.0f} s")
+            ready, _, _ = select.select(live, [], [], min(left, 1.0))
+            for f in ready:
+                chunk = os.read(f.fileno(), 65536)
+                if not chunk:
+                    live.remove(f)
+                elif want_json and f is p.stdout:
+                    bufs[f] += chunk
+                    obj = first_json(bufs[f])
+                else:
+                    bufs[f] += chunk
+    finally:
+        try:
+            p.wait(timeout=5 if obj is not None or not live else 0)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+        p.stdout.close()
+        p.stderr.close()
+    rest = bufs[p.stderr] + (b"" if obj is not None else b"\n" + bufs[p.stdout])
+    return obj, ANSI_RE.sub("", rest.decode(errors="replace")).strip()
+
+
+def reset_accounts() -> list[dict]:
+    """`omp usage reset --json`: every Codex and Claude account with its saved rate-limit resets
+    (`{provider, credentialId, email, accountId, orgId, orgName, availableCount, redeemableCount,
+    soonestExpiry?, credits:[{id, title, status, grantedAt, expiresAt}], unavailableReason?,
+    error?}`). RequestError with omp's text when it fails."""
+    obj, text = omp_cli(["usage", "reset", "--json"], 60.0)
+    if obj is None or not isinstance(obj.get("accounts"), list):
+        raise RequestError(f"omp usage reset failed: {last_line(text) or 'no answer'}")
+    return [a for a in obj["accounts"] if isinstance(a, dict) and isinstance(a.get("provider"), str)
+            and isinstance(a.get("credentialId"), int)]
+
+
+class UsageLimits:
+    """omp's provider usage limits (its /usage page): `omp usage --json` (every account's quota
+    windows) plus `omp usage reset --json` (saved rate-limit resets with their credential ids),
+    kept in memory and in LIMITS_FILE. omp answers from its own report cache in about a second
+    but takes a minute or more when that is cold, so a copy older than LIMITS_FRESH_S is served
+    at once while a background refresh runs; whoever got the old copy is called back when the
+    refresh ends."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.cond = threading.Condition()
+        self.data: dict | None = None
+        self.refreshing = False
+        self.error: str | None = None
+        self.failed_at = -LIMITS_RETRY_S
+        self.waiters: list = []
+        try:
+            data = json.loads(path.read_text())
+            if (data.get("v") == LIMITS_VERSION and isinstance(data.get("reports"), list)
+                    and isinstance(data.get("fetchedAt"), int)):
+                self.data = data
+        except (OSError, ValueError, AttributeError) as ex:
+            if path.exists():
+                log(f"ignoring unreadable {path}: {ex}")
+
+    def get(self, force: bool, waiter) -> tuple[dict, bool]:
+        """(limits, refreshing). Refreshes when nothing is cached, on `force`, or when the copy is
+        older than LIMITS_FRESH_S (after a failure only on `force` for LIMITS_RETRY_S). With nothing
+        cached this waits for the refresh (RequestError with omp's text when it fails); otherwise,
+        while a refresh runs, `waiter(limits, error)` is called once when it ends."""
+        with self.cond:
+            data = self.data
+            old = data is None or force or time.time() * 1000 - data["fetchedAt"] > LIMITS_FRESH_S * 1000
+            backoff = not force and data is not None and time.monotonic() - self.failed_at < LIMITS_RETRY_S
+            if old and not self.refreshing and not backoff:
+                self.refreshing = True
+                threading.Thread(target=self._refresh, daemon=True).start()
+            if data is None:
+                self.cond.wait_for(lambda: not self.refreshing, timeout=LIMITS_TIMEOUT_S + 70)
+                if self.data is None:
+                    raise RequestError(self.error or "omp usage did not answer")
+                return self.data, False
+            if self.refreshing:
+                self.waiters.append(waiter)
+            return data, self.refreshing
+
+    def _refresh(self) -> None:
+        data, err = None, None
+        resets: dict = {}
+
+        def fetch_resets():
+            try:
+                resets["accounts"] = reset_accounts()
+            except RequestError as ex:
+                resets["error"] = str(ex)
+        side = threading.Thread(target=fetch_resets, daemon=True)
+        side.start()
+        try:
+            usage, text = omp_cli(["usage", "--json"], LIMITS_TIMEOUT_S)
+            if usage is None or not isinstance(usage.get("reports"), list):
+                raise RequestError(f"omp usage failed: {last_line(text) or 'no report'}")
+            side.join(70)
+            now = int(time.time() * 1000)
+            data = {"v": LIMITS_VERSION, "fetchedAt": now,
+                    "generatedAt": usage["generatedAt"] if isinstance(usage.get("generatedAt"), int) else now,
+                    "reports": [r for r in usage["reports"] if isinstance(r, dict) and isinstance(r.get("provider"), str)],
+                    "unavailable": [a for a in usage.get("accountsWithoutUsage") or [] if isinstance(a, dict)],
+                    "disabled": [a for a in usage.get("disabledCredentials") or [] if isinstance(a, dict)],
+                    "resets": resets.get("accounts"),
+                    "resetsError": resets.get("error", None if "accounts" in resets else "omp usage reset did not answer")}
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+                os.replace(tmp, self.path)
+            except OSError as ex:
+                log(f"cannot persist {self.path}: {ex}")
+        except RequestError as ex:
+            err = str(ex)
+            log(err)
+        with self.cond:
+            if data is not None:
+                self.data = data
+            else:
+                self.failed_at = time.monotonic()
+            self.error, self.refreshing = err, False
+            waiters, self.waiters = self.waiters, []
+            current = self.data
+            self.cond.notify_all()
+        for fn in waiters:
+            try:
+                fn(current, err)
+            except Exception as ex:  # one closed connection must not keep the others waiting
+                log(f"usage callback failed: {ex!r}")
+
+
+def usage_history(days: int) -> dict:
+    """`omp usage --history --days N --json` (hourly snapshots, ~100 KB a day) folded into one
+    series per account and limit: `{provider, email?, accountId?, limitId, label, windowLabel,
+    points:[[recordedAt, usedFraction]]}`, oldest point first."""
+    obj, text = omp_cli(["usage", "--history", "--days", str(days), "--json"], 60.0)
+    if obj is None or not isinstance(obj.get("entries"), list):
+        raise RequestError(f"omp usage --history failed: {last_line(text) or 'no answer'}")
+    series: dict[tuple, dict] = {}
+    for e in obj["entries"]:
+        if not isinstance(e, dict) or not isinstance(e.get("provider"), str) or not isinstance(e.get("limitId"), str):
+            continue
+        t, f = e.get("recordedAt"), e.get("usedFraction")
+        if not isinstance(t, int) or not isinstance(f, (int, float)) or isinstance(f, bool):
+            continue
+        key = (e["provider"], e.get("accountKey") or e.get("accountId") or e.get("email"), e["limitId"])
+        s = series.get(key)
+        if s is None:
+            s = series[key] = {"provider": e["provider"], "limitId": e["limitId"],
+                               "label": e.get("label") if isinstance(e.get("label"), str) else e["limitId"],
+                               "windowLabel": e.get("windowLabel") if isinstance(e.get("windowLabel"), str) else "",
+                               "points": []}
+            for k in ("email", "accountId"):
+                if isinstance(e.get(k), str) and e[k]:
+                    s[k] = e[k]
+        s["points"].append([t, round(min(1.0, max(0.0, float(f))), 3)])
+    for s in series.values():
+        s["points"].sort()
+    return {"t": "usage_history", "days": days,
+            "sinceMs": obj["sinceMs"] if isinstance(obj.get("sinceMs"), int) else None, "series": list(series.values())}
+
+
 def footer_name(name: str) -> str:
     return name[7:] if name.startswith("Claude ") else name
 
 
-def model_roles() -> dict[str, str]:
-    """`modelRoles:` of omp's config.yml (a flat block of `role: provider/id[:level]` lines)."""
+def model_scores() -> tuple[dict[str, float], dict[str, float], set[str]]:
+    """From omp's provider-model cache (models.db, read-only): intelligence scores by selector and
+    by bare id (omp shows a provider's score for the same id elsewhere), and the selectors of chat
+    models with web-search grounding. Empty when the cache is missing or unreadable."""
+    scores: dict[str, float] = {}
+    by_id: dict[str, float] = {}
+    grounded: set[str] = set()
     try:
-        text = (OMP_DIR / "config.yml").read_text()
+        con = sqlite3.connect(f"file:{OMP_MODELS_DB}?mode=ro", uri=True, timeout=2)
+        try:
+            rows = con.execute("SELECT provider_id, models FROM model_cache").fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error as ex:
+        log(f"cannot read {OMP_MODELS_DB}: {ex}")
+        return scores, by_id, grounded
+    for provider_id, text in rows:
+        try:
+            models = json.loads(text)
+        except (TypeError, ValueError):
+            continue
+        for m in models if isinstance(models, list) else []:
+            if not isinstance(m, dict) or not isinstance(m.get("id"), str):
+                continue
+            provider = m.get("provider") if isinstance(m.get("provider"), str) else str(provider_id).split(":", 1)[0]
+            sel = f"{provider}/{m['id']}"
+            score = m.get("int")
+            if isinstance(score, (int, float)) and not isinstance(score, bool):
+                scores[sel] = float(score)
+                by_id.setdefault(m["id"], float(score))
+            if m.get("webSearch"):
+                grounded.add(sel)
+    return scores, by_id, grounded
+
+
+_usage_lock = threading.Lock()
+_usage: tuple[float, dict[str, dict]] = (-USAGE_TTL_S, {})
+
+
+def model_usage() -> dict[str, dict]:
+    """{selector: {count, last, tps, ttft}} of omp's replies in the last USAGE_DAYS days, from
+    omp's stats.db (read-only): reply count, last reply (epoch ms), and the medians of output
+    tokens per second (over the whole reply, as omp's model hub shows it) and time to first
+    token (ms) of the latest USAGE_SAMPLES replies with 50+ output tokens. Cached USAGE_TTL_S."""
+    global _usage
+    with _usage_lock:
+        if time.monotonic() - _usage[0] < USAGE_TTL_S:
+            return _usage[1]
+        out: dict[str, dict] = {}
+        since = int((time.time() - USAGE_DAYS * 86400) * 1000)
+        speeds: dict[str, tuple[list[float], list[float]]] = collections.defaultdict(lambda: ([], []))
+        try:
+            con = sqlite3.connect(f"file:{OMP_STATS_DB}?mode=ro", uri=True, timeout=2)
+            try:
+                for p, m, n, last in con.execute(
+                        "SELECT provider, model, COUNT(*), MAX(timestamp) FROM messages WHERE timestamp > ?"
+                        " GROUP BY provider, model", (since,)):
+                    out[f"{p}/{m}"] = {"count": n, "last": last, "tps": None, "ttft": None}
+                for p, m, toks, dur, ttft in con.execute(
+                        "SELECT provider, model, output_tokens, duration, ttft FROM (SELECT provider, model,"
+                        " output_tokens, duration, ttft, ROW_NUMBER() OVER (PARTITION BY provider, model"
+                        " ORDER BY timestamp DESC) AS rn FROM messages WHERE timestamp > ? AND output_tokens >= 50"
+                        " AND duration > 0) WHERE rn <= ?", (since, USAGE_SAMPLES)):
+                    tps, ttfts = speeds[f"{p}/{m}"]
+                    tps.append(toks * 1000 / dur)
+                    if ttft:
+                        ttfts.append(ttft)
+            finally:
+                con.close()
+        except sqlite3.Error as ex:
+            log(f"cannot read {OMP_STATS_DB}: {ex}")
+        for sel, (tps, ttfts) in speeds.items():
+            if sel in out:
+                out[sel]["tps"] = round(statistics.median(tps), 1) if tps else None
+                out[sel]["ttft"] = round(statistics.median(ttfts)) if ttfts else None
+        _usage = (time.monotonic(), out)
+        return out
+
+
+# ---------------------------------------------------------------- omp settings and model roles
+
+_config_lock = threading.Lock()
+_config_cache: dict[str, tuple[tuple, dict]] = {}
+
+
+def _config_stamp(cwd: str) -> tuple:
+    def mtime(p: Path) -> int | None:
+        try:
+            return p.stat().st_mtime_ns
+        except OSError:
+            return None
+    return tuple(mtime(p) for p in (OMP_DIR / "config.yml", OMP_DIR / "config.yaml",
+                                    Path(cwd) / ".omp" / "config.yml", Path(cwd) / ".omp" / "settings.json"))
+
+
+def omp_config(cwd: str | None = None, fresh: bool = False) -> dict:
+    """omp's effective settings {key: value} in `cwd` (its project layer applies), from
+    `omp config list --json`; cached until omp's global or that project's config file changes.
+    Keys without a value are left out. RequestError when omp cannot be run."""
+    cwd = cwd if cwd and os.path.isdir(cwd) else str(Path.home())
+    stamp = _config_stamp(cwd)
+    with _config_lock:
+        hit = _config_cache.get(cwd)
+    if hit and hit[0] == stamp and not fresh:
+        return hit[1]
+    try:
+        r = subprocess.run([omp_binary(), "config", "list", "--json"], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=OMP_CONFIG_TIMEOUT_S, cwd=cwd)
+        raw = json.loads(r.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as ex:
+        raise RequestError(f"omp config list failed: {ex}") from None
+    if not isinstance(raw, dict):
+        raise RequestError("omp config list gave no settings")
+    cfg = {k: v["value"] for k, v in raw.items() if isinstance(v, dict) and "value" in v}
+    with _config_lock:
+        _config_cache[cwd] = (stamp, cfg)
+    return cfg
+
+
+def omp_config_write(action: str, key: str, *value: str) -> None:
+    """`omp config set <key> <json>` or `omp config reset <key>`: omp writes its global config file
+    (validated, merged under its lock)."""
+    try:
+        r = subprocess.run([omp_binary(), "config", action, key, *value], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=OMP_CONFIG_TIMEOUT_S, cwd=Path.home())
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        raise RequestError(f"omp config {action} failed: {ex}") from None
+    if r.returncode != 0:
+        lines = ANSI_RE.sub("", r.stderr + r.stdout).strip().splitlines()
+        raise RequestError(f"omp config {action} {key}: " + (lines[0] if lines else f"exit {r.returncode}"))
+
+
+def omp_config_set(key: str, value) -> None:
+    """`omp config set <key> <json>`."""
+    omp_config_write("set", key, json.dumps(value, ensure_ascii=False))
+
+
+_schema_lock = threading.Lock()
+_schema: tuple[int | None, dict] = (None, {})
+
+
+def settings_schema() -> dict:
+    """omp's settings schema as the devdeck extension saved it (EXT_DIR/settings-schema.json):
+    {tabs:[{id, label, groups}], settings:{key: {type, default, values?, options?, tab?, group?,
+    label?, description?, credential}}}; empty until some omp loaded the extension."""
+    global _schema
+    path = EXT_DIR / "settings-schema.json"
+    try:
+        mtime = path.stat().st_mtime_ns
     except OSError:
-        return {}
-    roles, inside = {}, False
-    for ln in text.splitlines():
-        if not inside:
-            inside = bool(re.match(r"^modelRoles:\s*(#.*)?$", ln))
+        return {"tabs": [], "settings": {}}
+    with _schema_lock:
+        if _schema[0] == mtime:
+            return _schema[1]
+    try:
+        raw = json.loads(path.read_text())
+        schema = {"tabs": [t for t in raw.get("tabs") or [] if isinstance(t, dict) and isinstance(t.get("id"), str)],
+                  "settings": {s["key"]: s for s in raw.get("settings") or []
+                               if isinstance(s, dict) and isinstance(s.get("key"), str)}}
+    except (OSError, ValueError, AttributeError) as ex:
+        log(f"{path}: {ex}")
+        schema = {"tabs": [], "settings": {}}
+    with _schema_lock:
+        _schema = (mtime, schema)
+    return schema
+
+
+def settings_state(cwd: str | None) -> dict:
+    """The `settings` reply: every omp setting in `cwd` (its project layer applies) from three
+    `omp config list --json` runs at once (effective values, then the keys the global and the project
+    layer set), described with the schema. Ordered like omp's /settings page (tab, then group);
+    settings the page does not show follow, grouped by their first key segment."""
+    cwd = cwd if cwd and os.path.isdir(cwd) else str(Path.home())
+    procs = []
+    try:
+        for extra in ((), ("--scope", "global"), ("--scope", "project")):
+            procs.append(subprocess.Popen([omp_binary(), "config", "list", "--json", *extra], stdout=subprocess.PIPE,
+                                          stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, cwd=cwd, text=True))
+        outs = [p.communicate(timeout=OMP_CONFIG_TIMEOUT_S)[0] for p in procs]
+        full, glob_, proj = (json.loads(o) for o in outs)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as ex:
+        raise RequestError(f"omp config list failed: {ex}") from None
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+    if not all(isinstance(d, dict) for d in (full, glob_, proj)):
+        raise RequestError("omp config list gave no settings")
+    schema = settings_schema()
+    tabs = {t["id"]: (i, t) for i, t in enumerate(schema["tabs"])}
+    items = []
+    for order, (key, cur) in enumerate(full.items()):
+        if not isinstance(cur, dict):
             continue
-        if not ln.strip() or ln.lstrip().startswith("#"):
+        d = schema["settings"].get(key, {})
+        typ = cur.get("type") if cur.get("type") in SETTINGS_TYPES else d.get("type")
+        if typ not in SETTINGS_TYPES:
             continue
-        if not ln[0].isspace():
-            break
-        m = re.match(r"^\s+([\w.-]+)\s*:\s*(.*?)\s*$", ln)
-        if m:
-            value = re.sub(r"\s+#.*$", "", m.group(2)).strip().strip("'\"")
-            if value:
-                roles[m.group(1)] = value
-    return roles
+        tab = tabs.get(d.get("tab"))
+        if tab:
+            group = tab[1].get("label", tab[0]) + (f" · {d['group']}" if d.get("group") else "")
+            groups = tab[1].get("groups") or []
+            rank = (0, tab[0], groups.index(d["group"]) if d.get("group") in groups else len(groups), order)
+        else:
+            group, rank = key.split(".", 1)[0], (1, 0, 0, order)
+        item = {"key": key, "group": group, "type": typ,
+                "description": d.get("description") or cur.get("description") or "",
+                "scope": "project" if key in proj else "global" if key in glob_ else "default"}
+        secret = d.get("credential") is True
+        if secret:
+            item["secret"] = True
+        else:
+            if "value" in cur:
+                item["value"] = cur["value"]
+            if d.get("default") is not None:
+                item["default"] = d["default"]
+        if typ == "enum" and isinstance(d.get("values"), list):
+            item["options"] = [str(v) for v in d["values"]]
+        elif typ == "string" and isinstance(d.get("options"), list) and d["options"]:
+            item["options"] = [str(o.get("value")) for o in d["options"] if isinstance(o, dict)]
+        if isinstance(d.get("label"), str):
+            item["label"] = d["label"]
+        items.append((rank, item))
+    items.sort(key=lambda r: r[0])
+    # omp watches its config directory and applies on-disk changes to running sessions.
+    return {"t": "settings", "items": [i for _, i in items], "restartHint": False}
+
+
+CHAT_ROLES = ("default", "smol", "slow", "vision", "plan", "commit", "tiny", "memory", "task", "advisor", "widget")
+KIND_ROLES = ("image", "web", "speech", "dictation", "judge")
+ROLE_KINDS = {"tiny": ("chat", "tiny"), "memory": ("chat", "tiny"), "image": ("image",), "web": ("search", "chat"),
+              "speech": ("tts",), "dictation": ("stt",), "judge": ("judge", "tiny", "chat")}
+ROLE_LEVELS = THINKING_LEVELS + ("inherit",)
+ROLE_DESC = {
+    "default": "The main conversation model",
+    "smol": "Fast, cheap model for light work and prewalk hand-offs",
+    "slow": "Strong model for thorough reasoning",
+    "vision": "Chat model that answers questions about images",
+    "plan": "Model used while plan mode is on",
+    "commit": "Writes commit messages",
+    "tiny": "Background work such as session titles",
+    "memory": "Memory extraction and consolidation",
+    "task": "Model for task subagents",
+    "advisor": "Second model that reviews each turn",
+    "widget": "Writes the live widgets of background jobs",
+    "image": "Image generation (generate_image)",
+    "web": "Web search: a search engine or a grounded chat model",
+    "speech": "Text to speech",
+    "dictation": "Speech to text",
+    "judge": "Judgments: auto thinking, stop detection, find",
+}
+
+
+def split_level(spec: str) -> tuple[str, str | None]:
+    """("provider/id" or "@role", level) of a role selector with an optional ":level" suffix."""
+    head, sep, tail = spec.rpartition(":")
+    return (head, tail) if sep and head and tail in ROLE_LEVELS else (spec, None)
+
+
+def role_names(cfg: dict) -> list[str]:
+    """Built-in chat roles, custom roles (from modelRoles, cycleOrder and modelTags), kind roles."""
+    custom: list[str] = []
+    for src in (cfg.get("modelRoles"), cfg.get("cycleOrder"), cfg.get("modelTags")):
+        for name in src or ():
+            if isinstance(name, str) and name not in CHAT_ROLES and name not in KIND_ROLES and name not in custom:
+                custom.append(name)
+    return [*CHAT_ROLES, *custom, *KIND_ROLES]
+
+
+def role_kinds(name: str) -> tuple[str, ...]:
+    return ROLE_KINDS.get(name, ("chat",))
+
+
+def role_thinking(name: str) -> bool:
+    """Whether a ":level" suffix applies: roles that take chat models (omp's hub shows levels on
+    web and judge when they hold a chat model; image, speech and dictation take none)."""
+    return "chat" in role_kinds(name)
+
+
+def roles_state(cfg: dict) -> dict:
+    """The `roles` reply: omp's role assignments, fallback chains, cycle order, compaction limits
+    and presets as configured, each role with what it resolves to."""
+    roles = cfg.get("modelRoles") if isinstance(cfg.get("modelRoles"), dict) else {}
+
+    def resolve(value: str, depth: int = 0) -> tuple[str | None, str | None]:
+        spec, level = split_level(value.split(",", 1)[0].strip())
+        if spec.startswith("@"):
+            target = roles.get(spec[1:])
+            if not isinstance(target, str) or depth > 5:
+                return None, level
+            sel, inner = resolve(target, depth + 1)
+            return sel, level or inner
+        return (spec or None), level
+
+    out = []
+    for name in role_names(cfg):
+        value = roles.get(name) if isinstance(roles.get(name), str) and roles.get(name) else None
+        sel, level = resolve(value) if value else (None, None)
+        auto = None
+        if value is None:
+            auto = {"tiny": "@smol", "memory": "@tiny", "widget": "@smol"}.get(name, "built-in")
+            if name in ("smol", "slow") and roles.get("default"):
+                auto = "@default"
+            elif name == "advisor" and roles.get("slow"):
+                auto = "@slow"
+        builtin = name in CHAT_ROLES or name in KIND_ROLES
+        out.append({"name": name,
+                    "label": name if builtin or not re.search(r"[_-]", name) else re.sub(r"[_-]+", " ", name).title(),
+                    "group": "kind" if name in KIND_ROLES else "chat" if builtin else "custom",
+                    "accepts": list(role_kinds(name)), "thinking": role_thinking(name),
+                    "value": value, "selector": sel, "level": level, "auto": auto,
+                    "desc": ROLE_DESC.get(name, f"Custom chat role (@{name})")})
+    presets = []
+    for pname, p in (cfg.get("modelPresets") or {}).items():
+        if isinstance(p, dict):
+            presets.append({"name": pname,
+                            "roles": p.get("modelRoles") if isinstance(p.get("modelRoles"), dict) else {},
+                            "thinking": p.get("defaultThinkingLevel") if isinstance(p.get("defaultThinkingLevel"), str) else None})
+    storage = cfg.get("modelRoleStorage")
+    return {"t": "roles", "storage": storage if storage in ("global", "project") else "global",
+            "defaultThinking": cfg.get("defaultThinkingLevel") if isinstance(cfg.get("defaultThinkingLevel"), str) else None,
+            "roles": out, "cycle": [c for c in cfg.get("cycleOrder") or [] if isinstance(c, str)],
+            "chains": cfg.get("retry.fallbackChains") if isinstance(cfg.get("retry.fallbackChains"), dict) else {},
+            "thresholds": cfg.get("compaction.modelThresholds") if isinstance(cfg.get("compaction.modelThresholds"), dict) else {},
+            "presets": presets}
+
+
+ROLE_SETTINGS = {"modelRoles": dict, "retry.fallbackChains": dict, "cycleOrder": list,
+                 "compaction.modelThresholds": dict, "modelPresets": dict}
+THRESHOLD_RE = re.compile(r"^(f?[1-9]\d*|[1-9]\d?%|100%)$")
+
+
+def check_selector(catalog: ModelCatalog, spec: str, kinds: tuple[str, ...], thinking: bool, where: str,
+                   grounded: bool = False) -> None:
+    """RequestError unless `spec` ("provider/id[:level]" or "@role[:level]") names a catalog model of
+    one of `kinds` (or another role) with a level that model supports; `grounded` (the web role)
+    also requires a chat model to have web-search grounding."""
+    sel, level = split_level(spec.strip())
+    if level and not thinking:
+        raise RequestError(f"{where}: {sel} takes no thinking level")
+    if sel.startswith("@"):
+        if not ROLE_NAME_RE.match(sel[1:]):
+            raise RequestError(f"{where}: bad role alias {sel!r}")
+        return
+    m = catalog.lookup(sel)
+    if m is None:
+        raise RequestError(f"{where}: unknown model {sel!r}")
+    if m["kind"] not in kinds:
+        raise RequestError(f"{where}: {m['name']} is a {m['kind']} model; this takes " + " or ".join(kinds))
+    if grounded and m["kind"] == "chat" and not m["webSearch"]:
+        raise RequestError(f"{where}: {m['name']} has no web-search grounding")
+    if level and m["kind"] != "chat":
+        raise RequestError(f"{where}: {m['name']} is a {m['kind']} model and takes no thinking level")
+    if level and level not in ("off", "auto", "inherit") and level not in (m["thinking"] or []):
+        raise RequestError(f"{where}: {m['name']} supports thinking: "
+                           + ", ".join(["off", "auto", "inherit", *(m["thinking"] or [])]))
+
+
+def check_role_setting(catalog: ModelCatalog, key: str, value, old) -> None:
+    """RequestError unless `value` is a valid whole value of the role setting `key`; entries
+    unchanged from `old` (possibly hand-written on the PC) are not re-checked."""
+    if not isinstance(value, ROLE_SETTINGS[key]):
+        raise RequestError(f"{key} must be a{'n object' if ROLE_SETTINGS[key] is dict else ' list'}")
+    old = old if isinstance(old, ROLE_SETTINGS[key]) else ROLE_SETTINGS[key]()
+    if key == "cycleOrder":
+        if any(not isinstance(r, str) or not ROLE_NAME_RE.match(r) for r in value) or len(set(value)) != len(value):
+            raise RequestError("cycleOrder must list distinct role names")
+        return
+    for k, v in value.items():
+        if not isinstance(k, str) or not k or (key in ("modelRoles", "modelPresets") and not ROLE_NAME_RE.match(k)):
+            raise RequestError(f"{key}: bad key {k!r}")
+        if old.get(k) == v:
+            continue
+        if key == "modelRoles":
+            if not isinstance(v, str) or not v.strip():
+                raise RequestError(f"modelRoles.{k} must be a model selector")
+            for part in v.split(","):
+                check_selector(catalog, part, role_kinds(k), role_thinking(k), f"role {k}", grounded=k == "web")
+        elif key == "retry.fallbackChains":
+            if not isinstance(v, list) or not all(isinstance(s, str) and s.strip() for s in v):
+                raise RequestError(f"fallback chain {k} must be a list of selectors")
+            for s in v:
+                if not split_level(s.strip())[0].endswith("/*"):
+                    check_selector(catalog, s, ("chat", "tiny", "judge", "image", "search", "tts", "stt"), True,
+                                   f"fallback chain {k}")
+        elif key == "compaction.modelThresholds":
+            if not (isinstance(v, int) and not isinstance(v, bool) and v > 0) and not (isinstance(v, str) and THRESHOLD_RE.match(v)):
+                raise RequestError(f"compaction limit {k}: use tokens (90000), a fixed trigger (f90000) or a percentage (80%)")
+        else:  # modelPresets
+            if not PRESET_RE.match(k) or not isinstance(v, dict) or not isinstance(v.get("modelRoles"), dict):
+                raise RequestError(f"preset {k!r} needs a name of letters, digits, _ . - and its modelRoles")
+            lvl = v.get("defaultThinkingLevel")
+            if lvl is not None and lvl not in THINKING_LEVELS:
+                raise RequestError(f"preset {k}: unknown thinking level {lvl!r}")
+            if any(not isinstance(r, str) or not isinstance(s, str) for r, s in v["modelRoles"].items()):
+                raise RequestError(f"preset {k}: modelRoles must map role names to selectors")
 
 
 _heads_lock = threading.Lock()
@@ -1626,9 +2647,11 @@ def live_session_paths() -> set[str]:
     return live
 
 
-def session_history(cwd: str, current: str | None) -> list[dict]:
-    """omp sessions of `cwd`: pinned first, then newest; empty ones (no user message) skipped."""
-    cwd = os.path.normpath(cwd)
+def session_history(cwd: str | None, current: str | None) -> list[dict]:
+    """omp sessions of `cwd` (every project's when None, each with its `cwd`): pinned first, then
+    newest; empty ones (no user message) skipped."""
+    cwd = os.path.normpath(cwd) if cwd is not None else None
+    limit = HISTORY_MAX if cwd is not None else HISTORY_ALL_MAX
     try:
         pins = json.loads((OMP_DIR / "session-pins.json").read_text())
         pins = {p for p in pins if isinstance(p, str)} if isinstance(pins, list) else set()
@@ -1642,7 +2665,7 @@ def session_history(cwd: str, current: str | None) -> list[dict]:
         except OSError:
             continue
         head = session_head(path, st)
-        if head and head["cwd"] and os.path.normpath(head["cwd"]) == cwd:
+        if head and head["cwd"] and (cwd is None or os.path.normpath(head["cwd"]) == cwd):
             cands.append((head["id"] in pins, st.st_mtime, path, st, head))
     cands.sort(key=lambda c: (c[0], c[1]), reverse=True)
     picked = []
@@ -1651,7 +2674,7 @@ def session_history(cwd: str, current: str | None) -> list[dict]:
         if first is None and not pinned:
             continue
         picked.append((pinned, mtime, path, head, first))
-        if len(picked) >= HISTORY_MAX:
+        if len(picked) >= limit:
             break
     titles, recaps = history_db_info([h["id"] for _, _, _, h, _ in picked])
     live = live_session_paths()
@@ -1662,8 +2685,296 @@ def session_history(cwd: str, current: str | None) -> list[dict]:
                 "live": path in live, "current": sid == current, "pinned": pinned}
         if recaps.get(sid):
             item["recap"] = recaps[sid]
+        if cwd is None:
+            item["cwd"] = head["cwd"]
         out.append(item)
     return out
+
+
+def session_file(sid: str) -> str | None:
+    """The session file `<ts>_<sid>.jsonl` directly under ~/.omp/agent/sessions/*/, if any."""
+    if not UUID_RE.match(sid):
+        return None
+    return next((str(p) for p in (OMP_DIR / "sessions").glob(f"*/*_{sid}.jsonl")), None)
+
+
+def session_entries(path: str):
+    """Every JSON object line of a session file, in order."""
+    with open(path, "rb") as f:
+        for line in f:
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                yield obj
+
+
+def session_entry(path: str, entry_id: str) -> dict | None:
+    """The entry `entry_id` of a session file (only lines naming the id are parsed)."""
+    needle = f'"id":"{entry_id}"'.encode()
+    with open(path, "rb") as f:
+        for line in f:
+            if needle not in line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict) and obj.get("id") == entry_id:
+                return obj
+    return None
+
+
+def one_line(text: str, limit: int = TREE_PREVIEW) -> str:
+    s = " ".join(text.split())
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+def tree_kind(obj: dict) -> str:
+    t = obj.get("type")
+    if t == "message":
+        role = (obj.get("message") or {}).get("role") if isinstance(obj.get("message"), dict) else None
+        if role in ("user", "assistant"):
+            return role
+        if role == "toolResult":
+            return "tool"
+        return "notice" if role in ("bashExecution", "pythonExecution", "fileMention", "custom", "hookMessage") \
+            else "other"
+    if t in ("compaction", "branch_summary"):
+        return t
+    return "notice" if t == "custom_message" else "other"
+
+
+def tree_preview(obj: dict) -> str:
+    """One line (at most TREE_PREVIEW chars) describing a session entry in the tree."""
+    t = obj.get("type")
+    if t == "message":
+        m = obj["message"] if isinstance(obj.get("message"), dict) else {}
+        role, text = m.get("role"), content_text(m.get("content"))
+        if role == "assistant" and not text.strip():
+            names = [b.get("name") for b in m.get("content") or []
+                     if isinstance(b, dict) and b.get("type") == "toolCall" and isinstance(b.get("name"), str)]
+            text = "→ " + ", ".join(names) if names else str(m.get("errorMessage") or m.get("stopReason") or "")
+        elif role == "toolResult":
+            text = f"{m.get('toolName') or 'tool'}: {text}"
+        elif not text and role == "bashExecution":
+            text = f"$ {m.get('command') or ''}"
+        return one_line(text or str(role or "message"))
+    if t in ("compaction", "branch_summary"):
+        return one_line(str(obj.get("summary") or t.replace("_", " ")))
+    if t == "custom_message":
+        return one_line(content_text(obj.get("content")) or str(obj.get("customType") or "notice"))
+    if t == "model_change":
+        return one_line(f"model: {obj.get('model')}")
+    if t == "thinking_level_change":
+        return one_line(f"thinking: {obj.get('thinkingLevel')}")
+    if t == "mode_change":
+        return one_line(f"mode: {obj.get('mode')}")
+    if t == "reset_boundary":
+        return "context cleared (/clear)"
+    return one_line(str(t or "entry").replace("_", " "))
+
+
+def session_tree(path: str) -> dict:
+    """{leafId, entries} of a whole session file for the tree view (wire protocol `tree`). Bookkeeping
+    entries (TREE_SKIP) are left out; an entry whose parent is left out hangs on the nearest shown
+    ancestor. The leaf follows omp's rule: the last entry, or its `activeLeafId` when it has one."""
+    parents: dict[str, str | None] = {}
+    rows: list[tuple] = []
+    labels: dict[str, str] = {}
+    leaf: str | None = None
+    for obj in session_entries(path):
+        ident, t = obj.get("id"), obj.get("type")
+        if not isinstance(ident, str) or t in ("session", "title"):
+            continue
+        parent = obj.get("parentId") if isinstance(obj.get("parentId"), str) else None
+        parents[ident] = parent
+        if "activeLeafId" in obj:
+            leaf = obj["activeLeafId"] if isinstance(obj["activeLeafId"], str) else None
+        else:
+            leaf = ident
+        if t == "label" and isinstance(obj.get("targetId"), str):
+            if isinstance(obj.get("label"), str) and obj["label"].strip():
+                labels[obj["targetId"]] = obj["label"].strip()
+            else:
+                labels.pop(obj["targetId"], None)
+        if t not in TREE_SKIP:
+            rows.append((ident, parent, tree_kind(obj), tree_preview(obj), ts_ms(obj.get("timestamp")) or 0))
+    kept = {r[0] for r in rows}
+    shown: dict[str | None, str | None] = {None: None}
+
+    def shown_of(ident: str | None) -> str | None:
+        chain = []
+        while ident not in shown and ident not in kept and len(chain) < len(parents) + 1:
+            chain.append(ident)
+            ident = parents.get(ident)
+        res = shown.get(ident, ident if ident in kept else None)
+        for c in chain:
+            shown[c] = res
+        return res
+    on_path, cur = set(), leaf
+    while cur is not None and cur not in on_path:
+        on_path.add(cur)
+        cur = parents.get(cur)
+    entries = []
+    for ident, parent, kind, preview, ts in rows:
+        e = {"id": ident, "parentId": shown_of(parent), "kind": kind, "preview": preview, "ts": ts,
+             "onPath": ident in on_path}
+        if ident in labels:
+            e["label"] = labels[ident]
+        entries.append(e)
+    return {"leafId": shown_of(leaf), "entries": entries}
+
+
+def dir_bytes(path: str) -> int:
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def session_tally(path: str) -> dict:
+    """One read of a session file: `entries` counts the whole file; user/assistant messages, models,
+    tokens and cost count the current branch (root to leaf), as omp's /session page does: assistant
+    replies, `model_usage` entries (titles, cache warming, summaries) and the usage subagents
+    report in `task` results. `cost` is None when no entry was priced."""
+    created, parent, leaf = None, None, None
+    # id -> (parentId, role, provider/model, usage)
+    nodes: dict[str, tuple[str | None, str | None, str | None, dict | None]] = {}
+    for obj in session_entries(path):
+        t = obj.get("type")
+        if t == "session":
+            created = ts_ms(obj.get("timestamp"))
+            parent = obj.get("parentSession") if isinstance(obj.get("parentSession"), str) else None
+            continue
+        ident = obj.get("id")
+        if not isinstance(ident, str) or t == "title":
+            continue
+        leaf = (obj["activeLeafId"] if isinstance(obj["activeLeafId"], str) else None) if "activeLeafId" in obj else ident
+        role = model = None
+        usage = obj.get("usage") if t == "model_usage" else None
+        if t == "message" and isinstance(obj.get("message"), dict):
+            m = obj["message"]
+            role = m.get("role")
+            if role == "assistant":
+                if isinstance(m.get("provider"), str) and isinstance(m.get("model"), str):
+                    model = f"{m['provider']}/{m['model']}"
+                usage = m.get("usage")
+            elif role == "toolResult" and m.get("toolName") == "task" and isinstance(m.get("details"), dict):
+                usage = m["details"].get("usage")
+        nodes[ident] = (obj.get("parentId") if isinstance(obj.get("parentId"), str) else None, role, model,
+                        usage if isinstance(usage, dict) else None)
+    users = assistants = 0
+    models: collections.Counter[str] = collections.Counter()
+    tokens = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+    cost, priced, seen, cur = 0.0, False, set(), leaf
+    while cur in nodes and cur not in seen:
+        seen.add(cur)
+        up, role, model, usage = nodes[cur]
+        cur = up
+        users += role == "user"
+        assistants += role == "assistant"
+        if model:
+            models[model] += 1
+        if usage is None:
+            continue
+        for k in tokens:
+            v = usage.get(k)
+            if isinstance(v, int) and not isinstance(v, bool):
+                tokens[k] += v
+        total = usage.get("cost", {}).get("total") if isinstance(usage.get("cost"), dict) else None
+        if isinstance(total, (int, float)) and not isinstance(total, bool):
+            cost += total
+            priced = True
+    return {"created": created, "parent": parent, "entries": len(nodes), "userMessages": users,
+            "assistantMessages": assistants, "models": [{"model": k, "count": n} for k, n in models.most_common()],
+            "tokens": tokens, "cost": round(cost, 6) if priced else None}
+
+
+def session_info(path: str) -> dict:
+    """Facts about a session file for the session sheet (wire protocol `session_info`), counted
+    as session_tally does."""
+    st = os.stat(path)
+    head = session_head(path, st) or {}
+    sid = head.get("id") or session_id_of(path)
+    tally = session_tally(path)
+    titles, _ = history_db_info([sid])
+    artifacts = path.removesuffix(".jsonl")
+    btw = os.path.join(artifacts, "btw-history")
+    out = {"id": sid, "file": path, "cwd": head.get("cwd") or "",
+           "title": head.get("title") or titles.get(sid) or session_first_user(path, st) or "",
+           "created": tally["created"] or int(st.st_ctime * 1000), "modified": int(st.st_mtime * 1000),
+           "entries": tally["entries"], "userMessages": tally["userMessages"],
+           "assistantMessages": tally["assistantMessages"], "models": tally["models"], "tokens": tally["tokens"],
+           "cost": tally["cost"],
+           "artifactsBytes": dir_bytes(artifacts) if os.path.isdir(artifacts) else 0,
+           "btwTopics": len([n for n in (os.listdir(btw) if os.path.isdir(btw) else [])
+                             if re.fullmatch(r"entry-.+\.json", n)])}
+    if tally["parent"]:
+        out["parentSession"] = tally["parent"]
+    return out
+
+
+def prune_trash() -> None:
+    """Drops sessions deleted from the phone more than TRASH_KEEP_S ago."""
+    cutoff = time.time() - TRASH_KEEP_S
+    try:
+        folders = list(TRASH_DIR.iterdir())
+    except OSError:
+        return
+    for folder in folders:
+        try:
+            if json.loads((folder / "meta.json").read_text())["deletedAt"] / 1000 < cutoff:
+                shutil.rmtree(folder)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+
+
+def trash_session(path: str) -> str:
+    """Moves a session file and its artifact directory (subagent sessions, /btw history, ...) into
+    TRASH_DIR/<trashId>/ with a meta.json; returns the trashId."""
+    prune_trash()
+    trash_id = f"{int(time.time())}-{secrets.token_hex(4)}"
+    folder = TRASH_DIR / trash_id
+    folder.mkdir(mode=0o700, parents=True)
+    artifacts = path.removesuffix(".jsonl")
+    has_art = os.path.isdir(artifacts)
+    meta = {"id": session_id_of(path), "path": path, "artifacts": artifacts if has_art else None,
+            "deletedAt": int(time.time() * 1000)}
+    (folder / "meta.json").write_text(json.dumps(meta))
+    shutil.move(path, folder / os.path.basename(path))
+    if has_art:
+        shutil.move(artifacts, folder / os.path.basename(artifacts))
+    return trash_id
+
+
+def restore_session(trash_id) -> str:
+    """Moves a trashed session back where it was; its path."""
+    if not isinstance(trash_id, str) or not re.fullmatch(r"\d{1,12}-[0-9a-f]{8}", trash_id):
+        raise RequestError("session_restore needs a trashId")
+    folder = TRASH_DIR / trash_id
+    try:
+        meta = json.loads((folder / "meta.json").read_text())
+        path, artifacts = meta["path"], meta.get("artifacts")
+    except (OSError, ValueError, KeyError, TypeError):
+        raise RequestError("no such deleted session (restorable for 30 days)") from None
+    sessions = str(OMP_DIR / "sessions") + os.sep
+    if not isinstance(path, str) or not path.startswith(sessions) or \
+            (artifacts is not None and (not isinstance(artifacts, str) or not artifacts.startswith(sessions))):
+        raise RequestError("the deleted session's record is damaged")
+    if os.path.exists(path) or (artifacts and os.path.exists(artifacts)):
+        raise RequestError(f"{path} exists again; not overwriting it")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    shutil.move(folder / os.path.basename(path), path)
+    if artifacts and (folder / os.path.basename(artifacts)).exists():
+        shutil.move(folder / os.path.basename(artifacts), artifacts)
+    shutil.rmtree(folder, ignore_errors=True)
+    return path
 
 
 # ---------------------------------------------------------------- files and git
@@ -3482,6 +4793,9 @@ class Server:
         self.panes_rev = 0
         self.poll_now = threading.Event()
         self.catalog = ModelCatalog(MODELS_FILE)
+        self.limits = UsageLimits(LIMITS_FILE)
+        self.reset_lock = threading.Lock()  # one saved-reset spend at a time
+        self.roles_lock = threading.Lock()  # serialises read-check-write of omp's role settings
         self.cmd_locks_lock = threading.Lock()
         self.cmd_locks: dict[str, threading.Lock] = {}
         self.last_escape: dict[str, float] = {}
@@ -3502,6 +4816,8 @@ class Server:
         self.concierge_lock = threading.Lock()
         self.ctl_path = CTL_SOCK
         self.ctl_sock: socket.socket | None = None
+        self.btw_lock = threading.Lock()
+        self.btw_feeds: dict[str, BtwFeed] = {}  # pane target -> the side question DevDeck runs there
         self.sock = socket.create_server(("0.0.0.0", port), reuse_port=False, backlog=16)
 
     def next_rev(self) -> int:
@@ -3559,8 +4875,9 @@ class Server:
             with self.ctl_cond:
                 if panes != self.panes:
                     self.panes = panes
-                    self.panes_sig = tuple((p["target"], p["state"], (p.get("ask") or {}).get("toolCallId"))
-                                           for p in panes)
+                    self.panes_sig = tuple((p["target"], p["state"], (p.get("ask") or {}).get("toolCallId"),
+                                            (p.get("sketch") or {}).get("toolCallId"),
+                                            (p.get("planReview") or {}).get("id")) for p in panes)
                     self.panes_rev += 1
                     controls = list(self.controls)
                 else:
@@ -3619,7 +4936,7 @@ class Server:
         return panes
 
     def inspect_agent(self, target: str, tty: str, pid: int, working: bool, page: bool):
-        """({state, ask?, sessionId?, omp}, transcript or None, visible screen or None) of an omp
+        """({state, ask?, sketch?, sessionId?, omp}, transcript or None, visible screen or None) of an omp
         pane. The screen is captured only when needed: no session file yet (asking and the omp
         settings come from the screen), settings missing from the file, or `page` detection."""
         fields: dict = {"state": "working" if working else "idle"}
@@ -3643,6 +4960,13 @@ class Server:
         elif scr is not None and last_box_top(scr["lines"]).startswith(ASK_MARKERS):
             fields["state"] = "asking"
         fields["omp"] = self.omp_field(target, crumb, st, scr, page)
+        reg = sketch_registration(pid)
+        if reg is not None and reg["request"] is not None:
+            fields["sketch"] = {"toolCallId": reg["request"]["id"], "prompt": reg["request"]["prompt"]}
+        ext = ext_registration(pid)
+        plan = plan_review_field(ext["planReview"]) if ext is not None and ext["planReview"] else None
+        if plan is not None:
+            fields["planReview"] = plan
         return fields, tr, scr
 
     def omp_field(self, target: str, crumb, st: dict | None, scr: dict | None, page: bool) -> dict:
@@ -3678,10 +5002,15 @@ class Server:
 
     def preferred_models(self, target: str) -> list[str]:
         prefer = [self.pane_models[target]] if target in self.pane_models else []
-        default = model_roles().get("default")
-        if default:
-            sel = default.split(":", 1)[0]
-            prefer += [sel, sel.split("/", 1)[0]]
+        try:
+            roles = omp_config().get("modelRoles")
+        except RequestError:
+            roles = None
+        default = roles.get("default") if isinstance(roles, dict) else None
+        if isinstance(default, str):
+            sel = split_level(default.split(",", 1)[0].strip())[0]
+            if not sel.startswith("@"):
+                prefer += [sel, sel.split("/", 1)[0]]
         return prefer
 
     # ------------------------------------------------------------ voice mode
@@ -3759,14 +5088,29 @@ class Server:
             lock.release()
             self.poll_now.set()
 
+    def btw_push(self, target: str, msg: dict, asker) -> None:
+        """A side question's `btw_delta` / `btw_record` to every client watching `target` in the chat
+        view and to the one that asked; paused clients get nothing (they re-fetch with btw_list)."""
+        with self.ctl_cond:
+            controls = list(self.controls)
+        for ctl in controls:
+            if not ctl.paused and (ctl is asker or (ctl.view == "chat" and ctl.target == target)):
+                ctl.push(msg)
+
+    def btw_feed_done(self, feed: BtwFeed) -> None:
+        with self.btw_lock:
+            if self.btw_feeds.get(feed.target) is feed:
+                del self.btw_feeds[feed.target]
+
     def pane_transcript(self, info: dict) -> Transcript | None:
         path = breadcrumb_session(info["tty"], info["pid"])
         return self.transcript(path) if path else None
 
-    def create_terminal(self, cwd: str | None = None, omp: bool = False, yolo: bool = False) -> str:
+    def create_terminal(self, cwd: str | None = None, omp: bool = False, yolo: bool = False,
+                        resume: str | None = None) -> str:
         """A fresh tmux session phone-N (lowest free N) running the default shell in `cwd` (home),
-        optionally starting omp in it (with --yolo if asked); its pane target. RequestError on
-        failure."""
+        optionally starting omp in it (with --yolo if asked, `--resume <id>` with `resume`); its pane
+        target. RequestError on failure."""
         with self.deliver_lock:  # two phones pressing "+ New" at once must not collide
             r = tmux("list-sessions", "-F", "#{session_name}")
             taken = set(r.stdout.decode(errors="replace").split()) if r.returncode == 0 else set()
@@ -3780,12 +5124,12 @@ class Server:
         info = pane_info(name)
         target = info["target"] if isinstance(info, dict) else name
         if omp:
-            launch = shlex.quote(omp_binary()) + (" --yolo" if yolo else "")
+            launch = shlex.quote(omp_binary()) + (" --yolo" if yolo else "") + (f" --resume {resume}" if resume else "")
             err = deliver_text("new-" + name, target, launch, True)
             if err:
                 raise RequestError(f"started {target} but could not start omp in it: {err}")
         log(f"created terminal {target}" + (f" with omp{' --yolo' if yolo else ''}" if omp else "")
-            + (f" in {cwd}" if cwd else ""))
+            + (f" resuming {resume}" if resume else "") + (f" in {cwd}" if cwd else ""))
         self.poll_now.set()
         return target
 
@@ -4216,7 +5560,7 @@ class PaneCommand:
     from the session file, the breadcrumb or the footer. Callers serialise per pane."""
 
     NAMES = ("switch", "effort", "fast", "plan", "compact", "new", "clear", "retry", "resume", "rename",
-             "stop", "queue", "page")
+             "stop", "queue", "page", "preset")
 
     def __init__(self, server: Server, info: dict, name: str, arg):
         self.server, self.target, self.tty, self.pid = server, info["target"], info["tty"], info["pid"]
@@ -4313,7 +5657,7 @@ class PaneCommand:
             raise CmdFailed("the PC prompt has an unsent draft: clear it on the PC first")
         if self.name != "stop" and editor_draft(lines, parse_footer(lines)):
             raise CmdFailed("omp's prompt on the PC holds unsent text; clear it first")
-        if self.name in ("clear", "retry") and state == "working":
+        if self.name in ("clear", "retry", "goto") and state == "working":
             raise CmdFailed("omp is working; stop it first")
         return getattr(self, "c_" + self.name)(state, omp, lines)
 
@@ -4328,6 +5672,8 @@ class PaneCommand:
         model = self.server.catalog.lookup(sel)
         if model is None:
             raise CmdFailed(f"unknown model {sel!r}")
+        if model["kind"] != "chat":
+            raise CmdFailed(f"{model['name']} is a {model['kind']} model, not a chat model")
         if level:
             if level not in THINKING_LEVELS:
                 raise CmdFailed(f"unknown thinking level {level!r}")
@@ -4503,6 +5849,68 @@ class PaneCommand:
             return t >= PAGE_WAIT_S - 0.2 and cur["lines"] != before
         return self.confirm(before, check, timeout=PAGE_WAIT_S)
 
+    def c_preset(self, state, omp, before):
+        """`/modelpreset switch <name>`: omp writes the preset's roles and switches this session to
+        its default model. Confirmed by a model change or by the roles now matching the preset."""
+        name = self.arg.strip()
+        if not PRESET_RE.match(name):
+            raise CmdFailed("preset needs a preset name")
+        try:
+            presets = omp_config(omp["cwd"]).get("modelPresets")
+        except RequestError as ex:
+            raise CmdFailed(str(ex)) from None
+        preset = presets.get(name) if isinstance(presets, dict) else None
+        if not isinstance(preset, dict):
+            raise CmdFailed(f"no model preset {name!r}")
+        want = preset.get("modelRoles") if isinstance(preset.get("modelRoles"), dict) else {}
+        base = self.baseline()
+        self.paste(f"/modelpreset switch {name}")
+
+        def check(cur, news, t):
+            if self.entry(base, "model_change"):
+                return True
+            try:
+                return t >= CMD_SETTLE_S and omp_config(omp["cwd"]).get("modelRoles") == want
+            except RequestError:
+                return False
+        return self.confirm(before, check)
+
+    def c_sketch(self, state, omp, before):
+        """Start the sketch extension's canvas server (`/sketch url`: no browser on the PC)."""
+        reg = sketch_registration(self.pid)
+        if reg is None:
+            raise CmdFailed(SKETCH_MISSING)
+        if reg["port"] is not None:
+            return None
+        self.paste("/sketch url")
+
+        def check(cur, news, t):
+            r = sketch_registration(self.pid)
+            return r is not None and r["port"] is not None
+        return self.confirm(before, check)
+
+    def c_goto(self, state, omp, before):
+        """`/devdeck-goto <nonce> <entryId> [summarize]`: the devdeck extension moves the session leaf
+        with navigateTree (command context only); its outcome is read back by nonce."""
+        entry, _, mode = self.arg.partition(" ")
+        reg = ext_registration(self.pid)
+        if reg is None:
+            raise CmdFailed(EXT_MISSING)
+        nonce = secrets.token_hex(6)
+        self.paste(f"/devdeck-goto {nonce} {entry}" + (" summarize" if mode == "summarize" else ""))
+
+        def check(cur, news, t):
+            try:
+                status, res = ext_http(reg, "GET", "/goto", query={"nonce": nonce})
+            except RequestError:
+                return False
+            if status != 200 or not res.get("done"):
+                return False
+            if not res.get("ok"):
+                raise CmdFailed(str(res.get("error") or "omp refused the move"))
+            return True
+        return self.confirm(before, check, timeout=GOTO_SUMMARY_S if mode == "summarize" else GOTO_WAIT_S)
+
 
 class Utterance:
     """One text being spoken to one connection: `say` (req), an auto-read reply or a question."""
@@ -4557,6 +5965,7 @@ class Control:
         self.voice: dict[str, dict] = {}
         self.utterances: set[Utterance] = set()  # guarded by self.cond
         self.last_rx = time.monotonic()  # when the phone last sent anything
+        self.sketch: SketchFeed | None = None  # the canvas this phone has open; guarded by self.cond
 
     def poke_page(self) -> None:
         with self.cond:
@@ -4591,6 +6000,7 @@ class Control:
                 self.closed = True
                 self.cond.notify()
             self.stop_utterances(lambda u: True)
+            self.close_sketch()
             now = time.monotonic()
             for target, sub in self.voice_subs():
                 if self.client:
@@ -4679,7 +6089,15 @@ class Control:
         elif kind == "say_stop":
             req = msg.get("req")
             self.stop_utterances(lambda u: u.req == req if isinstance(req, str) else True)
-        elif kind in ("more", "full", "ls", "read", "git", "models", "history", "cmd", "omp_update"):
+        elif kind == "sketch":
+            if msg.get("op") == "close":
+                self.close_sketch()
+            else:
+                self.request(msg)
+        elif kind in ("more", "full", "ls", "read", "git", "models", "roles", "roles_set", "history", "cmd", "omp_update",
+                      "btw_list", "btw_ask", "btw_cancel", "plan_get", "plan_answer", "plan_open", "tree", "goto",
+                      "settings", "settings_set", "session_info", "session_delete", "session_restore",
+                      "usage", "usage_reset", "usage_history"):
             self.request(msg)
         else:
             self.push({"t": "error", "error": f"unknown message type {kind!r}"})
@@ -4740,15 +6158,21 @@ class Control:
 
     def new_terminal(self, msg: dict) -> None:
         """A fresh tmux session phone-N running the default shell, watched now. Optional `cwd`
-        (inside home) and `omp` (start omp there, `yolo` adds --yolo); omp ones open in chat."""
+        (inside home) and `omp` (start omp there, `yolo` adds --yolo, `resume` a session id adds
+        --resume); omp ones open in chat."""
         omp = msg.get("omp") is True
+        resume = msg.get("resume")
         cwd = None
         try:
             if msg.get("cwd") is not None:
                 cwd = user_path(msg.get("cwd"))
                 if not os.path.isdir(cwd):
                     raise RequestError(f"not a folder: {cwd}")
-            target = self.server.create_terminal(cwd, omp, msg.get("yolo") is True)
+            if resume is not None:
+                if not omp or not isinstance(resume, str) or session_file(resume.lower()) is None:
+                    raise RequestError("resume needs omp:true and the id of an existing session")
+                resume = resume.lower()
+            target = self.server.create_terminal(cwd, omp, msg.get("yolo") is True, resume)
         except RequestError as ex:
             self.push({"t": "error", "error": str(ex)})
             return
@@ -5021,17 +6445,24 @@ class Control:
                 reply = {"t": "git", **git_request(msg)}
             elif kind == "models":
                 data = self.server.catalog.get(wait=True)
-                reply = {"t": "models", "models": data["models"], "roles": model_roles(),
-                         "fetchedAt": data["fetchedAt"]}
+                reply = {"t": "models", "models": self.server.catalog.rows(), "fetchedAt": data["fetchedAt"]}
+            elif kind == "roles":
+                reply = roles_state(omp_config(self.roles_cwd(msg)))
+            elif kind == "roles_set":
+                reply = self.do_roles_set(msg)
             elif kind == "history":
                 reply = self.do_history(msg)
             elif kind == "omp_update":
                 reply = omp_update(msg.get("check") is True)
-            else:
+            elif kind == "sketch":
+                reply = self.do_sketch(msg)
+            elif kind == "cmd":
                 reply = self.do_cmd(msg)
+            else:
+                reply = getattr(self, "do_" + kind)(msg)
             reply["req"] = req
         except RequestError as ex:
-            reply = {"t": "error", "req": req, "error": str(ex)}
+            reply = {"t": "error", "req": req, "error": str(ex), **({"code": ex.code} if ex.code else {})}
         except StaleFile:
             reply = {"t": "error", "req": req, "error": "the session file changed; try again"}
         except Exception as ex:
@@ -5061,11 +6492,345 @@ class Control:
         return info, fields
 
     def do_history(self, msg: dict) -> dict:
+        """This cwd's sessions, or with `all` every project's (each with its `cwd`)."""
         _, fields = self.agent_pane(msg.get("target"))
         omp = fields["omp"]
         if not omp["cwd"]:
             raise RequestError("omp has not told which directory this terminal works in")
-        return {"t": "history", "cwd": omp["cwd"], "sessions": session_history(omp["cwd"], omp["sessionId"])}
+        everywhere = msg.get("all") is True
+        return {"t": "history", "cwd": omp["cwd"],
+                "sessions": session_history(None if everywhere else omp["cwd"], omp["sessionId"])}
+
+    # ------------------------------------------------------------ native omp pages (README "Native omp pages")
+
+    def omp_pane(self, target) -> dict:
+        """pane_info of an omp pane, else RequestError."""
+        if not isinstance(target, str) or not target:
+            raise RequestError("no target")
+        info = pane_info(target)
+        if isinstance(info, str):
+            raise RequestError(info)
+        if not info["agent"]:
+            raise RequestError("that terminal is not running omp")
+        return info
+
+    def pane_session(self, info: dict) -> str:
+        """The session file of an omp pane, else RequestError."""
+        path = breadcrumb_session(info["tty"], info["pid"])
+        if not path or not os.path.isfile(path):
+            raise RequestError("omp in that terminal has no session file yet (send a first message)")
+        return path
+
+    def ext_pane(self, target) -> tuple[dict, dict]:
+        """(pane_info, devdeck extension registration) of an omp pane, else RequestError (code
+        no_extension when its omp has not loaded the extension)."""
+        info = self.omp_pane(target)
+        reg = ext_registration(info["pid"])
+        if reg is None:
+            raise RequestError(EXT_MISSING, code="no_extension")
+        return info, reg
+
+    def do_btw_list(self, msg: dict) -> dict:
+        """The pane session's /btw topics from omp's history files (no extension needed); the one a
+        DevDeck side question is answering right now comes from the extension, partial answer included."""
+        info = self.omp_pane(msg.get("target"))
+        path = breadcrumb_session(info["tty"], info["pid"])
+        sid = session_id_of(path) if path else None
+        recs = {r["id"]: r for r in btw_disk_records(path)} if path else {}
+        with self.server.btw_lock:
+            feed = self.server.btw_feeds.get(info["target"])
+        if feed is not None and feed.session_id == sid:
+            try:
+                status, res = ext_http(feed.reg, "GET", "/btw")
+                for r in (res.get("records") or []) if status == 200 else []:
+                    if isinstance(r, dict) and r.get("id") == feed.topic_id:
+                        recs[r["id"]] = r
+            except RequestError:
+                pass
+        mine = devdeck_btw_ids(sid)
+        topics = [t for t in (btw_topic(r, "devdeck" if i in mine else "omp") for i, r in recs.items()) if t]
+        topics.sort(key=lambda t: (t["turns"][0]["ts"], t["id"]), reverse=True)
+        return {"t": "btw_list", "target": info["target"], "sessionId": sid, "topics": topics}
+
+    def do_btw_ask(self, msg: dict) -> dict:
+        """A side question (or, with `topicId`, a follow-up) through the extension, which runs omp's
+        own /btw pipeline; the answer streams to the watching clients (BtwFeed)."""
+        question, topic = msg.get("question"), msg.get("topicId")
+        if not isinstance(question, str) or not question.strip() or len(question) > BTW_QUESTION_MAX:
+            raise RequestError(f"btw_ask needs a question of at most {BTW_QUESTION_MAX} characters")
+        if topic is not None and (not isinstance(topic, str) or not ENTRY_ID_RE.match(topic)):
+            raise RequestError("bad topicId")
+        info, reg = self.ext_pane(msg.get("target"))
+        target = info["target"]
+        with self.server.btw_lock:
+            if target in self.server.btw_feeds:
+                raise RequestError("A side question is still running here; cancel it first", code="btw_busy")
+            feed = self.server.btw_feeds[target] = BtwFeed(self.server, target, reg, reg["sessionId"], self,
+                                                           topic is None)
+        try:
+            feed.ready.wait(EXT_HTTP_S)
+            status, res = ext_http(reg, "POST", "/btw", {"question": question, **({"topicId": topic} if topic else {})})
+            rec = res.get("record")
+            if status != 200 or not isinstance(rec, dict) or not isinstance(rec.get("id"), str):
+                raise RequestError(str(res.get("error") or f"HTTP {status}"),
+                                   code="btw_busy" if res.get("code") == "btw_busy" else None)
+        except RequestError:
+            feed.stop()
+            self.server.btw_feed_done(feed)
+            raise
+        feed.topic_id = rec["id"]
+        log(f"{self.peer}: btw {'follow-up' if topic else 'question'} on {target}: topic {rec['id']}")
+        return {"t": "btw_ask", "target": target, "topicId": rec["id"]}
+
+    def do_btw_cancel(self, msg: dict) -> dict:
+        topic = msg.get("topicId")
+        if topic is not None and (not isinstance(topic, str) or not ENTRY_ID_RE.match(topic)):
+            raise RequestError("bad topicId")
+        _, reg = self.ext_pane(msg.get("target"))
+        status, res = ext_http(reg, "POST", "/btw/cancel", {"topicId": topic} if topic else {})
+        if status != 200:
+            raise RequestError(str(res.get("error") or f"HTTP {status}"))
+        return {"t": "btw_cancel", "cancelled": res.get("cancelled") is True}
+
+    def do_plan_get(self, msg: dict) -> dict:
+        rid = msg.get("id")
+        if not isinstance(rid, str) or not rid:
+            raise RequestError("plan_get needs an id")
+        _, reg = self.ext_pane(msg.get("target"))
+        status, res = ext_http(reg, "GET", "/plan", query={"id": rid})
+        if status != 200 or not isinstance(res.get("markdown"), str):
+            raise RequestError(str(res.get("error") or f"HTTP {status}"))
+        return {"t": "plan_get", "id": rid, "path": res.get("path") or "", "markdown": res["markdown"]}
+
+    def do_plan_answer(self, msg: dict) -> dict:
+        rid, choice, feedback, role = msg.get("id"), msg.get("choice"), msg.get("feedback"), msg.get("role")
+        if not isinstance(rid, str) or not rid or not isinstance(choice, str) or not choice:
+            raise RequestError("plan_answer needs an id and a choice")
+        if (feedback is not None and not isinstance(feedback, str)) or (role is not None and not isinstance(role, str)):
+            raise RequestError("feedback and role must be strings")
+        if choice == "refine" and not (feedback or "").strip():
+            return {"t": "plan_answer", "ok": False, "error": "Refining needs feedback"}
+        info, reg = self.ext_pane(msg.get("target"))
+        body = {"id": rid, "choice": choice, **({"feedback": feedback} if feedback else {}), **({"role": role} if role else {})}
+        status, res = ext_http(reg, "POST", "/plan/answer", body)
+        self.server.poll_now.set()
+        if status != 200:
+            return {"t": "plan_answer", "ok": False, "error": str(res.get("error") or f"HTTP {status}")}
+        ok = res.get("ok") is True
+        log(f"{self.peer}: plan review {choice} on {info['target']}: " + ("ok" if ok else str(res.get("error"))))
+        return {"t": "plan_answer", "ok": ok, **({} if ok else {"error": str(res.get("error") or "refused")})}
+
+    def do_plan_open(self, msg: dict) -> dict:
+        _, reg = self.ext_pane(msg.get("target"))
+        status, res = ext_http(reg, "POST", "/plan/open", {}, timeout=60.0)
+        self.server.poll_now.set()
+        if status != 200:
+            return {"t": "plan_open", "ok": False, "error": str(res.get("error") or f"HTTP {status}")}
+        ok = res.get("ok") is True
+        return {"t": "plan_open", "ok": ok, **({} if ok else {"error": str(res.get("error") or "refused")})}
+
+    def do_tree(self, msg: dict) -> dict:
+        info = self.omp_pane(msg.get("target"))
+        path = self.pane_session(info)
+        return {"t": "tree", "target": info["target"], "sessionId": session_id_of(path), **session_tree(path)}
+
+    def do_goto(self, msg: dict) -> dict:
+        """Move the pane's session to an entry: `/devdeck-goto` (PaneCommand goto), which calls omp's
+        navigateTree. A user prompt lands before it and comes back as `draft`, as omp's rewind does."""
+        entry, summarize, rewind = msg.get("entryId"), msg.get("summarize") is True, msg.get("rewind") is True
+        if not isinstance(entry, str) or not ENTRY_ID_RE.match(entry):
+            raise RequestError("goto needs an entryId")
+        info, _ = self.ext_pane(msg.get("target"))
+        if info["working"]:
+            raise RequestError("omp is working; stop it first", code="busy")
+        obj = session_entry(self.pane_session(info), entry)
+        if obj is None:
+            raise RequestError(f"no entry {entry} in this session")
+        m = obj.get("message") if obj.get("type") == "message" and isinstance(obj.get("message"), dict) else {}
+        prompt = m.get("role") == "user"
+        if rewind and not prompt:
+            raise RequestError("rewind needs one of your prompts")
+        try:
+            self.server.run_cmd(info, "goto", f"{entry} summarize" if summarize else entry)
+        except CmdFailed as ex:
+            if "is working" in str(ex):
+                raise RequestError(str(ex), code="busy") from None
+            log(f"{self.peer}: goto {entry} on {info['target']} failed: {str(ex).splitlines()[0]}")
+            return {"t": "goto", "ok": False, "error": str(ex)}
+        log(f"{self.peer}: goto {entry} on {info['target']}" + (" (summarized)" if summarize else ""))
+        return {"t": "goto", "ok": True, **({"draft": content_text(m.get("content"))} if prompt else {})}
+
+    def do_settings(self, msg: dict) -> dict:
+        return settings_state(self.roles_cwd(msg))
+
+    def do_settings_set(self, msg: dict) -> dict:
+        """`omp config set` (or `reset` for value null) of one global setting; answers the fresh list."""
+        key, value = msg.get("key"), msg.get("value")
+        if not isinstance(key, str) or not re.fullmatch(r"[\w.-]{1,128}", key):
+            raise RequestError("settings_set needs a key")
+        cwd = self.roles_cwd(msg)
+        if settings_schema()["settings"].get(key, {}).get("credential") is True:
+            raise RequestError(f"{key} holds a secret; change it on the PC")
+        with self.server.roles_lock:
+            if value is None:
+                omp_config_write("reset", key)
+            else:
+                omp_config_set(key, value)
+            state = settings_state(cwd)
+        item = next((i for i in state["items"] if i["key"] == key), None)
+        log(f"{self.peer}: omp setting {key} " + ("reset" if value is None else "set"))
+        if item is not None and item["scope"] == "project" and value is not None and item.get("value") != value:
+            raise RequestError(f"saved, but this project's .omp/config.yml still decides {key}; change it on the PC")
+        return state
+
+    def do_session_info(self, msg: dict) -> dict:
+        info = self.omp_pane(msg.get("target"))
+        return {"t": "session_info", **session_info(self.pane_session(info))}
+
+    def do_usage(self, msg: dict) -> dict:
+        """Provider usage limits (omp's /usage), plus with `target` that omp session's spend. A copy
+        older than LIMITS_FRESH_S (any copy with `force`) comes back at once with `stale:true`; the
+        refreshed limits follow as a `usage` push without `req` (with `error` when omp failed)."""
+        target = msg.get("target")
+        path = None
+        if target is not None:
+            try:
+                info = self.omp_pane(target)
+                path = breadcrumb_session(info["tty"], info["pid"])
+            except RequestError:
+                path = None  # the limits are global; only the session line is missing
+
+        def pushed(data: dict, err: str | None) -> None:
+            if self.closed:
+                return
+            out = self.usage_msg(data, target, path)
+            if err:
+                out["error"] = err
+            self.push(out)
+        data, refreshing = self.server.limits.get(msg.get("force") is True, pushed)
+        out = self.usage_msg(data, target, path)
+        if refreshing:
+            out["stale"] = True
+        return out
+
+    def usage_msg(self, data: dict, target, path: str | None) -> dict:
+        out = {"t": "usage", **{k: data.get(k) for k in ("fetchedAt", "generatedAt", "reports", "unavailable", "disabled", "resets")}}
+        if isinstance(target, str):
+            out["target"] = target
+        if data.get("resetsError"):
+            out["resetsError"] = data["resetsError"]
+        try:
+            cfg = omp_config()
+            out["autoRedeem"] = {"openai-codex": cfg.get("codexResets.autoRedeem", "unset"),
+                                 "anthropic": cfg.get("claudeResets.autoRedeem", "unset")}
+        except RequestError:
+            pass
+        if path and os.path.isfile(path):
+            try:
+                tally = session_tally(path)
+                out["session"] = {"tokens": tally["tokens"], "cost": tally["cost"]}
+            except (OSError, ValueError, StaleFile):
+                pass
+        return out
+
+    def do_usage_reset(self, msg: dict) -> dict:
+        """Spends one saved rate-limit reset: `omp usage reset <provider>/<credential id>`
+        (irreversible; the app confirms first). Refused unless a fresh `omp usage reset --json`
+        lists the account with a reset usable now. `ok` = omp's count of the account's saved resets
+        went down; `output` is what omp printed."""
+        account = msg.get("account")
+        m = RESET_ACCOUNT_RE.match(account) if isinstance(account, str) else None
+        if m is None:
+            raise RequestError("usage_reset needs an account as provider/credential id, e.g. openai-codex/3")
+        provider, cred = m.group(1), int(m.group(2))
+
+        def listed() -> dict | None:
+            return next((a for a in reset_accounts() if a["provider"] == provider and a["credentialId"] == cred), None)
+        if not self.server.reset_lock.acquire(blocking=False):
+            raise RequestError("a saved reset is being spent already; wait for it to finish")
+        try:
+            before = listed()
+            if before is None:
+                raise RequestError(f"omp lists no account {account} for saved resets; refresh and try again")
+            if isinstance(before.get("error"), str):
+                raise RequestError(f"omp could not load the saved resets of {account}: {before['error']}")
+            if not isinstance(before.get("redeemableCount"), int) or before["redeemableCount"] < 1:
+                why = before.get("unavailableReason")
+                raise RequestError(f"{account} has no saved reset usable now" + (f" ({why})" if isinstance(why, str) else ""))
+            log(f"{self.peer}: spending a saved reset on {account} ({before.get('availableCount')} saved)")
+            _, text = omp_cli(["usage", "reset", account], RESET_SPEND_S, want_json=False)
+            try:
+                after = listed()
+            except RequestError:
+                after = None
+        finally:
+            self.server.reset_lock.release()
+        left = after.get("availableCount") if after else None
+        ok = isinstance(left, int) and isinstance(before.get("availableCount"), int) and left < before["availableCount"]
+        log(f"{self.peer}: usage reset {account}: {'spent' if ok else 'not spent'}, {last_line(text)}")
+        return {"t": "usage_reset", "ok": ok, "account": account, "output": cap(text, 4000)[0],
+                "left": left if isinstance(left, int) else None}
+
+    def do_usage_history(self, msg: dict) -> dict:
+        days = msg.get("days", 7)
+        if not isinstance(days, int) or isinstance(days, bool) or not 1 <= days <= HISTORY_DAYS_MAX:
+            raise RequestError(f"usage_history needs days between 1 and {HISTORY_DAYS_MAX}")
+        return usage_history(days)
+
+    def do_session_delete(self, msg: dict) -> dict:
+        sid = msg.get("id")
+        _, fields = self.agent_pane(msg.get("target"))
+        if not isinstance(sid, str) or not UUID_RE.match(sid.lower()):
+            raise RequestError("session_delete needs a session id")
+        sid = sid.lower()
+        path = session_file(sid)
+        if path is None:
+            raise RequestError("no such session")
+        if sid == fields["omp"]["sessionId"] or path in live_session_paths():
+            raise RequestError("that session is open in a terminal; close it there first", code="live")
+        with self.server.deliver_lock:
+            trash_id = trash_session(path)
+        log(f"{self.peer}: deleted session {sid} (trash {trash_id})")
+        return {"t": "session_delete", "ok": True, "trashId": trash_id}
+
+    def do_session_restore(self, msg: dict) -> dict:
+        with self.server.deliver_lock:
+            path = restore_session(msg.get("trashId"))
+        log(f"{self.peer}: restored session {path}")
+        return {"t": "session_restore", "ok": True}
+
+    def roles_cwd(self, msg: dict) -> str | None:
+        """The directory whose omp settings apply: the omp cwd of `target` when given (its project
+        layer counts), else the home directory."""
+        if msg.get("target") is None:
+            return None
+        _, fields = self.agent_pane(msg.get("target"))
+        return fields["omp"]["cwd"]
+
+    def do_roles_set(self, msg: dict) -> dict:
+        """Writes one whole role setting with `omp config set`, if it still equals `base` (the value
+        the phone edited), then answers with the fresh roles state."""
+        key, value = msg.get("key"), msg.get("value")
+        if key not in ROLE_SETTINGS:
+            raise RequestError("roles_set key must be one of " + ", ".join(ROLE_SETTINGS))
+        cwd = self.roles_cwd(msg)
+        catalog = self.server.catalog
+        catalog.get(wait=True)
+        with self.server.roles_lock:
+            cfg = omp_config(cwd, fresh=True)
+            if key == "modelRoles" and cfg.get("modelRoleStorage") == "project":
+                raise RequestError("model roles are saved per project here (modelRoleStorage: project); change them on the PC")
+            cur = cfg.get(key) if isinstance(cfg.get(key), ROLE_SETTINGS[key]) else ROLE_SETTINGS[key]()
+            if cur != msg.get("base"):
+                raise RequestError(f"{key} changed on the PC; reloaded")
+            check_role_setting(catalog, key, value, cur)
+            omp_config_set(key, value)
+            cfg = omp_config(cwd, fresh=True)
+            if cfg.get(key, ROLE_SETTINGS[key]()) != value:
+                raise RequestError(f"saved, but another config layer (a project .omp/config.yml) still decides {key}; "
+                                   "change it on the PC")
+        log(f"{self.peer}: set omp {key}")
+        return roles_state(cfg)
 
     def do_cmd(self, msg: dict) -> dict:
         target, name = msg.get("target"), msg.get("cmd")
@@ -5088,6 +6853,59 @@ class Control:
         if name == "page":
             self.poke_page()
         return reply
+
+    def do_sketch(self, msg: dict) -> dict:
+        """`open`: start the pane's sketch canvas if needed, return its page and relay its events
+        to this phone; `http`: one call of the page to its server."""
+        op, target = msg.get("op"), msg.get("target")
+        if not isinstance(target, str) or not target:
+            raise RequestError("sketch needs a target")
+        info = pane_info(target)
+        if isinstance(info, str):
+            raise RequestError(info)
+        if not info["agent"]:
+            raise RequestError("that terminal is not running omp")
+        reg = sketch_registration(info["pid"])
+        if reg is None:
+            raise RequestError(SKETCH_MISSING)
+        if op == "open":
+            if reg["port"] is None:
+                try:
+                    self.server.run_cmd(info, "sketch", None)
+                except CmdFailed as ex:
+                    raise RequestError(str(ex)) from None
+                reg = sketch_registration(info["pid"])
+                if reg is None or reg["port"] is None:
+                    raise RequestError("omp did not start the sketch canvas")
+            status, _, html = sketch_http(reg, "GET", "/")
+            if status != 200:
+                raise RequestError(f"omp's sketch canvas answered HTTP {status}")
+            feed = SketchFeed(self.push, info["target"], info["pid"])
+            with self.cond:
+                closed = self.closed
+                old, self.sketch = self.sketch, None if closed else feed
+            for f in (old, feed if closed else None):
+                if f is not None:
+                    f.stop()
+            log(f"{self.peer}: sketch canvas of {info['target']} opened")
+            return {"t": "sketch", "op": "open", "target": info["target"], "html": html}
+        if op == "http":
+            method, path, body = msg.get("method"), msg.get("path"), msg.get("body")
+            if SKETCH_PATHS.get(path) != method or (body is not None and not isinstance(body, str)):
+                raise RequestError(f"sketch http: {method} {path} is not allowed")
+            if reg["port"] is None:
+                raise RequestError("the sketch canvas was closed on the PC; open it again")
+            status, ctype, text = sketch_http(reg, method, path, body.encode() if body is not None else None)
+            if path == "/send":
+                log(f"{self.peer}: sketch sent to {info['target']}: HTTP {status}")
+            return {"t": "sketch", "op": "http", "status": status, "type": ctype, "body": text}
+        raise RequestError("sketch op must be open, http or close")
+
+    def close_sketch(self) -> None:
+        with self.cond:
+            feed, self.sketch = self.sketch, None
+        if feed is not None:
+            feed.stop()
 
     def do_more(self, msg: dict) -> dict:
         target, before = msg.get("target"), msg.get("before")
@@ -5386,7 +7204,25 @@ def cmd_pair(args) -> None:
 
 # ---------------------------------------------------------------- service
 
+def install_ext() -> None:
+    """Symlink the devdeck omp extension (omp-ext/devdeck) into omp's extension directory; omp
+    processes started afterwards load it."""
+    EXT_LINK.parent.mkdir(parents=True, exist_ok=True)
+    if EXT_LINK.is_symlink() and EXT_LINK.resolve() == EXT_SRC.resolve():
+        print(f"{EXT_LINK} already links to {EXT_SRC}")
+        return
+    if EXT_LINK.exists() or EXT_LINK.is_symlink():
+        sys.exit(f"{EXT_LINK} exists and is not a link to {EXT_SRC}; move it away first")
+    EXT_LINK.symlink_to(EXT_SRC, target_is_directory=True)
+    print(f"linked {EXT_LINK} -> {EXT_SRC}; omp sessions started from now on load it (restart running ones)")
+
+
+def cmd_install_ext(args) -> None:
+    install_ext()
+
+
 def cmd_install_service(args) -> None:
+    install_ext()
     unit_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
     dest = Path(args.dest).expanduser().resolve()
@@ -5425,7 +7261,10 @@ def main() -> None:
     p_pair.add_argument("-s", "--serial", help="adb serial (default: the only device, else "
                                                f"{DEFAULT_SERIAL})")
     p_pair.add_argument("--rebuild", action="store_true", help="rebuild the APK first")
-    p_svc = sub.add_parser("install-service", help="start the daemon with every graphical session")
+    p_svc = sub.add_parser("install-service", help="start the daemon with every graphical session (also "
+                                                   "runs install-ext)")
+    sub.add_parser("install-ext", help="link the devdeck omp extension (omp-ext/devdeck) into "
+                                       "~/.omp/agent/extensions/")
     for p in (p_serve, p_svc):
         p.add_argument("--dest", default=str(DEFAULT_DEST),
                        help="where received files go (default %(default)s)")
@@ -5437,7 +7276,8 @@ def main() -> None:
         apply_instance(args.instance)
     if args.port is None:
         args.port = DEFAULT_PORT
-    {"serve": cmd_serve, "pair": cmd_pair, "install-service": cmd_install_service}[args.cmd](args)
+    {"serve": cmd_serve, "pair": cmd_pair, "install-service": cmd_install_service,
+     "install-ext": cmd_install_ext}[args.cmd](args)
 
 
 if __name__ == "__main__":

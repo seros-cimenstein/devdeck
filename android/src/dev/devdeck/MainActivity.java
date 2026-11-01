@@ -33,6 +33,7 @@ import android.view.WindowInsetsController;
 import android.webkit.ConsoleMessage;
 import android.webkit.JavascriptInterface;
 import android.webkit.RenderProcessGoneDetail;
+import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -70,6 +71,7 @@ public class MainActivity extends Activity implements LinkService.Listener {
     private static final int REQ_FILES = 1;
     private static final int REQ_MIC = 2;
     private static final int REQ_LIVE = 3;
+    private static final int REQ_CHOOSER = 4;
     private static final long BACK_TIMEOUT_MS = 1000;
 
     static volatile MainActivity current;
@@ -78,6 +80,7 @@ public class MainActivity extends Activity implements LinkService.Listener {
     private SharedPreferences prefs;
     private WebView web;
     private LinkService svc;
+    private ValueCallback<Uri[]> chooser;  // a page's <input type=file> (the sketch canvas's Image button)
     private boolean bound, started, ready;
     private String pendingOpen;
     private boolean backPending;
@@ -193,6 +196,20 @@ public class MainActivity extends Activity implements LinkService.Listener {
             public boolean onConsoleMessage(ConsoleMessage m) {
                 if (m.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
                     Log.w(TAG, "js: " + m.message() + " @" + m.sourceId() + ":" + m.lineNumber());
+                }
+                return true;
+            }
+
+            @Override
+            public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
+                if (chooser != null) chooser.onReceiveValue(null);
+                chooser = callback;
+                try {
+                    startActivityForResult(params.createIntent(), REQ_CHOOSER);
+                } catch (ActivityNotFoundException e) {
+                    chooser = null;
+                    toast("No file picker available");
+                    return false;
                 }
                 return true;
             }
@@ -576,6 +593,12 @@ public class MainActivity extends Activity implements LinkService.Listener {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_CHOOSER) {
+            ValueCallback<Uri[]> cb = chooser;
+            chooser = null;
+            if (cb != null) cb.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data));
+            return;
+        }
         if (requestCode != REQ_FILES || resultCode != RESULT_OK || data == null) return;
         List<Uri> uris = new ArrayList<>();
         ClipData clip = data.getClipData();
