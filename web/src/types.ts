@@ -378,14 +378,30 @@ export interface HistorySession {
   live: boolean;
   current: boolean;
   pinned: boolean;
+  /** Cut off mid-turn (crash, reboot) and open in no running omp: `omp --restore` continues it. */
+  interrupted: boolean;
+  /** Its terminal went away (killed omp, killed tmux) without omp exiting normally; open in no running omp. */
+  terminated: boolean;
   /** The session's project folder (`history {all:true}` only). */
   cwd?: string;
 }
 export interface HistoryMsg {
   t: "history";
   req: string;
+  /** The pane's omp cwd; "" for an all-projects request without a target. */
   cwd: string;
   sessions: HistorySession[];
+}
+/** Pushed by the PC after its start: sessions cut off or terminated within the last day; an empty list withdraws the offer. */
+export interface RestoreOfferMsg {
+  t: "restore_offer";
+  sessions: HistorySession[];
+}
+/** Reply of `restore_many`: one result per item, `target` of the new terminal or the `error`. */
+export interface RestoreManyMsg {
+  t: "restore_many";
+  req: string;
+  results: { id: string; target?: string; error?: string; restored?: boolean }[];
 }
 export interface CmdMsg {
   t: "cmd";

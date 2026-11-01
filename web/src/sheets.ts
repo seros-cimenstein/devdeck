@@ -2,13 +2,16 @@
 import { bridge, request, send } from "./bridge";
 import { errText, fmtTokens, isOnline, ompCmd, runCmd } from "./omp";
 import { currentPane, hooks, paneTitle, state } from "./state";
-import type { HistoryMsg, HistorySession, OkMsg, SessionDeleteMsg, SessionInfoMsg } from "./types";
+import type { HistoryMsg, HistorySession, OkMsg, RestoreManyMsg, SessionDeleteMsg, SessionInfoMsg } from "./types";
 import { confirmSheet, errorEl, Sheet, spinnerEl, toast } from "./ui";
 import { dirname, fmtAgo, fmtSize, h, icon, tildify } from "./util";
 
-// ---------------------------------------------------------------- history (resume)
+// ---------------------------------------------------------------- history (resume / restore)
 
-/** Sessions of this folder (resume here) or of every project (others open in a new terminal); delete with Undo. */
+/**
+ * Sessions of this folder (resume here) or of every project (others open in a new terminal); delete with Undo.
+ * Sessions cut off mid-turn (crash, reboot) come first in their section and offer Restore (`omp --restore`).
+ */
 export function openHistorySheet() {
   const p = currentPane();
   if (!p?.agent) return;
@@ -42,8 +45,10 @@ export function openHistorySheet() {
           s.body.replaceChildren(h("div.empty", { text: wantAll ? "No sessions found" : "No earlier sessions in this folder" }));
           return;
         }
+        // Pinned first, then cut-off ones, each group newest first (the PC's order; the sort is stable).
+        const sessions = [...m.sessions].sort((a, b) => Number(b.pinned) - Number(a.pinned) || Number(b.interrupted) - Number(a.interrupted));
         const list = h("div.hs-list");
-        for (const it of m.sessions) list.append(historyRow(it, target, s, wantAll && !!it.cwd && it.cwd !== m.cwd));
+        for (const it of sessions) list.append(historyRow(it, target, s, it.cwd || m.cwd, wantAll && !!it.cwd && it.cwd !== m.cwd));
         s.body.replaceChildren(list);
       })
       .catch((e) => {
@@ -53,19 +58,49 @@ export function openHistorySheet() {
   load();
 }
 
-/** One session; `other`: it belongs to another project, so it opens in a new terminal there. */
-function historyRow(it: HistorySession, target: string, s: Sheet, other: boolean): HTMLElement {
+/** The tag of a session that can be brought back: cut off mid-turn (continued) or closed with its terminal (reopened). */
+function restoreTag(it: HistorySession): HTMLElement | null {
+  if (it.interrupted) return h("span.tag.warn", { text: "\u26a1 Interrupted", title: "omp continues the turn that was cut off" });
+  return it.terminated ? h("span.tag", { text: "Closed", title: "Its terminal went away; it is just reopened" }) : null;
+}
+
+/**
+ * One session in folder `cwd`; `other`: it belongs to another project, so it opens in a new terminal there. A cut-off
+ * one restores on tap; Resume stays available beside Restore.
+ */
+function historyRow(it: HistorySession, target: string, s: Sheet, cwd: string, other: boolean): HTMLElement {
   const meta = h("span.hs-meta", null, h("span", { text: fmtAgo(it.mtime) }));
   if (it.pinned) meta.prepend(h("span.icw.hs-pin", { html: icon("pin"), title: "Pinned" }));
-  if (it.current) meta.append(h("span.tag.acc", { text: "Current" }));
-  else if (it.live) meta.append(h("span.tag.ok", { text: "Live" }));
+  const tag = it.current ? h("span.tag.acc", { text: "Current" }) : it.live ? h("span.tag.ok", { text: "Live" }) : restoreTag(it);
+  if (tag) meta.append(tag);
   const del = it.current || it.live ? null : (h("button.ib.mh-ib.hs-del", { "aria-label": "Delete session", title: "Delete", html: icon("trash") }) as HTMLButtonElement);
+  const acts = it.interrupted
+    ? h(
+        "span.hs-acts",
+        null,
+        h("button.btn.primary.sm", {
+          text: "Restore",
+          onclick: (e: Event) => {
+            e.stopPropagation();
+            void restore();
+          },
+        }),
+        h("button.btn.sm", {
+          text: "Resume",
+          onclick: (e: Event) => {
+            e.stopPropagation();
+            void open();
+          },
+        }),
+      )
+    : null;
   const row = h(
-    `div.hs-row${it.current ? ".cur" : ""}`,
+    `div.hs-row${it.current ? ".cur" : ""}${it.interrupted ? ".warn" : ""}`,
     { role: "button", tabindex: 0 },
     h("span.hs-top", null, h("span.hs-title", { text: it.title || "Untitled session" }), meta),
     it.recap ? h("span.hs-recap", { text: it.recap }) : null,
     it.cwd ? h("span.hs-cwd", { text: tildify(it.cwd) }) : null,
+    acts,
     del,
   );
   const busy = (on: boolean) => {
@@ -87,16 +122,27 @@ function historyRow(it: HistorySession, target: string, s: Sheet, other: boolean
       busy(false);
     }
   });
+  const restore = async () => {
+    const ok = await confirmSheet({
+      title: "Restore this session?",
+      text: `DevDeck opens a new terminal in ${tildify(cwd)} and runs omp --restore there: omp closes the turn that was cut off and continues it.`,
+      ok: "Restore",
+    });
+    if (!ok) return;
+    if (!send({ t: "new", cwd, omp: true, resume: it.id, restore: true })) return toast("Offline: cannot create a terminal", "err");
+    toast("Restoring in a new terminal...");
+    s.close();
+  };
   const open = async () => {
     if (it.current) return toast("This is the session that is open now");
     if (other) {
       const ok = await confirmSheet({
         title: "Open in a new terminal?",
-        text: `This session belongs to ${tildify(it.cwd!)}. DevDeck opens a new terminal there and resumes it with omp --resume.`,
+        text: `This session belongs to ${tildify(cwd)}. DevDeck opens a new terminal there and resumes it with omp --resume.`,
         ok: "Open",
       });
       if (!ok) return;
-      if (!send({ t: "new", cwd: it.cwd!, omp: true, resume: it.id })) return toast("Offline: cannot create a terminal", "err");
+      if (!send({ t: "new", cwd, omp: true, resume: it.id })) return toast("Offline: cannot create a terminal", "err");
       toast("Opening a terminal...");
       s.close();
       return;
@@ -128,9 +174,9 @@ function historyRow(it: HistorySession, target: string, s: Sheet, other: boolean
       busy(false);
     }
   };
-  row.addEventListener("click", () => void open());
+  row.addEventListener("click", () => void (it.interrupted ? restore() : open()));
   row.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") void open();
+    if (e.key === "Enter") void (it.interrupted ? restore() : open());
   });
   return row;
 }
@@ -152,6 +198,103 @@ function deletedRow(it: HistorySession, trashId: string, row: HTMLElement): HTML
     }
   });
   return gone;
+}
+
+// ---------------------------------------------------------------- restore (checklist)
+
+/**
+ * Every session that can be brought back, from every project: cut off mid-turn ("Interrupted": `omp --restore`
+ * continues the turn) or closed with its terminal ("Closed": `omp --resume` reopens it). Tick some; Restore N opens
+ * one terminal per session on the PC (`restore_many`) and the phone stays where it is. Needs no omp pane.
+ */
+export function openRestoreSheet() {
+  const p = currentPane();
+  const target = p?.agent ? p.target : "";
+  const s = new Sheet("Restore sessions", "Cut off or closed with their terminal, all projects", "tall");
+  const picked = new Set<string>();
+  const rows = new Map<string, HTMLElement>();
+  let sessions: HistorySession[] = [];
+  const count = h("span.rs-count");
+  const allBtn = h("button.lnk", {
+    onclick: () => {
+      const on = picked.size < sessions.length;
+      picked.clear();
+      if (on) for (const it of sessions) picked.add(it.id);
+      sync();
+    },
+  }) as HTMLButtonElement;
+  const go = h("button.btn.primary.wide", { onclick: () => void submit() }) as HTMLButtonElement;
+  const sync = () => {
+    for (const [id, row] of rows) {
+      row.classList.toggle("sel", picked.has(id));
+      row.querySelector("input")!.checked = picked.has(id);
+    }
+    count.textContent = `${sessions.length} session${sessions.length === 1 ? "" : "s"}`;
+    allBtn.textContent = picked.size < sessions.length ? "Select all" : "Select none";
+    go.textContent = picked.size ? `Restore ${picked.size}` : "Restore";
+    go.disabled = !picked.size;
+  };
+  const submit = async () => {
+    if (!isOnline()) return toast("Offline", "err");
+    const items = sessions.filter((it) => picked.has(it.id)).map((it) => ({ id: it.id, cwd: it.cwd }));
+    go.disabled = true;
+    go.textContent = "Opening terminals...";
+    try {
+      const m = await request<RestoreManyMsg>({ t: "restore_many", items }, 120_000);
+      const opened = m.results.filter((r) => r.target).length;
+      const failed = m.results.filter((r) => r.error);
+      const text = `Opened ${opened} terminal${opened === 1 ? "" : "s"}`;
+      toast(failed.length ? `${text}; ${failed.length} failed: ${failed[0].error}` : text, failed.length ? "err" : "ok");
+      s.close();
+    } catch (e) {
+      toast(errText(e), "err");
+      sync();
+    }
+  };
+  const load = () => {
+    s.body.replaceChildren(spinnerEl("Loading sessions..."));
+    s.foot.hidden = true;
+    request<HistoryMsg>({ t: "history", ...(target ? { target } : {}), all: true, restorable: true }, 30_000)
+      .then((m) => {
+        if (!s.isOpen) return;
+        sessions = m.sessions ?? [];
+        if (!sessions.length) {
+          s.body.replaceChildren(h("div.empty", { text: "No sessions to restore" }));
+          return;
+        }
+        const list = h("div.opts.rs-list");
+        for (const it of sessions) {
+          const inp = h("input", { type: "checkbox" }) as HTMLInputElement;
+          inp.addEventListener("change", () => {
+            if (inp.checked) picked.add(it.id);
+            else picked.delete(it.id);
+            sync();
+          });
+          const row = h(
+            "label.opt.rs-row",
+            null,
+            inp,
+            h("span.mark"),
+            h(
+              "span.opt-main",
+              null,
+              h("span.rs-top", null, h("span.hs-title", { text: it.title || "Untitled session" }), restoreTag(it)),
+              h("span.hs-cwd", { text: `${fmtAgo(it.mtime)} ago \u00b7 ${tildify(it.cwd || "")}` }),
+            ),
+          );
+          rows.set(it.id, row);
+          list.append(row);
+        }
+        s.body.replaceChildren(h("div.rs-bar", null, count, allBtn), list);
+        s.foot.hidden = false;
+        s.foot.replaceChildren(go);
+        sync();
+      })
+      .catch((e) => {
+        if (s.isOpen) s.body.replaceChildren(errorEl(errText(e), load));
+      });
+  };
+  load();
 }
 
 // ---------------------------------------------------------------- session info

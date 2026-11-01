@@ -43,6 +43,9 @@ and systemd unit. Both can run at the same time.
 ./devdeck.py pair              # builds the app, installs it via adb, shares a random token
 ./devdeck.py install-service   # systemd user service, starts with the graphical session;
                               # also links the devdeck omp extension (install-ext)
+./devdeck.py adopt-tmux        # once, if an older daemon started tmux: frees the terminals
+                              # from the service before you restart it (see "Terminals
+                              # outlive the daemon")
 ```
 
 **Which phone.** `pair` uses adb's only device. If several are connected it uses
@@ -203,6 +206,20 @@ offline, never queued), one at a time per terminal, and reports omp's own error 
   project's sessions with their folder; one from another project opens in a new terminal
   there (`omp --resume`). The trash button deletes a session (never the current or a live
   one): its files move to the PC's trash and the row offers Undo.
+- **Restore** (`/restore`): sessions cut off mid-turn by a crash, a reboot, a power loss or
+  a killed omp are marked **⚡ Interrupted** in the Resume sheet, first in their section
+  (pinned / the rest), with **Restore** (the default on tap) beside **Resume**. Restore
+  opens a new terminal in the session's folder running `omp --restore <id>`, which closes the
+  cut-off turn and continues it (like `/retry`), and shows it in chat. Sessions whose
+  terminal went away while omp ran (tmux killed, omp killed, terminal closed) are marked
+  **Closed**. `/restore` opens a checklist of every Interrupted or Closed session of every
+  project (title, folder, age, tag; "No sessions to restore" when there are none) with
+  **Select all** and **Restore N**: the PC opens one terminal per ticked session, continuing
+  Interrupted ones (`omp --restore`) and reopening Closed ones (`omp --resume`, with
+  `--yolo` when that pane had it), then "Opened N terminals" and you stay where you were.
+  After the PC daemon starts, a banner above the compose bar ("3 sessions were cut off",
+  **Restore...** opens the checklist) offers the ones from the last 24 hours until you
+  restore them or dismiss it (✕, for that daemon run).
 - **Stop**: with an empty compose box while omp works, Send becomes Stop (one Escape). With
   text while working, Send steers; "Queue as follow-up" delivers it after the turn.
 - **Tasks**: a `Tasks 3/7` chip shows omp's todo list.
@@ -215,7 +232,8 @@ offline, never queued), one at a time per terminal, and reports omp's own error 
 
 **Native omp pages.** omp's interactive pages have phone sheets instead. Picked from the
 palette or typed and sent, `/btw`, `/plan-review`, `/rewind`, `/branch`, `/tree`,
-`/settings`, `/session`, `/usage` and `/resume` (bare) never open omp's terminal page:
+`/settings`, `/session`, `/usage`, `/resume` (bare) and `/restore` never open omp's terminal
+page (omp has no `/restore` command; it only has the `--restore` flag):
 - **Side questions** (`/btw`, session menu): ask about the session while the agent keeps
   working. The model sees the conversation but runs no tools, and nothing enters the
   transcript. `/btw your question` + Send asks at once; bare `/btw` opens the sheet: topics
@@ -540,8 +558,9 @@ without a `model_change`. Only then the daemon reads omp's footer from the scree
 mode, and the name (catalog name without `Claude `) is mapped back to a model, preferring
 the model this daemon last switched the pane to, then the default role's.
 
-**Models.** `omp models --json --kind all` (omp's own catalog, every kind, no model call;
-about 2 s) is run in a thread on first use, cached in memory and in
+**Models.** `omp models --json --kind all --no-extensions` (omp's own catalog, every kind, no
+model call; about 2 s; without extensions because the devdeck and sketch extensions start
+servers on load that keep the CLI from exiting) is run in a thread on first use, cached in memory and in
 `~/.local/state/devdeck/models.json`, and refreshed in the background after 6 hours while
 the stale copy keeps being served. Two read-only additions:
 - omp's provider-model cache `~/.omp/agent/models.db` gives the intelligence score omp's own
@@ -579,7 +598,70 @@ header `cwd` is the pane's omp cwd. Only the first lines (title slot and header)
 cached by inode/size/mtime; a session counts as non-empty when it contains a user message
 (memory-mapped search). Titles fall back to `history.db` `session_titles`, then the first
 user line; recaps are the latest `session_recaps` row; pins come from
-`session-pins.json`; live means an open `/dev/pts/N` has a breadcrumb naming the file.
+`session-pins.json`; live means a running omp process has `/dev/pts/N` as its controlling
+terminal and that terminal's breadcrumb names the file, written since that omp started (a
+killed omp leaves its breadcrumb behind, and pts numbers are recycled) or naming the session
+that omp's command line names (`--resume`/`--restore`/`--session`: omp does not rewrite a
+breadcrumb that already says the same, so a recycled terminal resuming the very session its
+old breadcrumb names keeps the old one). The pane-to-session lookup uses the same rule.
+
+**Terminals outlive the daemon.** The tmux server must not live in the daemon's service:
+tmux puts every pane it spawns in a `tmux-spawn-*.scope` that is `PartOf` the server's unit,
+so stopping or restarting the service (whatever its `KillMode`) would end every terminal and
+omp session. The call that starts the tmux server (`tmux new-session` when none runs) goes
+through `systemd-run --user --scope --collect --unit=devdeck-tmux-<instance>-<pid>-<n>`
+(plain tmux when systemd-run is missing or fails). At start, and from `adopt-tmux` (also run
+by `install-service` before it restarts the unit), a tmux server found in the service's
+cgroup and the processes of every pane scope `PartOf` the service move into transient scopes
+of their own (`StartTransientUnit` with their PIDs over the user bus:
+`devdeck-tmux-<instance>-<pid>.scope`, `devdeck-pane-<uuid>-<n>.scope`). The unit written by
+`install-service` has `KillMode=process`, so a stop ends only the daemon.
+
+**Restore (sessions cut off mid-turn or closed with their terminal).** `interrupted(path)`
+mirrors the rule `omp --restore` applies (omp 18.14 `session/exit-diagnostics.ts` and
+`task/restore.ts`), reading only the file's tail (64 KB, more only while the last message,
+or for a tool result the assistant message before it, is missing; cached by
+inode/size/mtime):
+1. Walk back along the current branch (the leaf as in the tree view, then `parentId`). A
+   `custom` `session_exit` entry with `data.kind:"normal"` after the last message (the user
+   quit) means no. `signal`, `fatal` and `process_exit` exits (SIGHUP when a terminal closes,
+   SIGTERM) do not count as normal; SIGKILL, a crash or a power loss record none.
+2. The last message decides: an assistant message with tool calls (the batch never got
+   its results), tool results (unless the assistant message that called them ended with
+   `stopReason` `error` or `aborted`), or a user message with no reply yet: cut off. An
+   assistant reply without tool calls (finished, failed, or `Interrupted by user`): not. An
+   `aborted` reply whose `errorMessage` is omp's exit recovery ("Previous OMP process exited
+   before completing the turn.") is cut off but not yet retried: yes.
+3. Otherwise, when the session's last process recorded no normal exit, a subagent
+   transcript under `<session>/` (`<AgentId>.jsonl`, nested ones too; no
+   `<AgentId>.jsonl.tombstone`, not `__advisor*`, with a non-isolated `session_init`
+   contract) whose own entries meet 1-2 makes the session interrupted too. omp itself would
+   also revive such subagents after a normal exit; DevDeck does not offer those leftovers.
+
+`terminated(path)`: the session's last omp ended without a normal exit (no `session_exit`
+of kind `normal` after its last message: SIGKILL, or SIGHUP when tmux or the terminal went
+away), and either the terminals record saw it open in a tmux pane, or the file is older than
+that record and was modified in the last 48 h (the guess for sessions from before it). The
+record, `~/.local/state/devdeck[-instance]/terminals.json` `{since, sessions:{path:{id, cwd,
+pane, yolo}}}`, is refreshed every 5 s and when the panes change: each omp in a tmux pane
+with its session (live rule above) and whether that omp ran with `--yolo`. A recorded
+session leaves it once it ends normally, its file is gone, or it was idle 7 days; `since` is
+when the record began.
+
+`history` marks each session open in no running omp `interrupted` and/or `terminated`;
+`history {restorable:true}` lists only those that are either. `new {restore:true}` starts
+`omp --restore <id>` (refused for a live session): omp opens it as `--resume` does, closes the
+cut-off turn (unfinished tool calls get "outcome unknown" results, then its exit-recovery
+abort) and retries it as `/retry` does: a batch whose every call was cut off runs again,
+else the model answers from where the transcript stops. `restore_many {items}` opens one
+terminal per item, `omp --restore <id>` for an interrupted session, else `omp --resume <id>`,
+with `--yolo` when the record says its pane had it; a failing item does not stop the others,
+and the requesting phone keeps watching what it watched. **Offer**: once after start, the
+daemon lists the interrupted or terminated sessions of every project modified in the last
+24 h (at most 20, not live) and pushes `restore_offer` to each client that connects, minus
+sessions restored, reopened or finished since, until a client sends `restore_dismiss` (for
+this daemon run) or none are left; restoring through `new {restore}` or `restore_many` and a
+dismissal push the remaining list (empty withdraws it) to every connected client.
 
 **omp commands (`cmd`).** One command at a time per pane. Before acting the daemon checks
 that the pane runs omp, is not asking, shows no page/picker, has no draft trap and no unsent
@@ -686,12 +768,15 @@ values, `/settings` tabs and groups) once per process.
   id>`, then lists again: `ok` only when omp's count for that account went down.
   `usage_history` folds `omp usage --history --days N --json` (hourly snapshots, ~100 KB a
   day) into one series per account and window (~40 KB for 7 days).
-- **Resume extras.** `history {all:true}` lists every project's sessions (100 newest).
-  `session_delete` moves the session file and its artifact dir to
-  `~/.local/state/devdeck/trash/<trashId>/` (with `meta.json`), refusing the pane's session
-  and any session a terminal's breadcrumb names; `session_restore` moves them back (never
-  over an existing file). Trash older than 30 days is dropped on the next delete.
-  `new {resume}` starts `omp --resume <id>`.
+- **Resume extras.** `history {all:true}` lists every project's sessions (100 newest); it
+  needs no `target` (without one, nothing is `current` and `cwd` is ""). `session_delete`
+  moves the session file and its artifact dir to `~/.local/state/devdeck/trash/<trashId>/`
+  (with `meta.json`), refusing the pane's session and any session a running omp has open;
+  `session_restore` moves them back (never over an existing file). Trash older than 30 days
+  is dropped on the next delete. `new {resume}` starts `omp --resume <id>` (`restore:true`:
+  `omp --restore <id>`) in `cwd`, which may be the session's recorded folder even outside
+  home; without `cwd` it starts there. `--yolo` is added when asked or when the terminals
+  record says the session's last pane ran omp with it.
 
 **Messages, keys, clipboard.**
 - Messages go in with `tmux load-buffer` and `paste-buffer -p`, plus `send-keys Enter`.
@@ -1032,7 +1117,7 @@ Client → PC lines stay plain.
 
 | Group | Messages |
 |---|---|
-| Live | `watch {target, view}`, `pause`, `resume`, `resync`, `ping {ts}`, `keys {target, keys[]}`, `tap {target, row}`, `type {target, text}`, `new {cwd?, omp?, yolo?, resume?:sessionId}` (→ `created {target:"phone-N:W.P"}`; `resume` needs `omp:true` and starts `omp --resume <id>`) |
+| Live | `watch {target, view}`, `pause`, `resume`, `resync`, `ping {ts}`, `keys {target, keys[]}`, `tap {target, row}`, `type {target, text}`, `new {cwd?, omp?, yolo?, resume?:sessionId, restore?:true}` (→ `created {target:"phone-N:W.P"}`; `resume` needs `omp:true` and starts `omp --resume <id>`, with `restore:true` `omp --restore <id>` (refused while a running omp has it open); `cwd` may be the session's recorded folder, and defaults to it), `restore_dismiss {}` (withdraws the `restore_offer` for this daemon run) |
 | Queued (carry `id`, always answered by `ack {id, ok, error?}`, deduplicated) | `send {target, text, enter}`, `clip {text}`, `answer {target, toolCallId, answers:[{qid, selected[], custom?, note?}]}` |
 | Voice (live, never queued) | `voice {target, on, opts}`, `say {req, target?, entryId?, text?, voice?, speed?}`, `say_stop {req?}` (see "Voice messages") |
 | Live (never queued) | `live_offer`, `live_mode`, `live_stop` (see "Live messages") |
@@ -1056,9 +1141,17 @@ Requests:
   `retry.fallbackChains`, `cycleOrder`, `compaction.modelThresholds`, `modelPresets`;
   `value` the whole new value, `base` the value it was edited from. Errors come back as
   `error {req}`.
-- `history {target, all?}` → `history {cwd, sessions:[{id, title, recap?, mtime(ms), live, current, pinned, cwd?}]}`:
+- `history {target?, all?, restorable?}` → `history {cwd, sessions:[{id, title, recap?, mtime(ms), live, current, pinned, interrupted, terminated, cwd?}]}`:
   the sessions of the pane's omp cwd, pinned first then newest, at most 50, empty ones
-  skipped. With `all:true`: every project's sessions (at most 100), each with its `cwd`.
+  skipped. With `all:true`: every project's sessions (at most 100), each with its `cwd`;
+  `target` is then optional (`cwd` is "" without it). For sessions open in no running omp,
+  `interrupted`: cut off mid-turn; `terminated`: its terminal went away without omp exiting
+  normally (see "Restore"). `restorable:true` lists only those that are either.
+- `restore_many {items:[{id, cwd?}]}` (1-100) → `restore_many {results:[{id, target?,
+  restored?, error?}]}`: one new terminal per item, `omp --restore <id>` when interrupted
+  (`restored:true`), else `omp --resume <id>`, `--yolo` when its last pane had it; an item
+  that fails (unknown, already open) gets its `error` and the rest still open. No `created`
+  follows: the phone keeps watching what it watched. Opened sessions leave the offer.
 - `cmd {target, cmd, arg?}` → `cmd {ok, error?, info?}`: `cmd` is one of `switch`,
   `effort`, `fast`, `plan`, `compact`, `new`, `clear`, `retry`, `resume`, `rename`, `stop`,
   `queue`, `page`, `preset` (table in "omp commands"). Refusals and failures also come back as
@@ -1144,8 +1237,12 @@ Voices: `af_heart`, `af_bella`, `af_nicole`, `af_aoede`, `af_kore`, `af_sarah`,
   failed or a voice message was malformed; it ends that reading (no `last` chunk follows).
 - **Live** (see "Live messages" below): `live`, `live_answer`, `live_transcript`,
   `live_delegation`, `live_notice`.
+- **`restore_offer {sessions}`**: after the daemon starts, to each client that connects,
+  the sessions of every project cut off mid-turn or terminated in the last 24 h (same shape
+  as `history` sessions, each flagged, with `cwd`, at most 20), until restored or dismissed;
+  an empty list withdraws it.
 - **Other replies**: `created`, `ack`, `pong`, `error {error, req?}`, `full`, `ls`, `read`,
-  `git`, `models`, `roles`, `history`, `cmd`.
+  `git`, `models`, `roles`, `history`, `restore_many`, `cmd`.
 
 **Native omp pages** (requests as above; live only). `error {req, error, code?}`: `code` is
 `no_extension` when the pane's omp has not loaded the devdeck extension, `btw_busy`, `busy`

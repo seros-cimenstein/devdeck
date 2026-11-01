@@ -906,6 +906,19 @@ body.dg-covered .main, body.dg-covered .panel { content-visibility: hidden; }
 .hs-cwd { font: 11px var(--mono); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .hs-gone { border-style: dashed; background: transparent; }
 .hs-gone .hs-title { color: var(--muted); font-weight: 500; align-self: center; }
+.hs-acts { display: flex; gap: 8px; margin-top: 6px; }
+.hs-row.warn { border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+.tag.warn { background: color-mix(in srgb, var(--warning) 18%, transparent); color: var(--warning); }
+.restore-banner { background: color-mix(in srgb, var(--warning) 12%, var(--surface)); border-top-color: color-mix(in srgb, var(--warning) 35%, var(--border)); }
+.restore-banner .ab-badge { background: var(--warning); color: #1a1200; }
+.restore-banner .ab-badge .ic { width: 14px; height: 14px; }
+.rb-x { flex: none; width: 32px; height: 32px; color: var(--muted); }
+.rb-x .ic { width: 16px; height: 16px; }
+.rs-bar { display: flex; align-items: center; justify-content: space-between; padding: 2px 2px 8px; }
+.rs-count { font-size: 12.5px; color: var(--muted); }
+.rs-list { padding-bottom: 12px; }
+.rs-top { display: flex; align-items: flex-start; gap: 8px; }
+.rs-row .hs-cwd { margin-top: 2px; }
 .mh-fv.mono { font: 12px var(--mono); word-break: break-all; }
 .si-models { display: flex; flex-direction: column; gap: 2px; padding-bottom: 12px; }
 .si-model { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 4px; border-bottom: 1px solid var(--border); }

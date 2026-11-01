@@ -5,7 +5,7 @@ import { openModelHub, openThinkingSheet } from "./models";
 import { fmtTokens, isOnline, modelLabel, ompCmd, onModels, onPending, pendingFor } from "./omp";
 import { requestPlanReview } from "./plan";
 import { openSettings } from "./settings";
-import { openCompactSheet, openHistorySheet, openRenameSheet, openSessionInfo, openTasksSheet } from "./sheets";
+import { openCompactSheet, openHistorySheet, openRenameSheet, openRestoreSheet, openSessionInfo, openTasksSheet } from "./sheets";
 import { openSketch } from "./sketch";
 import { currentPane, state } from "./state";
 import { openRewind, openTree } from "./tree";
@@ -24,6 +24,8 @@ export const actions = {
   presets: () => openModelHub("roles"),
   effort: () => openThinkingSheet(),
   resume: () => openHistorySheet(),
+  /** Sessions cut off mid-turn or closed with their terminal, every project: a checklist that reopens them. */
+  restore: () => openRestoreSheet(),
   compact: () => openCompactSheet(),
   rename: () => openRenameSheet(),
   tasks: () => openTasksSheet(),

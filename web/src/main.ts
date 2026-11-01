@@ -15,7 +15,7 @@ import { outboxAck, outboxReconcile, sendText } from "./outbox";
 import { PagePanel } from "./page";
 import { initPlanReview, openPlanReview, planOpenFor, planSync } from "./plan";
 import { openSettings } from "./settings";
-import { openOmpUpdate } from "./sheets";
+import { openOmpUpdate, openRestoreSheet } from "./sheets";
 import { onSketchChange, onSketchEvent, openSketch, sketchLink, sketchOpenFor } from "./sketch";
 import { currentPane, hooks, state, type View } from "./state";
 import { TermView } from "./term";
@@ -34,6 +34,7 @@ import type {
   LiveTranscriptMsg,
   Msg,
   Pane,
+  RestoreOfferMsg,
   ScreenMsg,
   SessionsMsg,
   SketchEventMsg,
@@ -77,8 +78,11 @@ const askBanner = h("div.ask-banner", { hidden: true });
 const pageBanner = h("div.ask-banner.page-banner", { hidden: true });
 const sketchBanner = h("div.ask-banner.sketch-banner", { hidden: true });
 const planBanner = h("div.ask-banner.plan-banner", { hidden: true });
+const restoreBanner = h("div.ask-banner.restore-banner", { hidden: true });
+/** Sessions the PC found cut off mid-turn after its start (`restore_offer`), until restored or dismissed. */
+let restoreOffer: RestoreOfferMsg["sessions"] = [];
 const main = h("main.main", null, chat.wrap, term.wrap);
-app.append(top.el, strip.el, main, pageBanner, sketchBanner, planBanner, askBanner, voicePanel, compose.el);
+app.append(top.el, strip.el, main, restoreBanner, pageBanner, sketchBanner, planBanner, askBanner, voicePanel, compose.el);
 const page = new PagePanel();
 page.onChange = () => updatePageBanner();
 const drawer = new Drawer(
@@ -143,6 +147,7 @@ function openTarget(target: string, view?: View) {
   updateSketchBanner();
   planSync(target);
   updatePlanBanner();
+  updateRestoreBanner();
 }
 
 function newTerminal() {
@@ -316,6 +321,28 @@ function updatePlanBanner() {
   );
 }
 
+function updateRestoreBanner() {
+  const n = restoreOffer.length;
+  const show = n > 0 && state.view === "chat";
+  restoreBanner.hidden = !show;
+  if (!show) return;
+  restoreBanner.replaceChildren(
+    h("span.ab-badge", { html: icon("bolt") }),
+    h("span.ab-text", { text: n === 1 ? "1 session was cut off" : `${n} sessions were cut off` }),
+    h("button.btn.primary.sm", { text: "Restore...", onclick: () => openRestoreSheet() }),
+    h("button.ib.rb-x", {
+      "aria-label": "Dismiss",
+      title: "Dismiss",
+      html: icon("close"),
+      onclick: () => {
+        send({ t: "restore_dismiss" });
+        restoreOffer = [];
+        updateRestoreBanner();
+      },
+    }),
+  );
+}
+
 function onLink(l: LinkMsg) {
   state.link = l;
   top.setLink(l);
@@ -371,6 +398,10 @@ function receive(m: Msg) {
       return onAck(m as unknown as AckMsg);
     case "created":
       if (typeof m.target === "string") openTarget(m.target, m.view === "chat" ? "chat" : "term");
+      return;
+    case "restore_offer":
+      restoreOffer = (m as unknown as RestoreOfferMsg).sessions || [];
+      updateRestoreBanner();
       return;
     case "open":
       if (typeof m.target === "string") openTarget(m.target);

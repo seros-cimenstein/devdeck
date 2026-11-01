@@ -22,6 +22,7 @@ import datetime
 import hashlib
 import hmac
 import http.client
+import itertools
 import json
 import mimetypes
 import mmap
@@ -61,6 +62,7 @@ SEEN_FILE = STATE_DIR / "seen.json"
 PARTIAL_DIR = STATE_DIR / "partial"
 CTL_SOCK = STATE_DIR / "ctl.sock"  # local control socket for ddctl (serve --ctl overrides)
 TRASH_DIR = STATE_DIR / "trash"   # sessions deleted from the phone (restorable)
+TERMINALS_FILE = STATE_DIR / "terminals.json"  # omp sessions seen open in panes (README "Restore")
 DEFAULT_DEST = Path.home() / "Downloads" / "phone"
 UNIT_NAME = "devdeck.service"
 DEFAULT_PORT = 47490
@@ -140,6 +142,13 @@ PAGE_CHECK_S = 0.6        # chat view: how often the watched pane is checked for
 TODO_CAP = 4000
 HISTORY_MAX = 50
 HISTORY_ALL_MAX = 100    # sessions in the all-projects list
+TAIL_READ = 65536        # first read from a session file's end when checking for a cut-off turn
+RESTORE_OFFER_S = 24 * 3600  # interrupted/terminated sessions this recent are offered after the daemon starts
+RESTORE_OFFER_MAX = 20
+TERMINATED_GUESS_S = 48 * 3600  # files older than the terminals record: unfinished ones this recent count as terminated
+TERMINALS_POLL_S = 5.0   # how often the open omp sessions are recorded (TERMINALS_FILE)
+TERMINALS_KEEP_S = 7 * 24 * 3600  # recorded sessions closed this long ago are forgotten
+EXIT_ABORT_TEXT = "Previous OMP process exited before completing the turn."  # omp's exit-recovery abort
 TITLE_MAX = 120
 TYPE_MAX = 200
 TAP_MAX = 200
@@ -216,7 +225,7 @@ def apply_instance(name: str) -> None:
     """Point every per-install path and name at a side-by-side instance `name` (e.g. "plus":
     app dev.devdeckplus, ~/.config/devdeck-plus, devdeck-plus.service, port 47491)."""
     global INSTANCE, LABEL, APK, APP_PACKAGE, APP_ACTIVITY, CONFIG_DIR, TOKEN_FILE, STATE_DIR, SEEN_FILE
-    global PARTIAL_DIR, MODELS_FILE, LIMITS_FILE, UNIT_NAME, DEFAULT_PORT, CTL_SOCK, TRASH_DIR
+    global PARTIAL_DIR, MODELS_FILE, LIMITS_FILE, UNIT_NAME, DEFAULT_PORT, CTL_SOCK, TRASH_DIR, TERMINALS_FILE
     if not INSTANCE_RE.match(name):
         sys.exit(f"bad instance name {name!r}: lowercase letters and digits, starting with a letter")
     INSTANCE = name
@@ -233,6 +242,7 @@ def apply_instance(name: str) -> None:
     LIMITS_FILE = STATE_DIR / "usage.json"
     CTL_SOCK = STATE_DIR / "ctl.sock"
     TRASH_DIR = STATE_DIR / "trash"
+    TERMINALS_FILE = STATE_DIR / "terminals.json"
     UNIT_NAME = f"devdeck-{name}.service"
     DEFAULT_PORT = 47491
 
@@ -316,6 +326,95 @@ def tmux_error(r: subprocess.CompletedProcess) -> str:
     return err
 
 
+_scope_seq = itertools.count(1)
+
+
+def tmux_new_session(name: str, *args: str) -> subprocess.CompletedProcess:
+    """`tmux new-session -d -s name ...`. When no tmux server runs yet this call starts it, so it
+    runs in a transient systemd scope of its own (`devdeck-tmux-<instance>-<pid>-<n>`): inside the
+    daemon's service cgroup, stopping or restarting the service would kill every terminal. Plain
+    tmux when systemd-run is missing or cannot create the scope."""
+    cmd = ("new-session", "-d", "-s", name, *args)
+    if tmux("list-sessions").returncode == 0 or not shutil.which("systemd-run"):
+        return tmux(*cmd)
+    unit = f"devdeck-tmux-{INSTANCE or 'main'}-{os.getpid()}-{next(_scope_seq)}"
+    try:
+        r = subprocess.run(["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}", "tmux", *cmd],
+                           capture_output=True, timeout=TMUX_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        r = subprocess.CompletedProcess(["systemd-run"], 1, b"", str(ex).encode())
+    if r.returncode == 0 or tmux("has-session", "-t", f"={name}").returncode == 0:
+        log(f"started the tmux server in {unit}.scope")
+        return subprocess.CompletedProcess(r.args, 0, r.stdout, r.stderr)
+    log(f"systemd-run could not start tmux in a scope ({r.stderr.decode(errors='replace').strip()}); plain tmux")
+    return tmux(*cmd)
+
+
+def systemctl_show(unit: str, *props: str) -> dict[str, str]:
+    r = subprocess.run(["systemctl", "--user", "show", unit, *(f"--property={p}" for p in props)],
+                       capture_output=True, timeout=TMUX_TIMEOUT_S)
+    return dict(ln.split("=", 1) for ln in r.stdout.decode(errors="replace").splitlines() if "=" in ln)
+
+
+def move_to_scope(scope: str, pids: list[str]) -> str | None:
+    """Moves `pids` out of their unit into a new transient scope `scope`; None, else the error."""
+    try:
+        r = subprocess.run(["busctl", "--user", "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
+                            "org.freedesktop.systemd1.Manager", "StartTransientUnit", "ssa(sv)a(sa(sv))", scope, "fail",
+                            "2", "PIDs", "au", str(len(pids)), *pids, "CollectMode", "s", "inactive-or-failed", "0"],
+                           capture_output=True, timeout=TMUX_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        return str(ex)
+    return None if r.returncode == 0 else r.stderr.decode(errors="replace").strip() or f"busctl exited {r.returncode}"
+
+
+def adopt_tmux(unit: str) -> None:
+    """Frees the terminals from service `unit` (README "Terminals outlive the daemon"): an older
+    daemon started the tmux server inside its service, and tmux puts every pane it spawns in a
+    `tmux-spawn-*.scope` that is PartOf the server's unit, so stopping or restarting the service
+    killed them all. The server and those panes' processes move into scopes of their own."""
+    try:
+        cg = systemctl_show(unit, "ControlGroup").get("ControlGroup", "")
+        if not cg:
+            return
+        r = tmux("display-message", "-p", "#{pid}")
+        pid = r.stdout.decode(errors="replace").strip()
+        if r.returncode == 0 and pid.isdigit() and Path(f"/proc/{pid}/cgroup").read_text().strip() == f"0::{cg}":
+            err = move_to_scope(f"devdeck-tmux-{INSTANCE or 'main'}-{pid}.scope", [pid])
+            log(f"tmux server (pid {pid}) moved out of {unit}" if err is None else f"could not move the tmux server out of {unit}: {err}")
+        r = subprocess.run(["systemctl", "--user", "list-units", "--type=scope", "--all", "--plain", "--no-legend",
+                            "tmux-spawn-*"], capture_output=True, timeout=TMUX_TIMEOUT_S)
+        for scope in (ln.split()[0] for ln in r.stdout.decode(errors="replace").splitlines() if ln.strip()):
+            props = systemctl_show(scope, "PartOf", "ControlGroup")
+            if unit not in props.get("PartOf", "").split() or not props.get("ControlGroup"):
+                continue
+            moved: set[str] = set()
+            for attempt in range(2):  # a process forked during the move stays behind: once more
+                time.sleep(0.2 * attempt)  # systemd moves them after answering
+                try:
+                    pids = [p for p in Path(f"/sys/fs/cgroup{props['ControlGroup']}/cgroup.procs").read_text().split()
+                            if p not in moved]
+                except OSError:
+                    break
+                if not pids:
+                    break
+                err = move_to_scope(f"devdeck-pane-{scope.removeprefix('tmux-spawn-').removesuffix('.scope')}-{attempt}.scope", pids)
+                log(f"pane {scope} ({len(pids)} processes) moved out of {unit}" if err is None
+                    else f"could not move pane {scope} out of {unit}: {err}")
+                moved.update(pids)
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        log(f"adopting tmux out of {unit}: {ex}")
+
+
+def own_service() -> str | None:
+    """The systemd unit this process runs in, when it is a service."""
+    try:
+        unit = Path("/proc/self/cgroup").read_text().strip().rsplit("/", 1)[-1]
+    except OSError:
+        return None
+    return unit if unit.endswith(".service") else None
+
+
 # omp titles its terminal "π[-profile] [spinner] <context>": the braille spinner glyph is there
 # only while a turn runs. Without a session file, its question dialog (ask tool) is recognised
 # on screen by these boxes.
@@ -359,18 +458,22 @@ _btime: float | None = None
 _pid_start: dict[int, float] = {}
 
 
+def boot_time() -> float:
+    global _btime
+    if _btime is None:
+        with open("/proc/stat") as f:
+            _btime = next(float(ln.split()[1]) for ln in f if ln.startswith("btime "))
+    return _btime
+
+
 def process_start(pid: int) -> float:
     """Epoch start time of a process (0 if unknown)."""
-    global _btime
     if pid in _pid_start:
         return _pid_start[pid]
     try:
-        if _btime is None:
-            with open("/proc/stat") as f:
-                _btime = next(float(ln.split()[1]) for ln in f if ln.startswith("btime "))
         with open(f"/proc/{pid}/stat") as f:
             fields = f.read().rsplit(")", 1)[1].split()
-        start = _btime + int(fields[19]) / os.sysconf("SC_CLK_TCK")
+        start = boot_time() + int(fields[19]) / os.sysconf("SC_CLK_TCK")
     except (OSError, ValueError, IndexError, StopIteration):
         return 0.0
     if len(_pid_start) > 512:
@@ -379,9 +482,92 @@ def process_start(pid: int) -> float:
     return start
 
 
+def argv_sessions(argv: list[str]) -> set[str]:
+    """Sessions an omp command line names (`--resume`/`--restore`/`--session` id, id prefix or path)."""
+    out = set()
+    for i, a in enumerate(argv):
+        key, eq, val = a.partition("=")
+        if key in ("--resume", "--restore", "--session"):
+            v = val if eq else (argv[i + 1] if i + 1 < len(argv) else "")
+            if v and not v.startswith("-"):
+                out.add(v)
+    return out
+
+
+def crumb_named(path: str, named: set[str]) -> bool:
+    """Whether breadcrumb session `path` is one an omp command line named (argv_sessions): omp does
+    not rewrite a breadcrumb that already says the same, so `omp --resume <id>` in a recycled
+    terminal whose old breadcrumb named that very session leaves the old, older-looking one."""
+    sid = session_id_of(path)
+    return any(v == path or (len(v) >= 8 and sid.startswith(v.lower())) for v in named)
+
+
+def omp_terminals() -> dict[int, tuple[float, bool, set[str]]]:
+    """pts number -> (earliest start (epoch) of an omp process whose controlling terminal it is,
+    whether one of them was started with --yolo, the sessions their command lines name)."""
+    try:
+        btime, tck = boot_time(), os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, StopIteration):
+        return {}
+    out: dict[int, tuple[float, bool, set[str]]] = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        name, _, rest = raw.partition(" (")[2].rpartition(")")
+        if name != "omp":
+            continue
+        fields = rest.split()
+        try:
+            tty, start = int(fields[4]), btime + int(fields[19]) / tck
+        except (ValueError, IndexError):
+            continue
+        major, minor = (tty >> 8) & 0xFFF, (tty & 0xFF) | ((tty >> 12) & 0xFFF00)
+        if not 136 <= major <= 143:  # Unix98 pty slaves: /dev/pts/N
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = f.read().decode(errors="replace").split("\0")
+        except OSError:
+            argv = []
+        yolo, named = "--yolo" in argv, argv_sessions(argv)
+        n = (major - 136) * 256 + minor
+        prev = out.get(n)
+        out[n] = (min(prev[0], start), prev[1] or yolo, prev[2] | named) if prev else (start, yolo, named)
+    return out
+
+
+def pane_omp_sessions(pane_pid: int) -> set[str]:
+    """argv_sessions of the omp processes among a pane shell's children and grandchildren."""
+    out, pids = set(), [pane_pid]
+    for _ in range(2):
+        kids = []
+        for pid in pids:
+            try:
+                with open(f"/proc/{pid}/task/{pid}/children") as f:
+                    kids += [int(k) for k in f.read().split()]
+            except (OSError, ValueError):
+                pass
+        for k in kids:
+            try:
+                with open(f"/proc/{k}/cmdline", "rb") as f:
+                    argv = f.read().decode(errors="replace").split("\0")
+            except OSError:
+                continue
+            if argv and os.path.basename(argv[0]) == "omp":
+                out |= argv_sessions(argv)
+        pids = kids
+    return out
+
+
 def breadcrumb(tty: str, pane_pid: int) -> tuple[str, str] | None:
     """(cwd, session JSONL path) omp recorded for this pane's terminal, if written during the pane's
-    life (pts numbers are recycled, so an older breadcrumb belongs to some earlier terminal)."""
+    life (pts numbers are recycled, so an older breadcrumb belongs to some earlier terminal), or
+    naming the session the pane's omp was started with (crumb_named)."""
     if not tty.startswith("/dev/pts/"):
         return None
     crumb = OMP_DIR / "terminal-sessions" / f"pts-{tty[len('/dev/pts/'):]}"
@@ -391,7 +577,9 @@ def breadcrumb(tty: str, pane_pid: int) -> tuple[str, str] | None:
             lines = f.read(8192).splitlines()
     except OSError:
         return None
-    if len(lines) < 2 or not lines[1].startswith("/") or mtime < process_start(pane_pid) - 2:
+    if len(lines) < 2 or not lines[1].startswith("/"):
+        return None
+    if mtime < process_start(pane_pid) - 2 and not crumb_named(lines[1], pane_omp_sessions(pane_pid)):
         return None
     return lines[0], lines[1]
 
@@ -1856,16 +2044,13 @@ class ModelCatalog:
     def _refresh(self) -> None:
         data, err = None, None
         try:
-            r = subprocess.run([omp_binary(), "models", "--json", "--kind", "all"], capture_output=True,
-                               stdin=subprocess.DEVNULL, timeout=MODELS_TIMEOUT_S, cwd=Path.home())
-            out = r.stdout.decode(errors="replace")
-            line = next((ln for ln in out.splitlines() if ln.startswith("{")), None)
-            if line is None:
-                tail = (r.stderr.decode(errors="replace").strip().splitlines() or [f"exit {r.returncode}"])[-1]
-                raise ValueError(tail)
+            # Via omp_cli (--no-extensions): with extensions loaded `omp models` never exits.
+            obj, text = omp_cli(["models", "--json", "--kind", "all"], MODELS_TIMEOUT_S)
+            if obj is None or not isinstance(obj.get("models"), list):
+                raise ValueError(last_line(text) or "no answer")
             scores, by_id, grounded = model_scores()
             models = []
-            for m in json.loads(line)["models"]:
+            for m in obj["models"]:
                 if not isinstance(m, dict) or not isinstance(m.get("provider"), str) or not isinstance(m.get("id"), str):
                     continue
                 sel = f"{m['provider']}/{m['id']}"
@@ -1897,7 +2082,7 @@ class ModelCatalog:
                 os.replace(tmp, self.path)
             except OSError as ex:
                 log(f"cannot persist {self.path}: {ex}")
-        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as ex:
+        except (OSError, RequestError, ValueError, KeyError, TypeError) as ex:
             err = f"omp models failed: {ex}"
             log(err)
         with self.cond:
@@ -2632,24 +2817,248 @@ def history_db_info(ids: list[str]) -> tuple[dict[str, str], dict[str, str]]:
     return titles, recaps
 
 
-def live_session_paths() -> set[str]:
-    """Session files some open terminal's omp has recorded in its breadcrumb."""
-    live = set()
-    for crumb in (OMP_DIR / "terminal-sessions").glob("pts-*"):
-        if not os.path.exists("/dev/pts/" + crumb.name[4:]):
-            continue
+def open_omp_sessions() -> dict[str, dict]:
+    """Session files a running omp has open, by path: {tty, cwd, yolo}. Each terminal an omp
+    process runs in counts with its breadcrumb when written since that omp started (pts numbers
+    are recycled, and a killed omp leaves its breadcrumb behind) or naming the session that omp
+    was started with (crumb_named)."""
+    out = {}
+    for tty, (start, yolo, named) in omp_terminals().items():
         try:
-            lines = crumb.read_text(errors="replace").splitlines()
+            with open(OMP_DIR / "terminal-sessions" / f"pts-{tty}", errors="replace") as f:
+                mtime = os.fstat(f.fileno()).st_mtime
+                lines = f.read(8192).splitlines()
         except OSError:
             continue
-        if len(lines) >= 2:
-            live.add(lines[1])
-    return live
+        if len(lines) >= 2 and (mtime >= start - 2 or crumb_named(lines[1], named)):
+            out[lines[1]] = {"tty": f"/dev/pts/{tty}", "cwd": lines[0], "yolo": yolo}
+    return out
 
 
-def session_history(cwd: str | None, current: str | None) -> list[dict]:
+def live_session_paths() -> set[str]:
+    """Session files a running omp has open (open_omp_sessions)."""
+    return set(open_omp_sessions())
+
+
+def exit_record(obj: dict) -> dict | None:
+    """The data of an omp `session_exit` entry (how its process ended), else None."""
+    data = obj.get("data")
+    if obj.get("type") != "custom" or obj.get("customType") != "session_exit" or not isinstance(data, dict):
+        return None
+    if not isinstance(data.get("reason"), str) or not isinstance(data.get("recordedAt"), str) \
+            or data.get("kind") not in ("normal", "signal", "fatal", "process_exit"):
+        return None
+    return data
+
+
+def entry_message(obj: dict) -> dict | None:
+    if obj.get("type") != "message":
+        return None
+    return obj["message"] if isinstance(obj.get("message"), dict) else {}
+
+
+def turn_cut_off(entries: list[dict]) -> bool:
+    """omp's restore rule (`session/exit-diagnostics.ts` as of 18.14; `--restore` runs it on the
+    session's branch and on each subagent transcript): the last turn was left unfinished and no
+    normal exit was recorded after it. Never when the last message is an assistant reply without
+    tool calls (the turn finished, failed or was interrupted by the user), or tool results that
+    answer an assistant message that failed or was aborted."""
+    last = None
+    for i in range(len(entries) - 1, -1, -1):
+        ex = exit_record(entries[i])
+        if ex and ex["kind"] == "normal":
+            return False
+        m = entry_message(entries[i])
+        if m is None:
+            continue
+        if m.get("role") == "assistant" and m.get("stopReason") == "aborted" and m.get("errorMessage") == EXIT_ABORT_TEXT:
+            return True  # closed by omp's exit recovery but not yet retried
+        last = i
+        break
+    if last is None:
+        return False
+    m = entry_message(entries[last])
+    if m.get("role") == "assistant":
+        content = m.get("content")
+        return isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") == "toolCall" and (isinstance(b.get("name"), str) or isinstance(b.get("id"), str))
+            for b in content)
+    if m.get("role") == "toolResult":
+        prev = next((p for p in map(entry_message, reversed(entries[:last])) if p is not None and p.get("role") == "assistant"), None)
+        return prev is None or prev.get("stopReason") not in ("error", "aborted")
+    return True  # a user (or other) message with no reply yet
+
+
+def tail_entries(path: str, branch: bool) -> list[dict]:
+    """The last entries of a session file, read from its end: with `branch` the end of the current
+    branch (from the leaf, session_tree's rule, back along `parentId`), else in file order. More of
+    the file is read only while the last message (for a tool result also the assistant message
+    before it) is missing."""
+    size = os.path.getsize(path)
+    n = min(size, TAIL_READ)
+    while True:
+        with open(path, "rb") as f:
+            f.seek(size - n)
+            data = f.read(n)
+        lines = data.split(b"\n")
+        if n < size:
+            lines = lines[1:]  # the read starts inside this one
+        objs = []
+        for line in lines:
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict) and obj.get("type") not in ("session", "title"):
+                objs.append(obj)
+        whole = n >= size
+        if branch:
+            by_id = {o["id"]: o for o in objs if isinstance(o.get("id"), str)}
+            last = next((o for o in reversed(objs) if isinstance(o.get("id"), str)), None)
+            cur = (last.get("activeLeafId") if "activeLeafId" in last else last["id"]) if last else None
+            if last and cur is None:
+                return []  # the leaf is before the first entry
+            objs, seen = [], set()
+            while isinstance(cur, str) and cur in by_id and cur not in seen:
+                seen.add(cur)
+                objs.append(by_id[cur])
+                cur = by_id[cur].get("parentId")
+            objs.reverse()
+            whole = whole or (bool(objs) and not isinstance(cur, str))  # reached the root
+        msgs = [m for m in map(entry_message, objs) if m is not None]
+        if whole or (msgs and (msgs[-1].get("role") != "toolResult" or any(m.get("role") == "assistant" for m in msgs))):
+            return objs
+        n = min(size, n * 4)
+
+
+def exited_normally(entries: list[dict]) -> bool:
+    """Whether the last process of this session recorded a normal exit after its last message."""
+    for obj in reversed(entries):
+        ex = exit_record(obj)
+        if ex:
+            return ex["kind"] == "normal"
+        if entry_message(obj) is not None:
+            return False
+    return False
+
+
+def subagent_revivable(path: str) -> bool:
+    """Whether a subagent transcript has the non-isolated `session_init` contract omp's cold revive
+    needs (the last one counts)."""
+    try:
+        with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            idx = mm.rfind(b'"type":"session_init"')
+            if idx < 0:
+                return False
+            end = mm.find(b"\n", idx)
+            obj = json.loads(mm[mm.rfind(b"\n", 0, idx) + 1:end if end >= 0 else len(mm)])
+    except (OSError, ValueError):
+        return False
+    return isinstance(obj, dict) and not obj.get("isolated")
+
+
+def subagent_cut_off(path: str) -> bool:
+    """Whether a subagent transcript under the session (`<session>/<AgentId>.jsonl`, nested ones
+    too) was left mid-turn and `omp --restore` would revive it: not killed (no `.tombstone`), not
+    an advisor, revivable."""
+    folders = [path.removesuffix(".jsonl")]
+    while folders:
+        folder = folders.pop()
+        try:
+            names = set(os.listdir(folder))
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(".jsonl") or ".bak" in name or name == "__advisor.jsonl" or name.startswith("__advisor."):
+                continue
+            if name[:-6] in names:
+                folders.append(os.path.join(folder, name[:-6]))
+            sub = os.path.join(folder, name)
+            try:
+                if name + ".tombstone" not in names and turn_cut_off(tail_entries(sub, False)) and subagent_revivable(sub):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+_facts: dict[str, tuple[tuple, tuple[bool, bool]]] = {}
+
+
+def session_facts(path: str) -> tuple[bool, bool]:
+    """(interrupted, exited normally) of a session file. Interrupted: `omp --restore` would continue
+    something of it (README "Restore"): its own turn was cut off (turn_cut_off on its branch), or
+    its process ended without a normal exit while a subagent was mid-turn (omp would revive those
+    even after a normal exit; DevDeck does not offer such leftovers). Exited normally: its last
+    process recorded a normal exit after its last message. Only file tails are read, cached by
+    inode/size/mtime. Whether an omp has the session open now is live_session_paths' business."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False, False
+    key = (st.st_ino, st.st_size, st.st_mtime_ns)
+    with _heads_lock:
+        hit = _facts.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    try:
+        branch = tail_entries(path, True)
+        normal = exited_normally(branch)
+        facts = (turn_cut_off(branch) or (not normal and subagent_cut_off(path)), normal)
+    except OSError:
+        return False, False
+    with _heads_lock:
+        _facts[path] = (key, facts)
+    return facts
+
+
+def interrupted(path: str) -> bool:
+    return session_facts(path)[0]
+
+
+def terminated(path: str, mtime: float, record: dict | None) -> bool:
+    """Whether a session (open in no running omp) lost its terminal: its omp ended without a
+    normal exit (killed, or SIGHUP when the terminal or tmux went away). Counted for sessions the
+    terminals record (Server.record_terminals) saw open in a pane, and, for files older than the
+    record (`since`; all of them without one), for any modified in the last TERMINATED_GUESS_S."""
+    if session_facts(path)[1]:
+        return False
+    if record is not None and path in record["sessions"]:
+        return True
+    return (record is None or mtime < record["since"]) and mtime >= time.time() - TERMINATED_GUESS_S
+
+
+def load_terminals() -> dict:
+    """The terminals record {since, sessions: {path: {id, cwd, pane, yolo}}} (Server.record_terminals);
+    a new one starts now and is written at once, so `since` survives restarts."""
+    try:
+        data = json.loads(TERMINALS_FILE.read_text())
+        if isinstance(data.get("since"), (int, float)) and isinstance(data.get("sessions"), dict):
+            return {"since": float(data["since"]), "sessions": {
+                p: e for p, e in data["sessions"].items() if isinstance(e, dict) and isinstance(e.get("id"), str)}}
+    except (OSError, ValueError, AttributeError):
+        pass
+    data = {"since": time.time(), "sessions": {}}
+    save_terminals(data)
+    return data
+
+
+def save_terminals(data: dict) -> None:
+    try:
+        TERMINALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = TERMINALS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=1))
+        os.replace(tmp, TERMINALS_FILE)
+    except OSError as ex:
+        log(f"cannot persist {TERMINALS_FILE}: {ex}")
+
+
+def session_history(cwd: str | None, current: str | None, restorable_only: bool = False,
+                    record: dict | None = None) -> list[dict]:
     """omp sessions of `cwd` (every project's when None, each with its `cwd`): pinned first, then
-    newest; empty ones (no user message) skipped."""
+    newest; empty ones (no user message) skipped. Each one open in no running omp says whether it
+    is `interrupted` (cut off mid-turn) and `terminated` (its terminal went away; `record` is the
+    terminals record, see terminated()); `restorable_only` lists just those that are either."""
     cwd = os.path.normpath(cwd) if cwd is not None else None
     limit = HISTORY_MAX if cwd is not None else HISTORY_ALL_MAX
     try:
@@ -2668,21 +3077,27 @@ def session_history(cwd: str | None, current: str | None) -> list[dict]:
         if head and head["cwd"] and (cwd is None or os.path.normpath(head["cwd"]) == cwd):
             cands.append((head["id"] in pins, st.st_mtime, path, st, head))
     cands.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    live = live_session_paths()
     picked = []
     for pinned, mtime, path, st, head in cands:
+        cut = gone = False
+        if path not in live:
+            cut, gone = interrupted(path), terminated(path, mtime, record)
+        if restorable_only and not (cut or gone):
+            continue
         first = session_first_user(path, st)
         if first is None and not pinned:
             continue
-        picked.append((pinned, mtime, path, head, first))
+        picked.append((pinned, mtime, path, head, first, cut, gone))
         if len(picked) >= limit:
             break
-    titles, recaps = history_db_info([h["id"] for _, _, _, h, _ in picked])
-    live = live_session_paths()
+    titles, recaps = history_db_info([c[3]["id"] for c in picked])
     out = []
-    for pinned, mtime, path, head, first in picked:
+    for pinned, mtime, path, head, first, cut, gone in picked:
         sid = head["id"]
         item = {"id": sid, "title": head["title"] or titles.get(sid) or first or "", "mtime": int(mtime * 1000),
-                "live": path in live, "current": sid == current, "pinned": pinned}
+                "live": path in live, "current": sid == current, "pinned": pinned, "interrupted": cut,
+                "terminated": gone}
         if recaps.get(sid):
             item["recap"] = recaps[sid]
         if cwd is None:
@@ -4012,9 +4427,10 @@ def start_concierge(ctl_path: Path) -> str | None:
     model, level = concierge_model()
     # Separate argv, no shell; tmux takes PATH from its client rather than from -e, so `env`
     # puts the repo (ddctl) on omp's PATH.
-    r = tmux("new-session", "-d", "-s", CONCIERGE_SESSION, "-c", str(CONCIERGE_DIR), "-e", f"DEVDECK_CTL={ctl_path}",
-             "env", f"PATH={HERE}{os.pathsep}{os.environ.get('PATH', '')}", f"DEVDECK_CTL={ctl_path}",
-             omp_binary(), "--model", model, "--thinking", level, "--tools", "bash,read", "--no-skills", "--no-title")
+    r = tmux_new_session(CONCIERGE_SESSION, "-c", str(CONCIERGE_DIR), "-e", f"DEVDECK_CTL={ctl_path}",
+                         "env", f"PATH={HERE}{os.pathsep}{os.environ.get('PATH', '')}", f"DEVDECK_CTL={ctl_path}",
+                         omp_binary(), "--model", model, "--thinking", level, "--tools", "bash,read", "--no-skills",
+                         "--no-title")
     if r.returncode != 0:
         return tmux_error(r)
     log(f"concierge: started {CONCIERGE_SESSION} ({model}, thinking {level})")
@@ -4818,6 +5234,14 @@ class Server:
         self.ctl_sock: socket.socket | None = None
         self.btw_lock = threading.Lock()
         self.btw_feeds: dict[str, BtwFeed] = {}  # pane target -> the side question DevDeck runs there
+        # Sessions cut off mid-turn or whose terminal went away, found once after start (README
+        # "Restore"): None until then, what is left to offer after that ([] once dismissed).
+        self.restore_lock = threading.Lock()
+        self.restore_offer: list[dict] | None = None
+        # omp sessions seen open in tmux panes (TERMINALS_FILE, see record_terminals)
+        self.terminals_lock = threading.Lock()
+        self.terminals = load_terminals()
+        self.record_now = threading.Event()
         self.sock = socket.create_server(("0.0.0.0", port), reuse_port=False, backlog=16)
 
     def next_rev(self) -> int:
@@ -4833,7 +5257,11 @@ class Server:
             return tr
 
     def serve(self) -> None:
+        if unit := own_service():
+            adopt_tmux(unit)
         threading.Thread(target=self.poll_loop, daemon=True).start()
+        threading.Thread(target=self.record_loop, daemon=True).start()
+        threading.Thread(target=self.find_restorable, daemon=True).start()
         while True:
             conn, addr = self.sock.accept()
             threading.Thread(target=self.handle, args=(conn, addr), daemon=True).start()
@@ -4849,6 +5277,112 @@ class Server:
                 self.ctl_path.unlink()
             except OSError:
                 pass
+
+    # ------------------------------------------------------------ restore offer (README "Restore")
+
+    def find_restorable(self) -> None:
+        """Once per run: sessions of every project cut off mid-turn or left by a terminal that went
+        away (crash, reboot, power loss, killed tmux) in the last RESTORE_OFFER_S, offered to each
+        client that connects until dismissed or restored."""
+        since = (time.time() - RESTORE_OFFER_S) * 1000
+        try:
+            found = [s for s in session_history(None, None, True, self.terminal_record())
+                     if s["mtime"] >= since][:RESTORE_OFFER_MAX]
+        except Exception as ex:  # the offer is a nicety; never take the daemon down for it
+            log(f"restore offer: {ex!r}")
+            found = []
+        with self.restore_lock:
+            if self.restore_offer is not None:  # dismissed before it was found
+                return
+            self.restore_offer = found
+        log(f"restore offer: {len(found)} session(s)" + "".join(
+            f"\n  {s['id']} {'interrupted' if s['interrupted'] else 'terminated'} {s['title'][:60]!r} in {s['cwd']}"
+            for s in found))
+        if found:
+            with self.ctl_cond:
+                ctls = list(self.controls)
+            for ctl in ctls:
+                self.offer_restore(ctl)
+
+    def offer_restore(self, ctl: Control) -> None:
+        """`restore_offer` to a client, without sessions restored, reopened or finished since."""
+        with self.restore_lock:
+            offer = self.restore_offer
+        if not offer:
+            return
+        live, record = live_session_paths(), self.terminal_record()
+        left = []
+        for s in offer:
+            p = session_file(s["id"])
+            try:
+                if p and p not in live and (interrupted(p) or terminated(p, os.path.getmtime(p), record)):
+                    left.append(s)
+            except OSError:
+                pass
+        with self.restore_lock:
+            if self.restore_offer is offer:
+                self.restore_offer = left
+            else:
+                ids = {s["id"] for s in self.restore_offer or []}
+                left = [s for s in left if s["id"] in ids]
+        if left:
+            ctl.push({"t": "restore_offer", "sessions": left})
+
+    def restore_drop(self, ids: set[str] | None) -> None:
+        """Drops sessions `ids` (restored) or, with None, the whole offer (dismissed) for this run;
+        every client hears what is left (`restore_offer` with an empty list withdraws it)."""
+        with self.restore_lock:
+            before = self.restore_offer or []
+            left = [s for s in before if ids is not None and s["id"] not in ids]
+            self.restore_offer = left
+        if len(left) == len(before):
+            return
+        with self.ctl_cond:
+            ctls = list(self.controls)
+        for ctl in ctls:
+            ctl.push({"t": "restore_offer", "sessions": left})
+
+    # ------------------------------------------------------------ terminals record (README "Restore")
+
+    def terminal_record(self) -> dict:
+        with self.terminals_lock:
+            return {"since": self.terminals["since"], "sessions": dict(self.terminals["sessions"])}
+
+    def record_loop(self) -> None:
+        while True:
+            try:
+                self.record_terminals()
+            except Exception as ex:  # the recorder must survive anything a pane or file throws at it
+                log(f"terminals record failed: {ex!r}")
+            self.record_now.wait(TERMINALS_POLL_S)
+            self.record_now.clear()
+
+    def record_terminals(self) -> None:
+        """Notes which omp session is open in which tmux pane (and with --yolo), so a session whose
+        terminal goes away without omp exiting normally counts as terminated and can be brought
+        back. Forgets sessions that ended normally, whose file is gone, or idle TERMINALS_KEEP_S."""
+        r = tmux("list-panes", "-a", "-F", "#{pane_tty}\t#{session_name}:#{window_index}.#{pane_index}")
+        panes = dict(ln.split("\t", 1) for ln in r.stdout.decode(errors="replace").splitlines()
+                     if "\t" in ln) if r.returncode == 0 else {}
+        opened, now = open_omp_sessions(), time.time()
+        with self.terminals_lock:
+            rec, changed = self.terminals["sessions"], False
+            for path, o in opened.items():
+                if o["tty"] not in panes:
+                    continue  # an omp outside tmux
+                entry = {"id": session_id_of(path), "cwd": o["cwd"], "pane": panes[o["tty"]], "yolo": o["yolo"]}
+                if rec.get(path) != entry:
+                    rec[path], changed = entry, True
+            for path in [p for p in rec if p not in opened]:
+                try:
+                    gone = os.path.getmtime(path) < now - TERMINALS_KEEP_S or session_facts(path)[1]
+                except OSError:
+                    gone = True
+                if gone:
+                    del rec[path]
+                    changed = True
+            if changed:
+                save_terminals(self.terminals)
 
     # ------------------------------------------------------------ sessions poller
 
@@ -4879,6 +5413,7 @@ class Server:
                                             (p.get("sketch") or {}).get("toolCallId"),
                                             (p.get("planReview") or {}).get("id")) for p in panes)
                     self.panes_rev += 1
+                    self.record_now.set()
                     controls = list(self.controls)
                 else:
                     controls = []
@@ -5107,10 +5642,10 @@ class Server:
         return self.transcript(path) if path else None
 
     def create_terminal(self, cwd: str | None = None, omp: bool = False, yolo: bool = False,
-                        resume: str | None = None) -> str:
+                        resume: str | None = None, restore: bool = False) -> str:
         """A fresh tmux session phone-N (lowest free N) running the default shell in `cwd` (home),
-        optionally starting omp in it (with --yolo if asked, `--resume <id>` with `resume`); its pane
-        target. RequestError on failure."""
+        optionally starting omp in it (with --yolo if asked, `--resume <id>` with `resume`, or
+        `--restore <id>` with `restore` too); its pane target. RequestError on failure."""
         with self.deliver_lock:  # two phones pressing "+ New" at once must not collide
             r = tmux("list-sessions", "-F", "#{session_name}")
             taken = set(r.stdout.decode(errors="replace").split()) if r.returncode == 0 else set()
@@ -5118,20 +5653,47 @@ class Server:
             while f"phone-{n}" in taken:
                 n += 1
             name = f"phone-{n}"
-            r = tmux("new-session", "-d", "-s", name, "-c", cwd or str(Path.home()))
+            r = tmux_new_session(name, "-c", cwd or str(Path.home()))
         if r.returncode != 0:
             raise RequestError(f"new terminal: {tmux_error(r)}")
         info = pane_info(name)
         target = info["target"] if isinstance(info, dict) else name
+        verb = "restore" if restore else "resume"
         if omp:
-            launch = shlex.quote(omp_binary()) + (" --yolo" if yolo else "") + (f" --resume {resume}" if resume else "")
+            launch = shlex.quote(omp_binary()) + (" --yolo" if yolo else "") + (f" --{verb} {resume}" if resume else "")
             err = deliver_text("new-" + name, target, launch, True)
             if err:
                 raise RequestError(f"started {target} but could not start omp in it: {err}")
         log(f"created terminal {target}" + (f" with omp{' --yolo' if yolo else ''}" if omp else "")
-            + (f" resuming {resume}" if resume else "") + (f" in {cwd}" if cwd else ""))
+            + (f" {verb[:-1]}ing {resume}" if resume else "") + (f" in {cwd}" if cwd else ""))
         self.poll_now.set()
+        self.record_now.set()
         return target
+
+    def reopen_session(self, sid: str, raw_cwd, restore: bool, yolo: bool) -> str:
+        """A new terminal running `omp --resume <sid>` (`--restore` with `restore`, refused while a
+        running omp has the session open) in `raw_cwd`: inside home, or the session's recorded
+        folder even outside it (also the default). --yolo when asked or when the pane the session
+        was last seen in ran omp with it. Its pane target; RequestError on failure."""
+        sid = sid.lower()
+        path = session_file(sid)
+        if path is None:
+            raise RequestError(f"no session {sid}")
+        if restore and path in live_session_paths():
+            raise RequestError("that session is open in a running omp; nothing to restore")
+        head = session_head(path, os.stat(path))
+        recorded = os.path.normpath(head["cwd"]) if head and head["cwd"] else None
+        cwd = None
+        if raw_cwd is not None:
+            same = recorded and isinstance(raw_cwd, str) and os.path.normpath(raw_cwd) == recorded
+            cwd = recorded if same else user_path(raw_cwd)
+            if not os.path.isdir(cwd):
+                raise RequestError(f"not a folder: {cwd}")
+        elif recorded and os.path.isdir(recorded):
+            cwd = recorded
+        with self.terminals_lock:
+            seen = self.terminals["sessions"].get(path) or {}
+        return self.create_terminal(cwd, True, yolo or seen.get("yolo") is True, sid, restore)
 
     def answer_ask(self, target: str, call: str, answers) -> str | None:
         """Answer omp's open question `call` in `target` with keys (see ask_keystrokes); None once
@@ -5991,6 +6553,7 @@ class Control:
         writer.start()
         self.server.attach(self)
         self.server.live_attached(self)
+        threading.Thread(target=self.server.offer_restore, args=(self,), daemon=True).start()
         try:
             self.read_loop()
         finally:
@@ -6073,6 +6636,8 @@ class Control:
             self.do_type(msg)
         elif kind == "new":
             self.new_terminal(msg)
+        elif kind == "restore_dismiss":
+            self.server.restore_drop(None)
         elif kind == "voice":
             self.do_voice(msg)
         elif kind == "say":
@@ -6097,7 +6662,7 @@ class Control:
         elif kind in ("more", "full", "ls", "read", "git", "models", "roles", "roles_set", "history", "cmd", "omp_update",
                       "btw_list", "btw_ask", "btw_cancel", "plan_get", "plan_answer", "plan_open", "tree", "goto",
                       "settings", "settings_set", "session_info", "session_delete", "session_restore",
-                      "usage", "usage_reset", "usage_history"):
+                      "usage", "usage_reset", "usage_history", "restore_many"):
             self.request(msg)
         else:
             self.push({"t": "error", "error": f"unknown message type {kind!r}"})
@@ -6158,24 +6723,28 @@ class Control:
 
     def new_terminal(self, msg: dict) -> None:
         """A fresh tmux session phone-N running the default shell, watched now. Optional `cwd`
-        (inside home) and `omp` (start omp there, `yolo` adds --yolo, `resume` a session id adds
-        --resume); omp ones open in chat."""
+        (inside home) and `omp` (start omp there, `yolo` adds --yolo); `resume` a session id (with
+        omp:true) reopens that session instead (Server.reopen_session, `restore` for --restore).
+        omp ones open in chat."""
         omp = msg.get("omp") is True
-        resume = msg.get("resume")
-        cwd = None
+        resume, restore = msg.get("resume"), msg.get("restore") is True
         try:
-            if msg.get("cwd") is not None:
-                cwd = user_path(msg.get("cwd"))
-                if not os.path.isdir(cwd):
-                    raise RequestError(f"not a folder: {cwd}")
-            if resume is not None:
-                if not omp or not isinstance(resume, str) or session_file(resume.lower()) is None:
-                    raise RequestError("resume needs omp:true and the id of an existing session")
-                resume = resume.lower()
-            target = self.server.create_terminal(cwd, omp, msg.get("yolo") is True, resume)
-        except RequestError as ex:
+            if resume is not None or restore:
+                if not omp or not isinstance(resume, str):
+                    raise RequestError(f"{'restore' if restore else 'resume'} needs omp:true and the id of an existing session")
+                target = self.server.reopen_session(resume, msg.get("cwd"), restore, msg.get("yolo") is True)
+            else:
+                cwd = None
+                if msg.get("cwd") is not None:
+                    cwd = user_path(msg.get("cwd"))
+                    if not os.path.isdir(cwd):
+                        raise RequestError(f"not a folder: {cwd}")
+                target = self.server.create_terminal(cwd, omp, msg.get("yolo") is True)
+        except (RequestError, OSError) as ex:
             self.push({"t": "error", "error": str(ex)})
             return
+        if restore:
+            self.server.restore_drop({resume.lower()})
         view = "chat" if omp else "term"
         self.push({"t": "created", "target": target, "view": view})
         with self.cond:
@@ -6492,14 +7061,47 @@ class Control:
         return info, fields
 
     def do_history(self, msg: dict) -> dict:
-        """This cwd's sessions, or with `all` every project's (each with its `cwd`)."""
-        _, fields = self.agent_pane(msg.get("target"))
-        omp = fields["omp"]
-        if not omp["cwd"]:
-            raise RequestError("omp has not told which directory this terminal works in")
-        everywhere = msg.get("all") is True
-        return {"t": "history", "cwd": omp["cwd"],
-                "sessions": session_history(None if everywhere else omp["cwd"], omp["sessionId"])}
+        """This cwd's sessions, or with `all` every project's (each with its `cwd`; `target` is then
+        optional). With `restorable` only the sessions cut off mid-turn or whose terminal went away."""
+        everywhere, cwd, current = msg.get("all") is True, "", None
+        if not everywhere or msg.get("target") is not None:
+            _, fields = self.agent_pane(msg.get("target"))
+            omp = fields["omp"]
+            if not omp["cwd"] and not everywhere:
+                raise RequestError("omp has not told which directory this terminal works in")
+            cwd, current = omp["cwd"] or "", omp["sessionId"]
+        return {"t": "history", "cwd": cwd,
+                "sessions": session_history(None if everywhere else cwd, current, msg.get("restorable") is True,
+                                            self.server.terminal_record())}
+
+    def do_restore_many(self, msg: dict) -> dict:
+        """One new terminal per item {id, cwd?}: `omp --restore <id>` when the session is cut off
+        mid-turn, else `omp --resume <id>` (Server.reopen_session). One item failing does not stop
+        the others; this client keeps watching what it watched."""
+        items = msg.get("items")
+        if not isinstance(items, list) or not items or len(items) > HISTORY_ALL_MAX:
+            raise RequestError(f"restore_many needs 1-{HISTORY_ALL_MAX} items")
+        results, done = [], set()
+        for it in items:
+            sid = it.get("id") if isinstance(it, dict) else None
+            if not isinstance(sid, str) or not UUID_RE.match(sid.lower()):
+                results.append({"id": sid if isinstance(sid, str) else "", "error": "not a session id"})
+                continue
+            sid = sid.lower()
+            path = session_file(sid)
+            restore = path is not None and interrupted(path)
+            try:
+                if path is not None and path in live_session_paths():
+                    raise RequestError("open in a running omp already")
+                target = self.server.reopen_session(sid, it.get("cwd"), restore, False)
+            except (RequestError, OSError) as ex:
+                results.append({"id": sid, "error": str(ex)})
+                continue
+            results.append({"id": sid, "target": target, "restored": restore})
+            done.add(sid)
+        log(f"{self.peer}: restore_many opened {len(done)} of {len(items)}")
+        self.server.restore_drop(done)
+        return {"t": "restore_many", "results": results}
 
     # ------------------------------------------------------------ native omp pages (README "Native omp pages")
 
@@ -7235,6 +7837,9 @@ After=graphical-session.target
 ExecStart={sys.executable} {Path(__file__).resolve()}{f" --instance {INSTANCE}" if INSTANCE else ""} --port {args.port} serve --dest "{dest}"
 Restart=on-failure
 RestartSec=2
+# Only the daemon: the tmux server (terminals, omp sessions) runs in a scope of its own, and the
+# daemon's own short-lived helpers may finish.
+KillMode=process
 
 [Install]
 WantedBy=graphical-session.target
@@ -7243,8 +7848,13 @@ WantedBy=graphical-session.target
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     subprocess.run(["systemctl", "--user", "enable", "--now", UNIT_NAME], check=True)
     if was_active:
+        adopt_tmux(UNIT_NAME)  # an older daemon's terminals would go down with the restart
         subprocess.run(["systemctl", "--user", "restart", UNIT_NAME], check=True)
     print(f"installed and started {UNIT_NAME}; logs: journalctl --user -u {UNIT_NAME} -f")
+
+
+def cmd_adopt_tmux(args) -> None:
+    adopt_tmux(UNIT_NAME)
 
 
 def main() -> None:
@@ -7265,6 +7875,9 @@ def main() -> None:
                                                    "runs install-ext)")
     sub.add_parser("install-ext", help="link the devdeck omp extension (omp-ext/devdeck) into "
                                        "~/.omp/agent/extensions/")
+    sub.add_parser("adopt-tmux", help="move the tmux server and its panes out of the daemon's service, so "
+                                      "stopping or restarting it keeps the terminals (the daemon does this "
+                                      "itself when it starts)")
     for p in (p_serve, p_svc):
         p.add_argument("--dest", default=str(DEFAULT_DEST),
                        help="where received files go (default %(default)s)")
@@ -7277,7 +7890,7 @@ def main() -> None:
     if args.port is None:
         args.port = DEFAULT_PORT
     {"serve": cmd_serve, "pair": cmd_pair, "install-service": cmd_install_service,
-     "install-ext": cmd_install_ext}[args.cmd](args)
+     "install-ext": cmd_install_ext, "adopt-tmux": cmd_adopt_tmux}[args.cmd](args)
 
 
 if __name__ == "__main__":

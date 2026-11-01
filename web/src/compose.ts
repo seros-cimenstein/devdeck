@@ -34,6 +34,7 @@ const SLASH: SlashCmd[] = [
   { name: "compact", desc: "Compact the context (optional focus)", run: actions.compact },
   { name: "new", desc: "Start a new session", run: () => void actions.newSession() },
   { name: "resume", desc: "Resume or delete sessions, all projects", run: actions.resume },
+  { name: "restore", desc: "Reopen sessions cut off or closed (crash, reboot)", run: actions.restore },
   { name: "rewind", desc: "Go back to before an earlier prompt", run: actions.rewind },
   { name: "branch", desc: "Branch from an earlier prompt", run: actions.branch },
   { name: "tree", desc: "Session tree: browse and switch branches", run: actions.tree },
@@ -50,12 +51,14 @@ const SLASH: SlashCmd[] = [
 
 /**
  * Typed commands whose omp version would open a terminal page (or, for `/btw`, an inline panel where Esc
- * would stop the agent): handled natively instead. The argument is ignored except for `/btw` and `/resume`.
+ * would stop the agent), or that omp has no slash command for (`/restore`): handled natively instead. The
+ * argument is ignored except for `/btw` and `/resume`.
  */
 const NATIVE_TYPED: Record<string, (arg: string) => void> = {
   btw: (arg) => actions.btw(arg || undefined),
   "plan-review": () => actions.planReview(),
   resume: (arg) => (arg ? void ompCmd("resume", arg) : actions.resume()),
+  restore: () => actions.restore(),
   rewind: () => actions.rewind(),
   branch: () => actions.branch(),
   tree: () => actions.tree(),

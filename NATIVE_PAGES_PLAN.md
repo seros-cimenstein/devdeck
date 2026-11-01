@@ -1,7 +1,7 @@
 # Native `/btw`, `/usage` and the other omp pages in DevDeck+ (design notes)
 
 Status: implemented (2026-11-01). `/model`, `/modelpreset`, `/btw`, `/plan-review`, `/rewind`,
-`/branch`, `/tree`, `/settings`, `/session`, `/resume` and `/usage` all open phone-native sheets;
+`/branch`, `/tree`, `/settings`, `/session`, `/resume`, `/restore` and `/usage` all open phone-native sheets;
 the live terminal mirror (`page.ts`) remains only for pages without one (provider logins). The
 sections below are the original design; the "Wire contract" section is kept current and the
 README documents the shipped behaviour.
@@ -177,12 +177,41 @@ question, ≤120 chars).
 
 ### Resume extras
 - `history {target, all?:true}`: with `all`, sessions of every project; each session then
-  also has `cwd`.
+  also has `cwd` (and `target` becomes optional, `cwd` "" without it).
 - `session_delete {target, id}` → `session_delete {ok, trashId}` (refuses the pane's live
   session and sessions open in any pane: `error {code:"live"}`).
 - `session_restore {trashId}` → `session_restore {ok}`.
 - `new {cwd, omp:true, yolo?, resume?:sessionId}`: opens a terminal running
   `omp --resume <id>` in `cwd` (for sessions of another project).
+
+### Restore (`/restore`, sessions cut off mid-turn or closed with their terminal)
+- Every `history` session has `interrupted:bool` and `terminated:bool`, both false while a
+  running omp has it open. `interrupted`: omp's `--restore` rule holds (the branch's last
+  turn was cut off with no normal `session_exit` after it, or the last process died without
+  a normal exit while a revivable subagent was mid-turn). `terminated`: its last omp ended
+  without a normal exit (SIGKILL, or SIGHUP when tmux/the terminal went away) and the
+  daemon's terminals record (`STATE_DIR/terminals.json`) saw it open in a tmux pane; files
+  older than that record count when modified in the last 48 h.
+  `history {all:true, restorable:true, target?}` lists only sessions that are either.
+- `new {cwd, omp:true, yolo?, resume:sessionId, restore:true}` → `created {target, view:"chat"}`:
+  a new terminal in `cwd` (the session's recorded folder is accepted even outside home)
+  running `omp --restore <id>`; `error` when a running omp has the session open.
+- `restore_many {items:[{id, cwd?}]}` → `restore_many {results:[{id, target?, restored?,
+  error?}]}`: one terminal per item, `omp --restore <id>` when interrupted (`restored:true`),
+  else `omp --resume <id>`, `--yolo` when the record says its pane had it; per-item errors
+  do not stop the rest; no `created`, the client keeps watching what it watched.
+- PC → client `restore_offer {sessions:[HistorySession with cwd]}`: once the daemon has
+  started, to each connecting client, the interrupted or terminated sessions modified in the
+  last 24 h (at most 20), minus ones restored, reopened or finished since; pushed again to
+  every client (possibly empty = withdraw) when some are restored (`new {restore}`,
+  `restore_many`) or the offer is dismissed.
+- Client → PC `restore_dismiss {}`: drops the offer for this daemon run.
+- App: Resume sheet rows show "⚡ Interrupted" (first in their section, Restore on tap plus
+  Resume) or "Closed"; `/restore` (palette or typed) and the banner's Restore... open a
+  checklist of every interrupted or terminated session of every project (tag "⚡ Interrupted"
+  = continues the cut-off turn, "Closed" = just reopens; "No sessions to restore" when
+  empty) with Select all and "Restore N" → `restore_many`, then the toast "Opened N
+  terminals" without leaving the current view.
 
 ### Usage (`/usage`)
 Data: `omp usage --json` and `omp usage reset --json`, always with `--no-extensions` (with
