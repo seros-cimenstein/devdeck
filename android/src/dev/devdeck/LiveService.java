@@ -38,10 +38,16 @@ import org.webrtc.SdpObserver;
 import org.webrtc.SessionDescription;
 import org.webrtc.audio.JavaAudioDeviceModule;
 
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -65,8 +71,13 @@ public class LiveService extends Service {
     // address from its connectivity checks, so the offer never waits long for candidates.
     private static final long GATHER_MS = 1000, ANSWER_MS = 30_000, CONNECT_MS = 20_000,
             LEVEL_MS = 100, ROUTE_DEBOUNCE_MS = 300;
+    private static final int LOG_TICKS = 50;  // level ticks per logcat line (5 s)
     // AudioDeviceInfo types newer than the API 30 compile platform.
     private static final int TYPE_BLE_HEADSET = 26;
+    // Call events the daemon has no use for (word-by-word turn deltas, audio): not relayed.
+    private static final Set<String> RELAY_SKIP = new HashSet<>(Arrays.asList("turn.created", "turn.delta",
+            "output_audio.delta", "session.output_audio.delta", "session.input_audio.append", "session.updated"));
+    private static final int RELAY_BACKLOG_MAX = 500;
 
     static volatile LiveService instance;
     private static boolean webrtcReady;  // dd-live thread
@@ -89,6 +100,8 @@ public class LiveService extends Service {
     private AudioSource source;
     private AudioTrack track;
     private DataChannel dc;
+    // Call events the link could not take (offline); sent first once it is back.
+    private final ArrayDeque<String> relayBacklog = new ArrayDeque<>();
     private String voice;
     private String req;  // live_offer id awaiting live_answer / error
     private boolean offerSent;
@@ -97,6 +110,9 @@ public class LiveService extends Service {
     private AudioDeviceCallback deviceCallback;
     private boolean scoStarted;
     private boolean lastLevelZero;
+    // Loudest mic/speaker level over the current LOG_TICKS window, logged for diagnosis.
+    private float logMic, logSpk;
+    private int logTicks;
     private final Runnable applyRoute = this::applyRoute;
 
     // ---- written on dd-live, read anywhere (UI replay, notification) ----
@@ -355,8 +371,11 @@ public class LiveService extends Service {
         track.setEnabled(true);
         pc.addTrack(track, Collections.singletonList("devdeck-live"));
 
-        // Required by the endpoint; events travel on the daemon's sideband, so messages here are
-        // drained (an unobserved channel would queue them natively for the whole call).
+        // The call's events (transcripts, delegations, errors; no audio) arrive here in real time,
+        // and messages sent here reach the call: the daemon's events come from this relay and its
+        // replies go out through it. Its own sideband mirrors the audio as base64 (64 KB/s each
+        // way), more than a slow laptop link carries, so it is only kept attached (the server
+        // offers delegations only with one) and no longer read once the relay runs.
         dc = pc.createDataChannel("oai-events", new DataChannel.Init());
         dc.registerObserver(new DataChannel.Observer() {
             @Override
@@ -369,6 +388,11 @@ public class LiveService extends Service {
 
             @Override
             public void onMessage(DataChannel.Buffer buffer) {
+                if (buffer.binary) return;
+                byte[] b = new byte[buffer.data.remaining()];
+                buffer.data.get(b);
+                String ev = new String(b, StandardCharsets.UTF_8);
+                live.post(() -> relay(g, ev));
             }
         });
 
@@ -466,7 +490,40 @@ public class LiveService extends Service {
                 end("error".equals(p) ? m.optString("error", "Live call failed") : null, true);
                 return;
             }
+            case "live_send": {
+                // The daemon's message for the call (context, session.close) onto the data channel.
+                JSONObject msg = m.optJSONObject("msg");
+                if (msg == null || callId == null || !callId.equals(m.optString("callId"))) return;
+                if (dc == null || dc.state() != DataChannel.State.OPEN) {
+                    Log.w(TAG, "live_send dropped: data channel not open");
+                    return;
+                }
+                dc.send(new DataChannel.Buffer(ByteBuffer.wrap(msg.toString().getBytes(StandardCharsets.UTF_8)), false));
+                return;
+            }
             default:
+        }
+    }
+
+    /** One data-channel event of call `g` to the daemon (`live_event`), in order, also after the link was down. */
+    private void relay(int g, String ev) {
+        if (g != gen || callId == null) return;
+        String type = Peek.str(ev, "type");
+        if (type == null || RELAY_SKIP.contains(type)) return;
+        try {
+            relayBacklog.add(new JSONObject().put("t", "live_event").put("callId", callId).put("ev", ev).toString());
+        } catch (JSONException e) {
+            throw new IllegalStateException(e);
+        }
+        while (relayBacklog.size() > RELAY_BACKLOG_MAX) relayBacklog.poll();
+        flushRelay();
+    }
+
+    private void flushRelay() {
+        LinkService link = LinkService.instance;
+        while (!relayBacklog.isEmpty()) {
+            if (link == null || !link.sendLive(relayBacklog.peek())) return;
+            relayBacklog.poll();
         }
     }
 
@@ -529,6 +586,7 @@ public class LiveService extends Service {
         gen++;
         req = null;
         offerSent = false;
+        relayBacklog.clear();
         connectedAt = 0;
         if (dc != null) {
             try {
@@ -562,7 +620,8 @@ public class LiveService extends Service {
             adm.release();
             adm = null;
         }
-        micPeak = spkPeak = 0;
+        micPeak = spkPeak = logMic = logSpk = 0;
+        logTicks = 0;
         stopAudio();
         if (proximityWake != null && proximityWake.isHeld()) {
             proximityWake.release(PowerManager.RELEASE_FLAG_WAIT_FOR_NO_PROXIMITY);
@@ -592,12 +651,21 @@ public class LiveService extends Service {
         updateNote();
     }
 
-    /** Levels for the orb at <= 10 Hz while connected and the UI is visible. */
+    /** Levels for the orb at <= 10 Hz while connected and the UI is visible; also retries relayed events the link refused. */
     private void levelTick(int g) {
         if (g != gen) return;
         live.postDelayed(() -> levelTick(g), LEVEL_MS);
-        float mic = muted ? 0 : micPeak, spk = spkPeak;
+        if (!relayBacklog.isEmpty()) flushRelay();
+        float raw = micPeak, mic = muted ? 0 : raw, spk = spkPeak;
         micPeak = spkPeak = 0;
+        logMic = Math.max(logMic, raw);
+        logSpk = Math.max(logSpk, spk);
+        if (++logTicks >= LOG_TICKS) {
+            Log.i(TAG, String.format(Locale.ROOT, "levels %ds: mic %.2f spk %.2f route %s%s",
+                    LOG_TICKS * LEVEL_MS / 1000, logMic, logSpk, route, muted ? " muted" : ""));
+            logMic = logSpk = 0;
+            logTicks = 0;
+        }
         LinkService link = LinkService.instance;
         if (link == null || !link.isVisible()) return;
         boolean zero = mic < 0.01f && spk < 0.01f;
@@ -688,6 +756,7 @@ public class LiveService extends Service {
             now = routeLegacy();
         }
         if (now != null && !now.equals(route)) {
+            Log.i(TAG, "route " + route + " -> " + now);
             route = now;
             emitState();
             updateNote();

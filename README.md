@@ -926,8 +926,9 @@ This replicates omp 18.12.6's `/live` (`packages/coding-agent/src/live/`), excep
 phone holds the WebRTC peer. The daemon does the rest:
 ```
 phone (WebRTC, foreground service) <-> OpenAI GPT Live         audio, straight over the internet
-phone <-> daemon (this link)           offer/answer, state, captions, delegations, notices
-daemon <-> OpenAI sideband WebSocket   delegations in; progress, final replies, notices out
+phone <-> OpenAI data channel `oai-events`                     the call's events in, the daemon's context out
+phone <-> daemon (this link)           offer/answer, state, captions, delegations, notices, relayed events
+daemon <-> OpenAI sideband WebSocket   attached (delegations need it); read only without the relay
 daemon -> concierge pane (or the direct terminal) -> ddctl -> daemon
 ```
 - **Login.** omp's ChatGPT OAuth credentials are read from `~/.omp/agent/agent.db`
@@ -949,16 +950,35 @@ daemon -> concierge pane (or the direct terminal) -> ddctl -> daemon
   the next pause, `Routing:` context is silent.
 - **Sideband.** `wss://api.openai.com/v1/live/<call id>` with the same headers, after the
   answer went to the phone (5 attempts, 15 s each, backoff from 0.5 s). It is a small stdlib
-  WebSocket client (TLS, masked frames, fragments, ping/pong, close) driven by one I/O thread
-  that also sends everything queued for the call; it pings after 15 s without a frame and
-  gives up after 45 s. An `error` event or a close ends the call (`live {phase:"error"}`).
-  The sideband also carries both audio streams (`session.input_audio.append`,
-  `session.output_audio.delta`), which are ignored. Events used: `session.started`
-  (`listening`), `input_transcript.added` / `output_transcript.added` / `turn.done`
-  (captions, coalesced like omp: cumulative or delta pieces grow a turn, the piece after a
-  final starts the next), `delegation.created`, `error`; acknowledgements
-  (`session.context.appended`, `delegation.context.appended`), `turn.created`/`turn.delta`
-  and `session.usage.updated` are ignored, anything else is logged once per call.
+  WebSocket client (TLS, masked frames, fragments, ping/pong, close; the server negotiates no
+  compression) driven by one I/O thread. The server only creates client delegations while a
+  sideband is attached, so every call keeps one. It mirrors both audio streams as base64 JSON
+  (`session.input_audio.append` always, `session.output_audio.delta` while the model talks;
+  200 ms per event, 64 KB/s each way): on a slow laptop link (measured: 105 KB/s through
+  Cloudflare WARP) the events behind that audio arrive later and later (lag grew ~1 s per
+  second, 27 s within a minute), so delegations, captions and replies stalled while the model
+  kept talking. Hence the relay.
+- **Relay.** The phone forwards each event of the data channel `oai-events` (the same events
+  as the sideband in real time, without the audio; it skips `turn.created`/`turn.delta`) as
+  `live_event {callId, ev}`, buffering up to 500 while its link is down. The first one makes
+  it the call's event source: from then on the I/O thread no longer reads the sideband (it
+  stays attached; verified for minutes) and what the daemon sends to the call goes to the
+  phone as `live_send {callId, msg}`, which writes it to the data channel (the server
+  acknowledges there too). While the phone's link is down, and for an app without the relay,
+  the sideband carries both ways as before (it pings after 15 s without a frame and gives up
+  after 45 s). Events are deduplicated by item/turn id where both sources overlap. An `error`
+  event or a sideband close ends the call (`live {phase:"error"}`). Events used:
+  `session.started` (`listening`; when it fired before the sideband connected, it never comes
+  there, so 3 s without it count as started), `input_transcript.added` /
+  `output_transcript.added` / `turn.done` (captions, coalesced like omp: cumulative or delta
+  pieces grow a turn, the piece after a final starts the next), `delegation.created`,
+  `error`, `session.usage.updated` (audio total for the call log); acknowledgements
+  (`session.context.appended`, `delegation.context.appended`) and `turn.created`/`turn.delta`
+  are ignored, anything else is logged once per call.
+- **Call log** (journal): each finished turn (`live: user: '...'`, `live: assistant: '...'`),
+  each delegation and its outcome, and at the end turns, replies, delegations, the usage
+  audio total and which path carried the events. The phone logs its mic/speaker peak every
+  5 s and route changes (logcat tag `DevDeckLive`).
 - **Delegations.** `delegation.created {item:{id, content:[{type:"input_text", text}]}}` is
   pasted (bracketed paste + Enter, so it steers a working agent) into the concierge pane
   verbatim, or into the direct terminal as `[voice] <text>`; the concierge's tmux session is
@@ -1125,7 +1145,7 @@ Client → PC lines stay plain.
 | Live | `watch {target, view}`, `pause`, `resume`, `resync`, `ping {ts}`, `keys {target, keys[]}`, `tap {target, row}`, `type {target, text}`, `new {cwd?, omp?, yolo?, resume?:sessionId, restore?:true}` (→ `created {target:"phone-N:W.P"}`; `resume` needs `omp:true` and starts `omp --resume <id>`, with `restore:true` `omp --restore <id>` (refused while a running omp has it open); `cwd` may be the session's recorded folder, and defaults to it), `restore_dismiss {}` (withdraws the `restore_offer` for this daemon run) |
 | Queued (carry `id`, always answered by `ack {id, ok, error?}`, deduplicated) | `send {target, text, enter}`, `clip {text}`, `answer {target, toolCallId, answers:[{qid, selected[], custom?, note?}]}` |
 | Voice (live, never queued) | `voice {target, on, opts}`, `say {req, target?, entryId?, text?, voice?, speed?}`, `say_stop {req?}` (see "Voice messages") |
-| Live (never queued) | `live_offer`, `live_mode`, `live_stop` (see "Live messages") |
+| Live (never queued) | `live_offer`, `live_mode`, `live_stop`, `live_event` (see "Live messages") |
 | Requests (carry `req`, answered with the same `req`, or `error {req, error}`) | see below |
 
 Requests:
@@ -1241,7 +1261,7 @@ Voices: `af_heart`, `af_bella`, `af_nicole`, `af_aoede`, `af_kore`, `af_sarah`,
 - **`voice_error {error, req?, target?, entryId?, auto?, ask?, toolCallId?}`**: a reading
   failed or a voice message was malformed; it ends that reading (no `last` chunk follows).
 - **Live** (see "Live messages" below): `live`, `live_answer`, `live_transcript`,
-  `live_delegation`, `live_notice`.
+  `live_delegation`, `live_notice`, `live_send`.
 - **`restore_offer {sessions}`**: after the daemon starts, to each client that connects,
   the sessions of every project cut off mid-turn or terminated in the last 24 h (same shape
   as `history` sessions, each flagged, with `cwd`, at most 20), until restored or dismissed;
@@ -1306,6 +1326,10 @@ Voices: `af_heart`, `af_bella`, `af_nicole`, `af_aoede`, `af_kore`, `af_sarah`,
   next call); refusals come back as `error {error}`.
 - `live_stop {}`: hangs up (`session.close` on the sideband), answered by `live
   {phase:"ended"}`.
+- `live_event {callId, ev}` (client → PC): one event of the call's data channel, `ev` its
+  JSON text unchanged; `live_send {callId, msg}` (PC → client): a message for the call
+  (`session.context.append`, `delegation.context.append`) that the client writes to the data
+  channel. Both only from/to the client holding the call; the UI never sees `live_send`.
 - `live {phase, mode, target?, callId?, error?}` (PC → client) on every change: `connecting`
   (before and right after `live_answer`), `listening`, `speaking` (from the voice model's
   first output transcript to its `turn.done`), `working` (a delegation is in flight),

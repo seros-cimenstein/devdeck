@@ -4233,6 +4233,7 @@ LIVE_GONE_S = 60.0           # the call ends this long after the phone's link is
 LIVE_TICK_S = 0.5            # delegation progress is read this often
 LIVE_NOTICE_GAP_S = 20.0     # at most one proactive notice per this long (merged)
 LIVE_REJECT_S = 5.0          # an error this soon after the first session.context.append rejects it
+LIVE_START_S = 3.0           # no session.started this long after the sideband connected: it came before
 LIVE_NOTICE_CHANNEL = "speakable"  # notices are spoken at the next pause (verified: with or without a channel)
 WS_MAX = 16 << 20
 # Sideband events the daemon has no use for (audio both ways, user-turn deltas that
@@ -4593,10 +4594,12 @@ def ws_mask(data: bytes, mask: bytes) -> bytes:
 
 class LiveSession:
     """The daemon's one GPT Live call (README "Live"). The phone holds the WebRTC call (audio
-    goes straight to OpenAI); this side signals it with omp's ChatGPT login, drives the sideband
-    WebSocket on one I/O thread, routes the voice model's delegations into a terminal and feeds
-    their progress, final replies and the other terminals' news back into the call. A tick
-    thread reads the routed pane's session file and ends the call when the phone stays away."""
+    goes straight to OpenAI); this side signals it with omp's ChatGPT login and attaches the
+    sideband WebSocket (one I/O thread). The call's events reach the daemon through the phone,
+    which relays its data channel (`live_event`, and `live_send` back); the sideband carries them
+    only for an app without the relay. Delegations are routed into a terminal; their progress,
+    final replies and the other terminals' news go back into the call. A tick thread reads the
+    routed pane's session file and ends the call when the phone stays away."""
 
     def __init__(self, server: Server, ctl: Control, req: str, sdp: str, voice: str, mode: str, target: str | None):
         self.server, self.ctl, self.client = server, ctl, ctl.client
@@ -4625,6 +4628,11 @@ class LiveSession:
         self.held: list[str] = []             # notices for the next final reply
         self.seen: dict[str, tuple] = {}      # pane target -> (state, final reply id, ask id)
         self.unknown: set[str] = set()
+        self.sideband_at: float | None = None  # when the sideband connected (session.started fallback)
+        self.counts = {"user": 0, "assistant": 0, "delegation": 0}  # finished turns, delegations
+        self.audio_ms = 0                      # session.usage.updated audio_duration_ms
+        self.relay = False                     # events come from the phone's data channel (relayed)
+        self.seen_ids: set[str] = set()        # item/turn ids handled (both sources overlap at the switch)
 
     # ------------------------------------------------------------ phone side
 
@@ -4670,7 +4678,10 @@ class LiveSession:
         with self.server.live_lock:
             if self.server.live is self:
                 self.server.live = None
-        log(f"live: call {self.call_id or '-'} ended" + (f": {error}" if error else ""))
+        log(f"live: call {self.call_id or '-'} ended" + (f": {error}" if error else "") +
+            f" ({self.counts['user']} user turns, {self.counts['assistant']} replies, "
+            f"{self.counts['delegation']} delegations, usage audio {self.audio_ms / 1000:.0f} s, "
+            f"events via {'phone relay' if self.relay else 'sideband'})")
         if notify:
             self.push(self.state(error))
 
@@ -4745,15 +4756,34 @@ class LiveSession:
             if self.ended:
                 ws.close()
                 raise LiveError("stopped")
-            self.ws = ws
+            self.ws, self.sideband_at = ws, time.monotonic()
         log(f"live: sideband connected ({call})")
 
     def send(self, msg: dict) -> None:
+        """To the call: through the phone's data channel while the relay runs and the phone is
+        here, else on the sideband."""
         with self.lock:
             if self.ended:
                 return
-            self.out.append(msg)
-        self.wake()
+            ctl = self.ctl if self.relay and self.gone_at is None else None
+            if ctl is None:
+                self.out.append(msg)
+        if ctl is not None:
+            ctl.push({"t": "live_send", "callId": self.call_id, "msg": msg})
+        else:
+            self.wake()
+
+    def relayed(self, data: bytes) -> None:
+        """An event from the phone's data channel (Server.live_event). The first one makes the
+        relay the call's event source and outlet; the sideband then stays attached (the server
+        only delegates with one) but unread: its base64 audio mirror (64 KB/s each way) outruns a
+        slow laptop link, and everything else in it came late."""
+        with self.lock:
+            first, self.relay = not self.relay, True
+        if first:
+            log("live: events now come over the phone's data channel")
+            self.wake()
+        self.on_event(data)
 
     def wake(self) -> None:
         try:
@@ -4778,24 +4808,28 @@ class LiveSession:
                     ws.send(1, json.dumps(msg, ensure_ascii=False, separators=(",", ":")).encode())
                     if msg["type"] == "session.close":
                         return
-                for op, data in ws.messages():
-                    rx, pinged = time.monotonic(), False
-                    if op == 1:
-                        self.on_event(data)
-                    elif op == 9:
-                        ws.send(10, data)
-                    elif op == 8:
-                        code = int.from_bytes(data[:2], "big") if len(data) >= 2 else 1005
-                        reason = data[2:].decode(errors="replace")
-                        raise ConnectionError(f"GPT Live closed the call ({code}{': ' + reason if reason else ''})")
+                relay = self.relay
+                if not relay:
+                    for op, data in ws.messages():
+                        rx, pinged = time.monotonic(), False
+                        if op == 1 and not self.relay:
+                            self.on_event(data)
+                        elif op == 9:
+                            ws.send(10, data)
+                        elif op == 8:
+                            code = int.from_bytes(data[:2], "big") if len(data) >= 2 else 1005
+                            reason = data[2:].decode(errors="replace")
+                            raise ConnectionError(f"GPT Live closed the call ({code}{': ' + reason if reason else ''})")
                 if self.out:
                     continue
-                if ws.pending():
+                if not relay and ws.pending():
                     ws.read()
                     continue
-                r, _, _ = select.select([ws, self.wake_r], [], [], LIVE_PING_S / 3)
+                r, _, _ = select.select([self.wake_r] if relay else [ws, self.wake_r], [], [], LIVE_PING_S / 3)
                 if self.wake_r in r:
                     self.wake_r.recv(4096)
+                if relay:
+                    continue
                 if ws in r:
                     ws.read()
                     continue
@@ -4815,6 +4849,17 @@ class LiveSession:
 
     # ------------------------------------------------------------ voice model events
 
+    def on_started(self, how: str) -> None:
+        """The call is up: phase and the hello context. Once, on session.started, or from the tick
+        when that event fired before the sideband connected (it is not repeated then)."""
+        with self.lock:
+            if self.started or self.ended:
+                return
+            self.started = True
+        log(f"live: call {self.call_id} started ({how})")
+        self.set_phase()
+        self.hello()
+
     def on_event(self, data: bytes) -> None:
         try:
             ev = json.loads(data)
@@ -4823,12 +4868,16 @@ class LiveSession:
         if not isinstance(ev, dict):
             return
         t = ev.get("type")
+        if t in ("input_transcript.added", "output_transcript.added", "delegation.created", "turn.done"):
+            part = ev.get("turn" if t == "turn.done" else "item")
+            key = part.get("id") if isinstance(part, dict) else None
+            if isinstance(key, str):
+                with self.lock:
+                    if key in self.seen_ids:
+                        return
+                    self.seen_ids.add(key)
         if t == "session.started":
-            with self.lock:
-                self.started = True
-            log(f"live: session.started {((ev.get('session') or {}).get('id'))}")
-            self.set_phase()
-            self.hello()
+            self.on_started(f"session.started {((ev.get('session') or {}).get('id'))}")
         elif t in ("input_transcript.added", "output_transcript.added"):
             item = ev.get("item") if isinstance(ev.get("item"), dict) else {}
             role = "user" if t[0] == "i" else "assistant"
@@ -4841,11 +4890,20 @@ class LiveSession:
             turn = ev.get("turn") if isinstance(ev.get("turn"), dict) else {}
             role = turn.get("role")
             if role in ("user", "assistant"):
-                self.transcript(role, turn.get("transcript"), True)
+                said = turn.get("transcript")
+                with self.lock:
+                    self.counts[role] += 1
+                log(f"live: {role}: {' '.join(said.split())[:200]!r}" if isinstance(said, str) else f"live: {role}: -")
+                self.transcript(role, said, True)
                 if role == "assistant":
                     with self.lock:
                         self.speaking = False
                     self.set_phase()
+        elif t == "session.usage.updated":
+            usage = ev.get("usage") if isinstance(ev.get("usage"), dict) else {}
+            if isinstance(usage.get("audio_duration_ms"), (int, float)):
+                with self.lock:
+                    self.audio_ms = int(usage["audio_duration_ms"])
         elif t == "delegation.created":
             self.on_delegation(ev.get("item"))
         elif t == "error":
@@ -5004,6 +5062,7 @@ class LiveSession:
             return
         with self.lock:
             mode, target = self.mode, self.target
+            self.counts["delegation"] += 1
         log(f"live: delegation {item['id']} ({mode}): {text[:200]!r}")
         threading.Thread(target=self.route, args=(item["id"], text, mode, target), daemon=True).start()
 
@@ -5146,13 +5205,16 @@ class LiveSession:
             try:
                 now = time.monotonic()
                 with self.lock:
-                    gone = self.gone_at
+                    gone, late = self.gone_at, not self.started and self.sideband_at is not None \
+                        and now - self.sideband_at >= LIVE_START_S
                     if self.ctx_probe is not None and now - self.ctx_probe >= LIVE_REJECT_S:
                         self.ctx_ok, self.ctx_probe, self.ctx_pending = True, None, []
                         log("live: session.context.append accepted")
                 if gone is not None and now - gone > LIVE_GONE_S:
                     self.end(f"the phone was away for {LIVE_GONE_S:.0f} s")
                     return
+                if late:
+                    self.on_started(f"no session.started within {LIVE_START_S:.0f} s of the sideband")
                 self.track()
                 self.flush_notices()
             except Exception as ex:  # the call must survive anything a pane or file throws at it
@@ -5791,6 +5853,15 @@ class Server:
         log(f"{ctl.peer}: live_offer ({mode}{' ' + target if target else ''}, voice {voice})")
         live.push(live.state())
         threading.Thread(target=live.run, daemon=True).start()
+
+    def live_event(self, ctl: Control, msg: dict) -> None:
+        """`live_event {callId, ev}`: one event of the call the phone got on its data channel (the
+        raw JSON text); see LiveSession.relayed."""
+        live = self.live
+        ev = msg.get("ev")
+        if (live is not None and isinstance(ev, str) and msg.get("callId") == live.call_id
+                and (live.ctl is ctl or (ctl.client and live.client == ctl.client))):
+            live.relayed(ev.encode())
 
     def live_mode(self, mode, target) -> dict:
         """Route the call's delegations to the concierge or straight to an omp terminal (also the
@@ -6651,6 +6722,8 @@ class Control:
                 self.push({"t": "error", "error": f"live_mode: {ex}"})
         elif kind == "live_stop":
             self.server.live_stop(self)
+        elif kind == "live_event":
+            self.server.live_event(self, msg)
         elif kind == "say_stop":
             req = msg.get("req")
             self.stop_utterances(lambda u: u.req == req if isinstance(req, str) else True)

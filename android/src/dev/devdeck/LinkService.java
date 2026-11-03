@@ -920,6 +920,9 @@ public class LinkService extends Service {
                 case "error":
                     LiveService.onLink(t, line);
                     break;
+                case "live_send":  // for the call's data channel only, not for the UI
+                    LiveService.onLink(t, line);
+                    return;
                 default:
                     break;
             }
