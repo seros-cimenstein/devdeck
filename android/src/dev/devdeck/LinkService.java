@@ -352,6 +352,7 @@ public class LinkService extends Service {
             if (w.isHeld()) w.release();
         }
         if (wifiLock.isHeld()) wifiLock.release();
+        UiStore.flushOpen(2000);  // the UI's last saves (drafts, answers) before the process may go
         super.onDestroy();
     }
 

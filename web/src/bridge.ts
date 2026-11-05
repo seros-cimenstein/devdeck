@@ -22,6 +22,11 @@ interface DDBridge {
   liveStart?(json: string): void;
   liveStop?(): void;
   liveMute?(on: boolean): void;
+  // durable UI storage (UiStore; absent on older shells)
+  kvGet?(key: string): string | null;
+  kvPut?(key: string, value: string | null): void;
+  kvKeys?(prefix: string): string;
+  kvFlush?(): void;
 }
 
 const noop = () => {};
@@ -42,6 +47,35 @@ function dd(): DDBridge {
   const w: Window & { DD?: DDBridge } = window;
   return w.DD ?? stub;
 }
+
+/**
+ * The shell's durable key/value store: each put is fsynced to its own file within milliseconds, unlike
+ * localStorage/IndexedDB, whose batched commits a phone restart or a flat battery can lose. Null in a
+ * plain browser (and older shells): callers then keep using localStorage/IndexedDB.
+ */
+export interface NativeStore {
+  /** The value, or null when absent. */
+  get(key: string): string | null;
+  /** Sets `key`; null deletes. Never waits on the disk. */
+  put(key: string, value: string | null): void;
+  /** Keys starting with `prefix`, least recently written first. */
+  keys(prefix: string): string[];
+  /** Blocks (at most ~2 s) until every put so far is on disk. */
+  flush(): void;
+}
+
+export const nativeStore: NativeStore | null = (() => {
+  const d = dd();
+  const { kvGet, kvPut, kvKeys, kvFlush } = d;
+  if (!kvGet || !kvPut || !kvKeys || !kvFlush) return null;
+  // Java bridge methods must be called on the bridge object.
+  return {
+    get: (k) => kvGet.call(d, k) ?? null,
+    put: (k, v) => kvPut.call(d, k, v),
+    keys: (p) => JSON.parse(kvKeys.call(d, p) || "[]") as string[],
+    flush: () => kvFlush.call(d),
+  };
+})();
 
 export function send(msg: Msg): boolean {
   try {

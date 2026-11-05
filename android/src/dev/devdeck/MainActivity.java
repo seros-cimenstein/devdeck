@@ -46,6 +46,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.ByteArrayInputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
@@ -73,11 +74,13 @@ public class MainActivity extends Activity implements LinkService.Listener {
     private static final int REQ_LIVE = 3;
     private static final int REQ_CHOOSER = 4;
     private static final long BACK_TIMEOUT_MS = 1000;
+    private static final long FLUSH_MS = 2000;  // bounds a flush: writes start at once, only a stalled disk waits this long
 
     static volatile MainActivity current;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private SharedPreferences prefs;
+    private UiStore store;
     private WebView web;
     private LinkService svc;
     private ValueCallback<Uri[]> chooser;  // a page's <input type=file> (the sketch canvas's Image button)
@@ -113,6 +116,7 @@ public class MainActivity extends Activity implements LinkService.Listener {
         super.onCreate(saved);
         current = this;
         prefs = LinkService.prefs(this);
+        store = UiStore.open(new File(getFilesDir(), "ui"));
         // Volume keys adjust the TTS voice, or the call during a Live call (LiveService flips it).
         setVolumeControlStream(LiveService.active() ? AudioManager.STREAM_VOICE_CALL : AudioManager.STREAM_MUSIC);
         recognizer = new Recognizer(this, this::emitLocal);
@@ -152,6 +156,7 @@ public class MainActivity extends Activity implements LinkService.Listener {
             web.onPause();
             web.pauseTimers();
         }
+        store.flush(FLUSH_MS);  // the page's last saves are on disk before the app may be killed
         super.onStop();
     }
 
@@ -796,6 +801,30 @@ public class MainActivity extends Activity implements LinkService.Listener {
         @JavascriptInterface
         public void liveMute(boolean on) {
             LiveService.requestMute(on);
+        }
+
+        /** Durable UI storage (UiStore): the value of `key`, or null. */
+        @JavascriptInterface
+        public String kvGet(String key) {
+            return store.get(key);
+        }
+
+        /** Sets `key`; null or "" deletes. Returns at once, the write follows in the background. */
+        @JavascriptInterface
+        public void kvPut(String key, String value) {
+            store.put(key, value);
+        }
+
+        /** JSON array of the keys starting with `prefix`, least recently written first. */
+        @JavascriptInterface
+        public String kvKeys(String prefix) {
+            return new org.json.JSONArray(store.keys(prefix)).toString();
+        }
+
+        /** Blocks (bounded) until every kvPut so far is on disk. */
+        @JavascriptInterface
+        public void kvFlush() {
+            store.flush(FLUSH_MS);
         }
     }
 }

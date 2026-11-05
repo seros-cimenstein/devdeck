@@ -4,7 +4,7 @@ import { cacheGet, cachePut } from "./cache";
 import { QuickKeys } from "./keys";
 import { ScreenMirror } from "./screen";
 import type { ScreenMsg } from "./types";
-import { debounce, h, icon } from "./util";
+import { debounce, h, icon, onHide } from "./util";
 
 const CACHE_LINES = 400;
 
@@ -41,6 +41,7 @@ export class TermView {
     });
     ro.observe(this.scr.body);
     ro.observe(el);
+    onHide(this.saveSoon.flush);
   }
 
   setTarget(target: string) {

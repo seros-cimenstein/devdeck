@@ -1,4 +1,6 @@
-// Small IndexedDB key/value cache for last transcripts and screens, LRU-capped per prefix.
+// Small key/value cache for last transcripts and screens, LRU-capped per prefix. In the app it lives
+// in the shell's durable store (JSON per key); in a plain browser in IndexedDB.
+import { nativeStore } from "./bridge";
 
 const DB = "devdeck";
 const STORE = "kv";
@@ -34,20 +36,37 @@ function done<T>(r: IDBRequest<T>): Promise<T | undefined> {
 }
 
 export async function cacheGet<T>(key: string): Promise<T | undefined> {
+  if (nativeStore) {
+    try {
+      const v = nativeStore.get(key);
+      return v == null ? undefined : (JSON.parse(v) as T);
+    } catch {
+      return undefined;
+    }
+  }
   const d = await db();
   if (!d) return undefined;
   const row = await done<Row<T> | undefined>(d.transaction(STORE).objectStore(STORE).get(key));
   return row?.v;
 }
 
+/** In the app the write is queued before this returns (no await first), so a following flush covers it. */
 export async function cachePut<T>(key: string, v: T): Promise<void> {
-  const d = await db();
-  if (!d) return;
-  const tx = d.transaction(STORE, "readwrite");
-  const st = tx.objectStore(STORE);
-  st.put({ k: key, v, at: Date.now() } satisfies Row<T>);
   const prefix = key.slice(0, key.indexOf(":") + 1);
   const cap = CAPS[prefix.slice(0, -1)];
+  if (nativeStore) {
+    nativeStore.put(key, JSON.stringify(v));
+    if (!cap) return;
+    const mine = nativeStore.keys(prefix); // oldest first
+    for (let i = 0; i < mine.length - cap; i++) nativeStore.put(mine[i], null);
+    return;
+  }
+  const d = await db();
+  if (!d) return;
+  // Strict: committed to disk before the transaction completes (the relaxed default can lose it on power loss).
+  const tx = d.transaction(STORE, "readwrite", { durability: "strict" });
+  const st = tx.objectStore(STORE);
+  st.put({ k: key, v, at: Date.now() } satisfies Row<T>);
   if (!cap) return;
   // Primary keys in ascending `at` order, so the oldest come first.
   const keys = (await done(st.index("at").getAllKeys())) ?? [];

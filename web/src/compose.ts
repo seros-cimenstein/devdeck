@@ -8,7 +8,7 @@ import { isOnline, isPending, ompCmd, onPending } from "./omp";
 import { onOutboxChange, outboxFor, retrySend } from "./outbox";
 import { state } from "./state";
 import { openMenu, toast } from "./ui";
-import { debounce, h, icon, lsGet, lsSet } from "./util";
+import { debounce, h, icon, lsGet, lsSet, onHide } from "./util";
 import { setEnabled, voiceEnabled } from "./voice";
 
 const LONG_PRESS_MS = 450;
@@ -113,6 +113,7 @@ export class Compose {
       else delete this.drafts[this.target];
       lsSet(DRAFTS_KEY, this.drafts);
     }, 300);
+    onHide(saveDraft.flush);
     this.ta.addEventListener("input", () => {
       this.autosize();
       saveDraft();

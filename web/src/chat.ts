@@ -5,7 +5,7 @@ import { hydrate, markdownEl, renderMarkdown } from "./md";
 import { dismissSend, onOutboxChange, outboxDelivered, outboxFor, retrySend } from "./outbox";
 import { hooks, state } from "./state";
 import type { AssistantEntry, Entry, FullMsg, ToolCall, TranscriptMsg } from "./types";
-import { debounce, h, icon, reducedMotion, ticking } from "./util";
+import { debounce, h, icon, onHide, reducedMotion, ticking } from "./util";
 import { onSayChange, sayStatus, toggleEntry } from "./voice";
 
 const MAX_DOM = 220; // rendered entries kept while following the bottom
@@ -68,6 +68,7 @@ export class ChatView {
     ro.observe(this.working);
     onOutboxChange(() => this.renderOutbox());
     onSayChange(() => this.updateSay());
+    onHide(this.saveSoon.flush);
   }
 
   // ---------------------------------------------------------------- target / data

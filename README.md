@@ -299,7 +299,8 @@ queued: a stale ^C delivered minutes later would be harmful.
 ### Compose bar
 
 - **Paperclip**: picks files, which are uploaded to `~/Downloads/phone/`.
-- **Input**: multi-line, with a separate draft for each terminal.
+- **Input**: multi-line, with a separate draft for each terminal. Drafts survive an app
+  restart, a phone restart and a flat battery (see "App" under "How it works").
 - **Send**: pastes the text (as a bracketed paste, so newlines do not submit early) and then
   presses Enter. Long-press Send to paste without Enter. Send with an empty box just presses
   Enter, except while omp works: a bare Enter would abort the turn, so the PC refuses it
@@ -381,7 +382,7 @@ behind omp's `/live`) through omp's ChatGPT login.
   link comes back.
 
 **Live view (web).** An orb button in the top bar starts a call with the saved voice and
-mode (`dd.live` in localStorage: voice, mode, last direct terminal) and opens the full-screen
+mode (`dd.live` in the UI store: voice, mode, last direct terminal) and opens the full-screen
 Live view: orb driven by `live_local` mic/spk levels and coloured by phase, phase label +
 hint, captions (`live_transcript`, partial -> final per role+turn), delegation chips
 (`live_delegation`, updated in place by id: sent/done/failed), notice cards (`live_notice`;
@@ -919,6 +920,8 @@ synthesised on the PC and streamed per sentence (protocol: "Voice messages").
 - The models list is cached in `~/.local/state/devdeck/models.json`, provider usage limits
   in `~/.local/state/devdeck/usage.json`.
 - `ddctl`'s control socket is `~/.local/state/devdeck/ctl.sock` (see "Concierge and `ddctl`").
+- The phone keeps its own UI state (drafts, answers in progress, cached chats, settings) in
+  the app's private files; see "Phone state on disk" under "App".
 
 ### Live calls (daemon)
 
@@ -1098,10 +1101,34 @@ catalog). Requests (the daemon's side):
   (`ticking()` in `web/src/util.ts`). Hidden ones are skipped; the timer stops when none is left
   or the app is hidden.
   Only short-lived loading spinners and the voice/Live visuals use CSS animations.
+- **Phone state on disk**: the UI keeps its state in a native store (`UiStore`, one file per
+  key under the app's `files/ui/`, file name = URL-safe base64 of the key), not in the
+  WebView's localStorage/IndexedDB. Chromium batches localStorage commits and writes
+  IndexedDB with relaxed durability, so a phone restart or a flat battery lost what the page
+  had just saved (typed drafts, picked answers, the cached chat). Every write goes to one
+  background thread, which coalesces repeated writes to a key (the latest wins), writes
+  `<f>.tmp`, fsyncs it, renames it over `<f>` and fsyncs the directory, usually within
+  milliseconds; reads are synchronous from memory, pending writes included.
+  - Stored there: compose drafts (`dd.drafts`), question answers in progress
+    (`dd.askDrafts`), the offline queue's list, settings and view preferences (`dd.*`), and
+    the last transcripts (`tx:<target>`, 24 kept) and terminal screens (`scr:<target>`, 32
+    kept), least recently written dropped first.
+  - Left in localStorage: caches the PC sends again (models list `dd.models.v2`, usage limits
+    `dd.usage`; `LS_ONLY` in `web/src/util.ts`). On the first run with the store, other keys
+    move over from localStorage as they are read.
+  - When the page is hidden or unloaded (`visibilitychange`, `pagehide`), the pending
+    debounced saves (compose draft, chat and screen cache) run at once and the UI waits up
+    to 2 s for the disk (`kvFlush`); the shell also flushes in `onStop` and when its service
+    is destroyed.
+  - In a plain browser (no `window.DD`, e.g. the headless dev setup) the UI falls back to
+    localStorage and IndexedDB (opened with `durability: "strict"`).
 - **Bridge**:
   - The UI talks to the shell through `window.DD`: `send` for live messages, `enqueue` for
     queued ones, plus `pickFiles`, `setWakelock`, `setNotify`, `copyText`, `openUrl`,
     `haptic`, `ready` and `backResult`.
+  - Storage (`UiStore`, above): `kvGet(key)` (null when absent), `kvPut(key, value)`
+    (null or "" deletes; returns at once), `kvKeys(prefix)` (JSON array, least recently
+    written first) and `kvFlush()` (blocks until queued writes are on disk, at most 2 s).
   - The shell delivers every server message, plus local `link`/`toast`/`open`/`back`
     events, to `window.dd.receive`.
   - Voice: `listen(opts)` with `{lang:"en-US"|"tr-TR", partial:true, preferOffline:true}`

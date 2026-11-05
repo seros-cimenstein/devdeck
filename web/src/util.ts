@@ -1,3 +1,5 @@
+import { nativeStore } from "./bridge";
+
 export type Attrs = Record<string, string | number | boolean | EventListener | undefined | null>;
 
 /** Tiny DOM builder: h("div.cls#id", {attrs}, ...children). */
@@ -35,12 +37,42 @@ const ESC: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"
 
 export function debounce<A extends unknown[]>(fn: (...a: A) => void, ms: number) {
   let t = 0;
+  let args: A | null = null;
+  const run = () => {
+    clearTimeout(t);
+    const a = args;
+    args = null;
+    if (a) fn(...a);
+  };
   const d = (...a: A) => {
     clearTimeout(t);
-    t = window.setTimeout(() => fn(...a), ms);
+    args = a;
+    t = window.setTimeout(run, ms);
   };
+  /** Runs the pending call (if any) now. */
+  d.flush = run;
   return d;
 }
+
+const hideHooks: (() => void)[] = [];
+/** Runs `fn` when the page goes to the background or away, before storage is flushed: pending saves go now. */
+export function onHide(fn: () => void) {
+  hideHooks.push(fn);
+}
+function pageHidden() {
+  for (const fn of hideHooks) {
+    try {
+      fn();
+    } catch (e) {
+      console.error(e);
+    }
+  }
+  nativeStore?.flush();
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) pageHidden();
+});
+window.addEventListener("pagehide", pageHidden);
 
 export function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -144,9 +176,30 @@ export function uuid(): string {
   return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
 }
 
+// Caches of data the PC sends again (a lost write costs a refetch): these stay in localStorage. Every
+// other key (drafts, ask answers, outbox, settings) goes to the shell's durable store when it has one.
+const LS_ONLY: Record<string, true> = {
+  "dd.models": true, // pre-v2 models list, only ever deleted
+  "dd.models.v2": true, // omp models list
+  "dd.usage": true, // last usage limits
+};
+
 export function lsGet<T>(key: string, def: T): T {
   try {
-    const v = localStorage.getItem(key);
+    let v: string | null;
+    if (nativeStore && !LS_ONLY[key]) {
+      v = nativeStore.get(key);
+      if (v == null) {
+        // First run on a shell with the store: move the value over.
+        v = localStorage.getItem(key);
+        if (v != null) {
+          nativeStore.put(key, v);
+          localStorage.removeItem(key);
+        }
+      }
+    } else {
+      v = localStorage.getItem(key);
+    }
     return v == null ? def : (JSON.parse(v) as T);
   } catch {
     return def;
@@ -154,7 +207,11 @@ export function lsGet<T>(key: string, def: T): T {
 }
 export function lsSet(key: string, v: unknown) {
   try {
-    if (v == null) localStorage.removeItem(key);
+    if (nativeStore && !LS_ONLY[key]) {
+      nativeStore.put(key, v == null ? null : JSON.stringify(v));
+      // A stale copy would come back through the migration above once the key is deleted.
+      localStorage.removeItem(key);
+    } else if (v == null) localStorage.removeItem(key);
     else localStorage.setItem(key, JSON.stringify(v));
   } catch {
     /* quota: drafts and prefs are best effort */
